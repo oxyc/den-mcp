@@ -90,7 +90,9 @@ fn bearer(header: Option<&str>) -> Result<&str, Refused> {
         .ok_or(Refused::Missing)
 }
 
-/// The `Authorization: Bearer` token, checked: signature by one of `keys`, issuer, audience, expiry, scope.
+/// The `Authorization: Bearer` token, checked: signature by one of `keys`, issuer, audience, expiry, scope. The
+/// server goes through `Verified`, which keeps what this checks; the tests check tokens with it directly.
+#[cfg(test)]
 pub fn verify(
     header: Option<&str>,
     keys: &[VerifyingKey],
