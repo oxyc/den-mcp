@@ -981,7 +981,7 @@ async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
                     "prominence" => ra.cmp(rb),
                     "name" => name(a).cmp(&name(b)),
                     "born_desc" => year(b).cmp(&year(a)),
-                    "born_asc" => year(a).map_or(i64::MAX, |y| y).cmp(&year(b).map_or(i64::MAX, |y| y)),
+                    "born_asc" => year(a).unwrap_or(i64::MAX).cmp(&year(b).unwrap_or(i64::MAX)),
                     _ => credits(b).cmp(&credits(a)),
                 };
                 by.then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
