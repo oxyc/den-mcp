@@ -27,8 +27,7 @@ use serde_json::{json, Map, Value};
 use std::sync::Arc;
 
 /// Said with every list: what the results are drawn from.
-const CORPUS: &str =
-    "Den's index of ~47k films and series, not every title; one missing here may still exist.";
+const CORPUS: &str = "Den's ~47k-title index, not every title.";
 /// Where Den's own descriptions come from, said with a title's facts.
 const ATTRIBUTION: &str = "Labels and plot facets are derived from Wikipedia article text (CC BY-SA 4.0); \
                            people and credits from Wikidata (CC0).";
@@ -156,7 +155,8 @@ pub fn list() -> Value {
             json!({ "type": "integer", "minimum": 1, "maximum": max, "default": default }),
         )
     };
-    let (page, limit20) = paging(20, 100);
+    // A page of 24 by default: atlas's and Den Web's own, so a question here is the same cache entry as there.
+    let (page, limit24) = paging(sel::PAGE as u32, 100);
     let (_, limit10) = paging(10, 100);
     // Every tool only reads, and asking again answers the same.
     let read_only = json!({ "readOnlyHint": true, "idempotentHint": true, "openWorldHint": false });
@@ -202,7 +202,7 @@ pub fn list() -> Value {
                     "order": { "type": "string", "enum": ["popular", "newest", "oldest"], "default": "popular",
                                "description": "Only popular for now; the answer says so for the others" },
                     "page": page,
-                    "limit": limit20,
+                    "limit": limit24,
                 },
             },
             "annotations": read_only,
@@ -260,7 +260,7 @@ pub fn list() -> Value {
                                      "description": "Countries (Sweden, SE) or Q-ids, all held" },
                     "occupation": { "type": "array", "items": { "type": "string" }, "description": "Q-ids, all held" },
                     "page": page,
-                    "limit": limit20,
+                    "limit": limit24,
                 },
             },
             "annotations": read_only,
@@ -290,7 +290,7 @@ pub fn list() -> Value {
                     "sel": sel_items,
                     "mix_types": { "type": "boolean", "default": true },
                     "page": page,
-                    "limit": limit20,
+                    "limit": limit24,
                 },
                 "required": ["titles"],
             },
@@ -928,10 +928,7 @@ async fn search(ctx: &Ctx<'_>, args: &Value) -> Answer {
         out.insert("more".into(), json!(candidates > shown));
         out.insert(
             "candidates_note".into(),
-            json!(
-                "How many titles the words reached, best first; not a count of exact matches. For an exact \
-                   count, den_filter_titles."
-            ),
+            json!("Titles the words reached, not a count of matches (den_filter_titles counts)."),
         );
     }
     if !tmdb.is_empty() {
@@ -1075,7 +1072,7 @@ async fn filter_titles(ctx: &Ctx<'_>, args: &Value) -> Answer {
         return Err(bad("order is popular, newest or oldest"));
     }
     let (sel, read_as) = selection(ctx, args, scope).await?;
-    let (page, limit) = paging(args, 20)?;
+    let (page, limit) = paging(args, sel::PAGE)?;
     let (skip, limit) = sel::page(page, limit);
     let (answer, _) = ctx.atlas.get(&sel::titles_url(scope, &sel, skip, limit), ctx.rid).await?;
     let results = titles(ctx.cfg, answer.get("titles"));
@@ -1458,7 +1455,7 @@ fn exact_year(value: &Value) -> Option<i64> {
 async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
     let scope = scope(args)?;
     let (sel, mut read_as) = selection(ctx, args, scope).await?;
-    let (page, limit) = paging(args, 20)?;
+    let (page, limit) = paging(args, sel::PAGE)?;
     let mut traits: Vec<String> = Vec::new();
     if let Some(role) = string(args, "role")? {
         traits.push(format!("role:{role}"));
@@ -1641,10 +1638,7 @@ async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
         .collect();
     let mut out = listing(results, total, page, limit);
     said(&mut out, read_as);
-    let mut notes =
-        vec!["Credits and traits are Wikidata's; a person with no record for a trait is not matched, so \
-                          this list is not complete."
-            .to_owned()];
+    let mut notes = vec!["Wikidata's credits and traits: no record, no match, so not complete.".to_owned()];
     if born_min.is_some() || born_max.is_some() {
         notes.push(
             "Ages are this year minus the birth year, so ±1; people dated only to a decade are kept when \
@@ -1778,7 +1772,7 @@ async fn similar(ctx: &Ctx<'_>, args: &Value) -> Answer {
         _ => return Err(bad("titles: one to eight {type, id}")),
     };
     let mix = args.get("mix_types").and_then(Value::as_bool).unwrap_or(true);
-    let (page, limit) = paging(args, 20)?;
+    let (page, limit) = paging(args, sel::PAGE)?;
     // The narrowing is the same for every seed: `sel` carries no `like`, the one kind whose spelling depends on scope.
     let (narrowing, read_as) = selection(ctx, args, Scope::All).await?;
     let ask = |kind: &str, id: u64| -> Result<String, ToolError> {

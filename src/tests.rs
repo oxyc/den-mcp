@@ -554,7 +554,7 @@ async fn filter_titles_builds_the_canonical_url_and_refuses_ratings() {
     let asked = s.asked.lock().unwrap().clone();
     assert!(
         asked.contains(
-            &"/index/filter/all/titles.json?sel=genre:28,language:sv,mood:Tense%2FEdge-of-seat,region:scandinavian&limit=20"
+            &"/index/filter/all/titles.json?sel=genre:28,language:sv,mood:Tense%2FEdge-of-seat,region:scandinavian"
                 .to_owned()
         ),
         "{asked:?}"
@@ -634,8 +634,8 @@ async fn people_by_traits_and_an_age_range() {
     assert_eq!(
         asked,
         [
-            "/index/filter/movie/people.json?sel=decade:2020&traits=born:1970,gender:Q6581097,role:cast&limit=20",
-            "/index/filter/movie/people.json?sel=decade:2020&traits=born:1980,gender:Q6581097,role:cast&limit=20",
+            "/index/filter/movie/people.json?sel=decade:2020&traits=born:1970,gender:Q6581097,role:cast",
+            "/index/filter/movie/people.json?sel=decade:2020&traits=born:1980,gender:Q6581097,role:cast",
         ]
     );
     let people = answer["results"].as_array().unwrap();
@@ -683,14 +683,12 @@ async fn people_sort_as_asked_or_say_the_order_they_came_in() {
         answer["notes"].as_array().unwrap().iter().map(|n| n.to_string()).collect::<String>()
     };
     let by_name = s.tool("den_find_people", json!({ "sel": ["decade:2020"], "sort": "name" })).await.unwrap();
-    assert_eq!(
-        s.asked.lock().unwrap()[0],
-        "/index/filter/all/people.json?sel=decade:2020&order=name&limit=20"
-    );
+    assert_eq!(s.asked.lock().unwrap()[0], "/index/filter/all/people.json?sel=decade:2020&order=name");
     assert!(notes(&by_name).contains("Sorted by name."), "{by_name}");
     // Prominence is atlas's default, so it is not spelled; an atlas that names no order ordered by credits.
     let default = s.tool("den_find_people", json!({ "sel": ["decade:2010"] })).await.unwrap();
-    assert_eq!(s.asked.lock().unwrap()[1], "/index/filter/all/people.json?sel=decade:2010&limit=20");
+    // A default page is atlas's own (24), so the question is spelled exactly as Den Web asks it.
+    assert_eq!(s.asked.lock().unwrap()[1], "/index/filter/all/people.json?sel=decade:2010");
     assert!(notes(&default).contains("Sorted by credits"), "{default}");
     let youngest =
         s.tool("den_find_people", json!({ "sel": ["decade:2000"], "sort": "youngest" })).await.unwrap();
@@ -766,9 +764,11 @@ async fn similar_to_one_title_narrowed_and_to_several_interleaved() {
         )
         .await
         .unwrap();
-    assert!(s.asked.lock().unwrap().contains(
-        &"/index/filter/all/titles.json?sel=like:movie-949,region:scandinavian&limit=20".to_owned()
-    ));
+    assert!(s
+        .asked
+        .lock()
+        .unwrap()
+        .contains(&"/index/filter/all/titles.json?sel=like:movie-949,region:scandinavian".to_owned()));
     assert_eq!(heat["results"][1]["url"], "https://den.example/tv/2-the-bridge");
     let both = s
         .tool(
