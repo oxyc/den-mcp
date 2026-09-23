@@ -293,6 +293,30 @@ pub fn list() -> Value {
             },
             "annotations": read_only,
         },
+        {
+            "name": "search",
+            "title": "Search Den (research)",
+            "description": "Search Den's film and series index in plain words. Returns ids (e.g. movie:949) for \
+                fetch, titles and Den Web urls. The den_ tools answer more precisely.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "query": { "type": "string" } },
+                "required": ["query"],
+            },
+            "annotations": read_only,
+        },
+        {
+            "name": "fetch",
+            "title": "Fetch a title (research)",
+            "description": "One title's facts from Den as text, by the id search gave (e.g. movie:949), with its \
+                Den Web url.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"],
+            },
+            "annotations": read_only,
+        },
     ])
 }
 
@@ -305,9 +329,86 @@ pub async fn call(ctx: &Ctx<'_>, name: &str, args: &Value) -> Option<Answer> {
         "den_find_people" => find_people(ctx, args).await,
         "den_title" => title_facts(ctx, args).await,
         "den_similar" => similar(ctx, args).await,
+        "search" => research_search(ctx, args).await,
+        "fetch" => research_fetch(ctx, args).await,
         _ => return None,
     };
     Some(answer.and_then(guard))
+}
+
+// ---- search and fetch: the pair ChatGPT's deep research and company knowledge call by these names and shapes
+
+/// `search {query}` → `{results: [{id, title, url}]}`, the id "movie:949" that `fetch` takes.
+async fn research_search(ctx: &Ctx<'_>, args: &Value) -> Answer {
+    let query = string(args, "query")?.ok_or_else(|| bad("query: what to look for"))?;
+    let found = search(ctx, &json!({ "query": query, "limit": 20 })).await?;
+    let results: Vec<Value> = found["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| {
+            let name = t["title"].as_str()?;
+            let title = match t["year"].as_i64() {
+                Some(year) => format!("{name} ({year})"),
+                None => name.to_owned(),
+            };
+            Some(json!({ "id": format!("{}:{}", t["type"].as_str()?, t["id"].as_u64()?), "title": title,
+                         "url": t["url"] }))
+        })
+        .collect();
+    Ok(json!({ "results": results }))
+}
+
+/// `fetch {id}` → one title's facts as text a model can quote, with its Den Web url and the attribution.
+async fn research_fetch(ctx: &Ctx<'_>, args: &Value) -> Answer {
+    let id = string(args, "id")?.ok_or_else(|| bad("id: as search gave it, e.g. movie:949"))?;
+    let (kind, n) = id.split_once(':').ok_or_else(|| bad("id is type:number, e.g. movie:949"))?;
+    let facts = title_facts(ctx, &json!({ "type": kind, "id": n })).await?;
+    if facts["indexed"] == false {
+        return Err(bad(format!("Den's index has nothing on {id}")));
+    }
+    let list = |key: &str| -> Option<String> {
+        let names: Vec<&str> = facts[key]
+            .as_array()?
+            .iter()
+            .filter_map(|v| v.as_str().or_else(|| v["name"].as_str()))
+            .collect();
+        (!names.is_empty()).then(|| names.join(", "))
+    };
+    let name = facts["title"].as_str().unwrap_or(id);
+    let title = match facts["year"].as_i64() {
+        Some(year) => format!("{name} ({year})"),
+        None => name.to_owned(),
+    };
+    let mut lines = vec![format!("{title}, a {}.", if kind == "series" { "series" } else { "film" })];
+    let mut add = |label: &str, value: Option<String>| {
+        if let Some(value) = value {
+            lines.push(format!("{label}: {value}."));
+        }
+    };
+    add("Genre", facts["genre"].as_str().map(str::to_owned));
+    add("Subgenres", list("subgenres"));
+    add("Moods", list("moods"));
+    add(
+        "Plot",
+        facts["plot_facets"].as_object().map(|f| {
+            f.iter().map(|(axis, v)| format!("{axis} {}", v.as_str().unwrap_or(""))).collect::<Vec<_>>().join(", ")
+        }),
+    );
+    add("Countries", list("countries"));
+    add("Languages", list("languages"));
+    add("Runtime", facts["runtime_minutes"].as_u64().map(|m| format!("{m} minutes")));
+    add("Based on", list("based_on"));
+    add("Studios", list("studios"));
+    add("Directors and writers", list("directors_writers"));
+    add("Cast", list("cast"));
+    Ok(json!({
+        "id": id,
+        "title": title,
+        "text": lines.join("\n"),
+        "url": facts["url"],
+        "metadata": { "type": kind, "source": "Den", "attribution": ATTRIBUTION },
+    }))
 }
 
 /// Keys atlas's serving guard (`tos.rs`) refuses, compared as it compares them: letters and digits, lower-cased.

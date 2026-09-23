@@ -299,7 +299,9 @@ async fn initialize_and_list_the_tools() {
             "den_filter_values",
             "den_find_people",
             "den_title",
-            "den_similar"
+            "den_similar",
+            "search",
+            "fetch"
         ]
     );
     for tool in tools["result"]["tools"].as_array().unwrap() {
@@ -703,6 +705,30 @@ async fn a_title_is_its_facts_and_an_unindexed_one_says_so() {
     let unknown = s.tool("den_title", json!({ "type": "movie", "id": 1 })).await.unwrap();
     assert_eq!(unknown["indexed"], false);
     assert!(s.tool("den_title", json!({ "type": "tv", "id": 1 })).await.is_err(), "series, not tv");
+}
+
+/// ChatGPT's research pair: `search` gives ids and urls, `fetch` a title's facts as text, both through the same
+/// allowlist as the den_ tools.
+#[tokio::test]
+async fn search_and_fetch_answer_in_the_research_shape() {
+    let s = Server::new().await;
+    let found = s.tool("search", json!({ "query": "slow-burn 90s thrillers" })).await.unwrap();
+    assert_eq!(
+        found["results"][0],
+        json!({ "id": "movie:949", "title": "Heat (1995)", "url": "https://den.example/movie/949-heat" })
+    );
+    assert_eq!(found["results"][1]["id"], "series:1396");
+    let heat = s.tool("fetch", json!({ "id": "movie:949" })).await.unwrap();
+    assert_eq!((&heat["id"], &heat["title"]), (&json!("movie:949"), &json!("Heat (1995)")));
+    assert_eq!(heat["url"], "https://den.example/movie/949-heat");
+    let text = heat["text"].as_str().unwrap();
+    for line in ["Heat (1995), a film.", "Subgenres: Heist.", "Plot: ending tragic.", "Directors and writers: Michael Mann."] {
+        assert!(text.contains(line), "{line}: {text}");
+    }
+    assert!(!text.contains("TMDB text"));
+    assert!(heat["metadata"]["attribution"].as_str().unwrap().contains("CC BY-SA"));
+    assert!(s.tool("fetch", json!({ "id": "movie:1" })).await.unwrap_err().contains("nothing on"));
+    assert!(s.tool("fetch", json!({ "id": "949" })).await.is_err());
 }
 
 #[tokio::test]

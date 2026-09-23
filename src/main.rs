@@ -347,9 +347,18 @@ async fn reply(
 
 /// The tools' names as `&'static str`, for the log and the metrics labels: never a name a client made up.
 fn known_tool(name: &str) -> Option<&'static str> {
-    ["den_search", "den_filter_titles", "den_filter_values", "den_find_people", "den_title", "den_similar"]
-        .into_iter()
-        .find(|t| *t == name)
+    [
+        "den_search",
+        "den_filter_titles",
+        "den_filter_values",
+        "den_find_people",
+        "den_title",
+        "den_similar",
+        "search",
+        "fetch",
+    ]
+    .into_iter()
+    .find(|t| *t == name)
 }
 
 async fn answer(
