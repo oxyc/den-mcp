@@ -136,7 +136,7 @@ pub fn list() -> Value {
         "type": "array", "items": { "type": "string" }, "maxItems": 16,
         "description": "Filters ANDed together, each \"kind:id\" (\"-kind:id\" excludes). Kinds: language (ISO 639-1), \
             country (ISO 3166-1), region (nordic, scandinavian, east-asian, …), decade (1990), primary (Den's primary \
-            genre: Crime, Drama, …), subgenre and mood (Den labels, exact case: \"Psychological Thriller\", \"Tense\"), \
+            genre: Crime, Drama, …), subgenre and mood (Den labels, exact case: \"Psychological Thriller\", \"Tense/Edge-of-seat\"), \
             genre (TMDB genre id), animated (yes|no), runtime (under-90|90-120|120-150|over-150), source (book, play, \
             comic, game, …), plot facets ending|tone|pacing|era|setting|scope|chronology|continuity|conflict|ensemble|\
             timespan|archetype, technique, audience, critique, warning, and Wikidata Q-ids for person, made (director/\
