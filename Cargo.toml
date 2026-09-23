@@ -1,6 +1,6 @@
 [package]
 name = "den-mcp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Den's MCP server: lets an LLM client (Claude, ChatGPT) search Den's film and series index through den-atlas, behind den-edge's OAuth"
 publish = false
