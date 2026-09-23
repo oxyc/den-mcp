@@ -133,6 +133,19 @@ async fn stub_atlas() -> (String, Asked) {
                         seen.lock().unwrap().push(path.clone());
                     }
                     let revalidating = req.headers().get("if-none-match").is_some_and(|v| v == "\"v1\"");
+                    // Asked about 1950s titles, the stub is an atlas older than birth-year ranges (den-atlas#85),
+                    // which reads a range as a decade and refuses it.
+                    let range = path.split(['?', '&', ',', '=']).any(|p| {
+                        p.trim_start_matches('-').strip_prefix("born:").is_some_and(|id| id.contains('-'))
+                    });
+                    if range && path.contains("decade:1950") {
+                        let refusal =
+                            r#"{"detail":"born: \"1900-1939\" is not an integer","error":"bad_request"}"#;
+                        return Ok(hyper::Response::builder()
+                            .status(400)
+                            .body(Full::new(Bytes::from(refusal)))
+                            .unwrap());
+                    }
                     // A slow question, for timing what is asked at once against what is asked in turn.
                     if path.contains("decade:1950") {
                         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -652,7 +665,7 @@ async fn filter_values_resolve_names_title_kinds_and_person_traits() {
 #[tokio::test]
 async fn people_by_traits_and_an_age_range() {
     let s = Server::new().await;
-    // Born 1976–1996 for 30–50 this year: the decades it spans, one question each, held to the exact years.
+    // A birth-year range is one question, its trait spelled and placed as atlas's canonical URL has it.
     let year = crate::year_of(unix_now());
     let answer = s
         .tool(
@@ -662,17 +675,12 @@ async fn people_by_traits_and_an_age_range() {
         )
         .await
         .unwrap();
-    let mut asked = s.asked.lock().unwrap().clone();
-    asked.sort();
     assert_eq!(
-        asked,
-        [
-            "/index/filter/movie/people.json?sel=decade:2020&traits=born:1970,gender:Q6581097,role:cast",
-            "/index/filter/movie/people.json?sel=decade:2020&traits=born:1980,gender:Q6581097,role:cast",
-        ]
+        *s.asked.lock().unwrap(),
+        ["/index/filter/movie/people.json?sel=decade:2020&traits=born:1975-1985,gender:Q6581097,role:cast"]
     );
     let people = answer["results"].as_array().unwrap();
-    assert_eq!(people.len(), 2);
+    assert_eq!(people.len(), 1);
     assert_eq!(
         people[0],
         json!({ "id": "Q1976", "name": "Actor 1976", "credits": 4, "roles": ["cast"], "gender": ["male"],
@@ -683,9 +691,26 @@ async fn people_by_traits_and_an_age_range() {
     );
     assert_eq!(answer["on_record"]["gender"], "98% of credited people");
     assert!(answer["notes"][0].as_str().unwrap().contains("not complete"));
-    // Held to the years: 1976 is outside 1980–1985.
-    let narrow = s.tool("den_find_people", json!({ "born_min": 1980, "born_max": 1985 })).await.unwrap();
-    assert!(narrow["results"].as_array().unwrap().iter().all(|p| p["id"] != "Q1976"), "{narrow}");
+    assert!(answer["notes"][1].as_str().unwrap().contains("±1"), "{answer}");
+    assert_eq!(answer["total"], 1);
+    // An age range is the birth years it counts back to; an open end stays open, and an end atlas cannot name is
+    // held to the years it can.
+    let last = |s: &Server| s.asked.lock().unwrap().last().unwrap().clone();
+    s.tool("den_find_people", json!({ "age_min": 30, "age_max": 50 })).await.unwrap();
+    assert_eq!(last(&s), format!("/index/filter/all/people.json?traits=born:{}-{}", year - 51, year - 30));
+    s.tool("den_find_people", json!({ "age_min": 30 })).await.unwrap();
+    assert_eq!(last(&s), format!("/index/filter/all/people.json?traits=born:-{}", year - 30));
+    s.tool("den_find_people", json!({ "born_min": 1990, "role": "director" })).await.unwrap();
+    assert_eq!(last(&s), "/index/filter/all/people.json?traits=born:1990-,role:director");
+    s.tool("den_find_people", json!({ "born_min": 1500, "born_max": 1850 })).await.unwrap();
+    assert_eq!(last(&s), "/index/filter/all/people.json?traits=born:1800-1850");
+    assert!(s.tool("den_find_people", json!({ "born_min": 1990, "born_max": 1980 })).await.is_err());
+    // A range pages like any list: past the first hundred people too.
+    s.tool("den_find_people", json!({ "age_max": 40, "page": 6, "limit": 20 })).await.unwrap();
+    assert_eq!(
+        last(&s),
+        format!("/index/filter/all/people.json?traits=born:{}-&skip=120&limit=20", year - 41)
+    );
     assert!(s.tool("den_find_people", json!({ "gender": "robot" })).await.is_err());
     // A citizenship by name or code is its Wikidata item, and the answer says how it was read.
     let swedes =
@@ -697,16 +722,31 @@ async fn people_by_traits_and_an_age_range() {
     assert!(s.tool("den_find_people", json!({ "citizenship": ["Narnia"] })).await.is_err());
 }
 
-/// An age range's decades are asked at once: four slow questions take about as long as one, not four times as long.
+/// An atlas older than birth-year ranges refuses one; the range is then asked by decade, the decades at once: four
+/// slow questions take about as long as one, not four times as long.
 #[tokio::test]
-async fn an_age_ranges_decades_are_asked_at_once() {
+async fn an_atlas_without_ranges_is_asked_by_decade_at_once() {
     let s = Server::new().await;
     let started = std::time::Instant::now();
     let args = json!({ "sel": ["decade:1950"], "born_min": 1900, "born_max": 1939 });
-    s.tool("den_find_people", args).await.unwrap();
-    assert_eq!(s.asked.lock().unwrap().len(), 4, "one question a decade");
+    let answer = s.tool("den_find_people", args).await.unwrap();
+    let asked = s.asked.lock().unwrap().clone();
+    assert_eq!(asked[0], "/index/filter/all/people.json?sel=decade:1950&traits=born:1900-1939");
+    assert_eq!(
+        asked[1..],
+        [1900, 1910, 1920, 1930]
+            .map(|d| format!("/index/filter/all/people.json?sel=decade:1950&traits=born:{d}")),
+        "one question a decade"
+    );
     // Each takes 300 ms: in turn that is 1.2 s.
     assert!(started.elapsed() < std::time::Duration::from_millis(900), "{:?}", started.elapsed());
+    let notes = answer["notes"].to_string();
+    assert!(notes.contains("asked by decade"), "{answer}");
+    // Held to the years there: the 1976 the stub answers every decade with is outside them.
+    assert!(answer["results"].as_array().unwrap().is_empty(), "{answer}");
+    // Merging decades reaches only each one's first hundred people.
+    let far = json!({ "sel": ["decade:1950"], "born_min": 1900, "born_max": 1939, "page": 6, "limit": 20 });
+    assert!(s.tool("den_find_people", far).await.unwrap_err().contains("within 100"));
 }
 
 #[tokio::test]
