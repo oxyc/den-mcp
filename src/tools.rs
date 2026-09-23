@@ -156,8 +156,9 @@ pub fn list() -> Value {
     };
     let (page, limit20) = paging(20, 100);
     let (_, limit10) = paging(10, 100);
-    let read_only = json!({ "readOnlyHint": true, "openWorldHint": false });
-    json!([
+    // Every tool only reads, and asking again answers the same.
+    let read_only = json!({ "readOnlyHint": true, "idempotentHint": true, "openWorldHint": false });
+    let mut tools = json!([
         {
             "name": "den_search",
             "title": "Search Den",
@@ -317,7 +318,85 @@ pub fn list() -> Value {
             },
             "annotations": read_only,
         },
-    ])
+    ]);
+    for tool in tools.as_array_mut().into_iter().flatten() {
+        let schema = output_schema(tool["name"].as_str().unwrap_or(""));
+        tool["outputSchema"] = schema;
+    }
+    tools
+}
+
+/// What each tool's `structuredContent` holds: the fields every answer of it carries, typed, and room for the rest
+/// (notes and caveats come and go with the question).
+pub(crate) fn output_schema(tool: &str) -> Value {
+    let title = json!({
+        "type": "object",
+        "properties": {
+            "type": { "type": "string", "enum": ["movie", "series"] },
+            "id": { "type": "integer" },
+            "title": { "type": "string" },
+            "year": { "type": "integer" },
+            "url": { "type": "string" },
+        },
+        "required": ["type", "id", "url"],
+    });
+    let listing = |item: Value| {
+        json!({
+            "type": "object",
+            "properties": {
+                "results": { "type": "array", "items": item },
+                "page": { "type": "integer" },
+                "more": { "type": "boolean" },
+                "corpus": { "type": "string" },
+            },
+            "required": ["results", "page", "corpus"],
+        })
+    };
+    match tool {
+        "den_search" | "den_filter_titles" | "den_similar" => listing(title),
+        "den_find_people" => listing(json!({
+            "type": "object",
+            "properties": { "id": { "type": "string" }, "name": { "type": "string" }, "url": { "type": "string" } },
+            "required": ["id"],
+        })),
+        "den_filter_values" => json!({
+            "type": "object",
+            "properties": {
+                "kind": { "type": "string" },
+                "values": { "type": "array", "items": { "type": "object", "required": ["id"] } },
+                "complete": { "type": "boolean" },
+                "kinds": { "type": "object" },
+            },
+        }),
+        "den_title" => json!({
+            "type": "object",
+            "properties": {
+                "type": { "type": "string" },
+                "id": { "type": "integer" },
+                "indexed": { "type": "boolean" },
+                "url": { "type": "string" },
+            },
+            "required": ["type", "id", "indexed"],
+        }),
+        "search" => json!({
+            "type": "object",
+            "properties": { "results": { "type": "array", "items": {
+                "type": "object", "required": ["id", "title", "url"] } } },
+            "required": ["results"],
+        }),
+        "fetch" => json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "title": { "type": "string" },
+                "text": { "type": "string" },
+                "url": { "type": "string" },
+                "metadata": { "type": "object" },
+            },
+            "required": ["id", "title", "text", "url"],
+        }),
+        _ => json!({ "type": "object" }),
+    }
 }
 
 /// Run one tool. `None` for a name that is not a tool, which is the protocol's error rather than the tool's.
@@ -368,11 +447,8 @@ async fn research_fetch(ctx: &Ctx<'_>, args: &Value) -> Answer {
         return Err(bad(format!("Den's index has nothing on {id}")));
     }
     let list = |key: &str| -> Option<String> {
-        let names: Vec<&str> = facts[key]
-            .as_array()?
-            .iter()
-            .filter_map(|v| v.as_str().or_else(|| v["name"].as_str()))
-            .collect();
+        let names: Vec<&str> =
+            facts[key].as_array()?.iter().filter_map(|v| v.as_str().or_else(|| v["name"].as_str())).collect();
         (!names.is_empty()).then(|| names.join(", "))
     };
     let name = facts["title"].as_str().unwrap_or(id);
@@ -392,7 +468,10 @@ async fn research_fetch(ctx: &Ctx<'_>, args: &Value) -> Answer {
     add(
         "Plot",
         facts["plot_facets"].as_object().map(|f| {
-            f.iter().map(|(axis, v)| format!("{axis} {}", v.as_str().unwrap_or(""))).collect::<Vec<_>>().join(", ")
+            f.iter()
+                .map(|(axis, v)| format!("{axis} {}", v.as_str().unwrap_or("")))
+                .collect::<Vec<_>>()
+                .join(", ")
         }),
     );
     add("Countries", list("countries"));
@@ -846,8 +925,10 @@ async fn search(ctx: &Ctx<'_>, args: &Value) -> Answer {
         out.insert("more".into(), json!(candidates > shown));
         out.insert(
             "candidates_note".into(),
-            json!("How many titles the words reached, best first; not a count of exact matches. For an exact \
-                   count, den_filter_titles."),
+            json!(
+                "How many titles the words reached, best first; not a count of exact matches. For an exact \
+                   count, den_filter_titles."
+            ),
         );
     }
     if !tmdb.is_empty() {
@@ -895,9 +976,18 @@ async fn search(ctx: &Ctx<'_>, args: &Value) -> Answer {
         // Words read as something to leave out ("without gore") that matched nothing Den can leave out: nothing
         // was, and a model should not say otherwise.
         if let Some(excluded) = parse.get("excluded").filter(|e| e.is_object()) {
-            let listed = |key: &str| excluded.get(key).and_then(Value::as_array).is_some_and(|l| !l.is_empty());
-            let kinds =
-                ["countries", "decades", "mediaTypes", "genres", "labels", "plotFacets", "basedOnKind", "people"];
+            let listed =
+                |key: &str| excluded.get(key).and_then(Value::as_array).is_some_and(|l| !l.is_empty());
+            let kinds = [
+                "countries",
+                "decades",
+                "mediaTypes",
+                "genres",
+                "labels",
+                "plotFacets",
+                "basedOnKind",
+                "people",
+            ];
             let matched = kinds.iter().any(|k| listed(k))
                 || excluded.get("titles").and_then(Value::as_u64).unwrap_or(0) > 0;
             if !matched && listed("phrases") {
@@ -1564,7 +1654,9 @@ async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
         format!("Sorted by {sort}.")
     } else if answer.get("orderUnavailable").is_some() {
         // An atlas that orders people but has no popularity order to rank prominence by (den-atlas#78).
-        format!("Sorted by credits (most matching titles): this Den has no popularity order to sort by {sort}.")
+        format!(
+            "Sorted by credits (most matching titles): this Den has no popularity order to sort by {sort}."
+        )
     } else {
         format!("Sorted by credits (most matching titles): this Den's index can't sort people by {sort} yet.")
     });
@@ -1645,7 +1737,9 @@ async fn title_facts(ctx: &Ctx<'_>, args: &Value) -> Answer {
     // Den's index names a title's makers as one list; which of them directed and which wrote, it doesn't say.
     out.insert(
         "makers_note".into(),
-        json!("directors_writers is one list: Den's index doesn't say which of them directed and which wrote."),
+        json!(
+            "directors_writers is one list: Den's index doesn't say which of them directed and which wrote."
+        ),
     );
     out.insert("cast".into(), Value::Array(people("cast", false)));
     put(&mut out, "cast_total", count(answer.get("castTotal")));

@@ -231,7 +231,36 @@ impl Server {
         }
         let value: Value = serde_json::from_str(&text).unwrap();
         assert_allowlisted(&value);
+        // The same answer as structured content, holding to the tool's declared output schema.
+        assert_eq!(result["structuredContent"], value, "{name}");
+        conforms(&value, &crate::tools::output_schema(name), name);
         Ok(value)
+    }
+}
+
+/// `value` holds to `schema` as far as the schemas here go: types, required keys, and the same for what they hold.
+fn conforms(value: &Value, schema: &Value, at: &str) {
+    let typed = match schema["type"].as_str() {
+        Some("object") => value.is_object(),
+        Some("array") => value.is_array(),
+        Some("string") => value.is_string(),
+        Some("integer") => value.is_i64() || value.is_u64(),
+        Some("boolean") => value.is_boolean(),
+        _ => true,
+    };
+    assert!(typed, "{at}: {value} is not a {}", schema["type"]);
+    for key in schema["required"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        assert!(value.get(key).is_some(), "{at}: {key} is required: {value}");
+    }
+    for (key, property) in schema["properties"].as_object().into_iter().flatten() {
+        if let Some(v) = value.get(key) {
+            conforms(v, property, &format!("{at}.{key}"));
+        }
+    }
+    if let (Some(items), Some(list)) = (schema.get("items"), value.as_array()) {
+        for v in list {
+            conforms(v, items, &format!("{at}[]"));
+        }
     }
 }
 
@@ -306,6 +335,11 @@ async fn initialize_and_list_the_tools() {
     );
     for tool in tools["result"]["tools"].as_array().unwrap() {
         assert_eq!(tool["inputSchema"]["type"], "object", "{tool}");
+        assert_eq!(tool["outputSchema"]["type"], "object", "{tool}");
+        assert_eq!(
+            (&tool["annotations"]["readOnlyHint"], &tool["annotations"]["idempotentHint"]),
+            (&json!(true), &json!(true))
+        );
         assert!(tool["description"].as_str().unwrap().len() < 800, "a lean description: {}", tool["name"]);
     }
     assert_eq!(s.rpc("ping", json!({})).await["result"], json!({}));
@@ -494,7 +528,9 @@ async fn search_answers_titles_people_and_what_it_understood() {
     let gore = s.tool("den_search", json!({ "query": "heists without gore" })).await.unwrap();
     assert!(gore["exclusion_note"].as_str().unwrap().contains("-warning:"), "{gore}");
     // A language by name, and a series' broadcaster by its Q-id.
-    s.tool("den_search", json!({ "query": "noir", "language": "Swedish", "broadcaster": "q907311" })).await.unwrap();
+    s.tool("den_search", json!({ "query": "noir", "language": "Swedish", "broadcaster": "q907311" }))
+        .await
+        .unwrap();
     assert!(s
         .asked
         .lock()
@@ -520,7 +556,8 @@ async fn filter_titles_builds_the_canonical_url_and_refuses_ratings() {
     // How much of the type each applied kind is on record for; a TMDB kind's share is never said.
     assert_eq!(answer["on_record"], json!({ "language": "27% of films" }));
     // Only popular order for now, and another is said rather than faked.
-    let newest = s.tool("den_filter_titles", json!({ "sel": ["genre:80"], "order": "newest" })).await.unwrap();
+    let newest =
+        s.tool("den_filter_titles", json!({ "sel": ["genre:80"], "order": "newest" })).await.unwrap();
     assert!(newest["order_note"].as_str().unwrap().contains("can't order titles by newest"));
     assert!(s.tool("den_filter_titles", json!({ "order": "best" })).await.is_err());
     // TMDB's kinds are refused: the two this server knows, and one only atlas's schema names.
@@ -722,7 +759,12 @@ async fn search_and_fetch_answer_in_the_research_shape() {
     assert_eq!((&heat["id"], &heat["title"]), (&json!("movie:949"), &json!("Heat (1995)")));
     assert_eq!(heat["url"], "https://den.example/movie/949-heat");
     let text = heat["text"].as_str().unwrap();
-    for line in ["Heat (1995), a film.", "Subgenres: Heist.", "Plot: ending tragic.", "Directors and writers: Michael Mann."] {
+    for line in [
+        "Heat (1995), a film.",
+        "Subgenres: Heist.",
+        "Plot: ending tragic.",
+        "Directors and writers: Michael Mann.",
+    ] {
         assert!(text.contains(line), "{line}: {text}");
     }
     assert!(!text.contains("TMDB text"));

@@ -103,10 +103,13 @@ pub fn initialize(params: &Value) -> Value {
     })
 }
 
-/// A tool's answer as `tools/call` returns it: compact JSON text, or the tool's error for the model to act on.
+/// A tool's answer as `tools/call` returns it: the JSON as `structuredContent` (its tool's `outputSchema`) and, for
+/// clients that read only content, the same as compact text; or the tool's error for the model to act on.
 pub fn tool_result(answer: Result<Value, crate::tools::ToolError>) -> Value {
     match answer {
-        Ok(value) => json!({ "content": [{ "type": "text", "text": value.to_string() }] }),
+        Ok(value) => {
+            json!({ "content": [{ "type": "text", "text": value.to_string() }], "structuredContent": value })
+        }
         Err(crate::tools::ToolError(message)) => {
             json!({ "content": [{ "type": "text", "text": message }], "isError": true })
         }
