@@ -6,7 +6,7 @@
 
 use crate::atlas::encode;
 
-/// The most items one list (`sel` or `traits`) may carry.
+/// The most values one list (`sel` or `traits`) may carry, every value of an OR group counted.
 pub const MAX_ITEMS: usize = 16;
 /// A titles or people page when none is asked for, and the most one returns.
 pub const PAGE: usize = 24;
@@ -107,7 +107,8 @@ impl Scope {
     }
 }
 
-/// One `[-]kind:id`, normalised.
+/// One `[-]kind:id`, normalised. An OR group (`country:FR|IT`, any of its values) is one item whose `id` is its ids
+/// sorted as strings, each once, joined by `|`: the id atlas sorts the item by.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Item {
     pub kind: String,
@@ -118,8 +119,15 @@ pub struct Item {
 impl Item {
     fn spelled(&self) -> String {
         // The kind is a known name of lower-case letters (`normalise`); it is encoded all the same, so nothing that
-        // ever reaches here can end the item or the parameter.
-        format!("{}{}:{}", if self.exclude { "-" } else { "" }, encode(&self.kind), encode(&self.id))
+        // ever reaches here can end the item or the parameter. Each id of a group is encoded and the `|` kept
+        // literal, as atlas's canonical URL has it.
+        let id = self.id.split('|').map(encode).collect::<Vec<_>>().join("|");
+        format!("{}{}:{id}", if self.exclude { "-" } else { "" }, encode(&self.kind))
+    }
+
+    /// Whether it is an OR group of more than one value.
+    pub fn is_group(&self) -> bool {
+        self.id.contains('|')
     }
 }
 
@@ -274,8 +282,10 @@ fn born_range(id: &str) -> Result<String, String> {
     }
 }
 
-/// A list of `[-]kind:id` items, normalised, sorted by kind, then positive before excluded, then id, each once. A
-/// `born` range beside another positive `born` pick is refused, as atlas refuses it.
+/// A list of `[-]kind:id` items, normalised, sorted by kind, then positive before excluded, then id, each once. An
+/// item may be an OR group, `kind:a|b`: each value normalised alone, all of one kind, sorted as strings and each kept
+/// once. Refused as atlas refuses them: more than `MAX_ITEMS` values counting group members, a group of `like`s or
+/// holding a `born` range, and a `born` range beside another positive `born` pick.
 pub fn items(raw: &[String], scope: Scope) -> Result<Vec<Item>, String> {
     let mut out = Vec::with_capacity(raw.len());
     for item in raw.iter().flat_map(|i| i.split(',')).map(str::trim).filter(|i| !i.is_empty()) {
@@ -284,13 +294,32 @@ pub fn items(raw: &[String], scope: Scope) -> Result<Vec<Item>, String> {
             None => (false, item),
         };
         let (kind, id) = item.split_once(':').ok_or_else(|| format!("{item:?} is not <kind>:<id>"))?;
-        let (kind, id) = normalise(kind, id, scope)?;
-        out.push(Item { kind, exclude, id });
+        let mut group: Option<String> = None;
+        let mut ids = Vec::new();
+        for one in id.split('|') {
+            let (k, one) = normalise(kind, one, scope)?;
+            if group.as_ref().is_some_and(|g| *g != k) {
+                return Err(format!("{item:?}: the values of one group are of one kind"));
+            }
+            group = Some(k);
+            ids.push(one);
+        }
+        ids.sort();
+        ids.dedup();
+        // `split` yields at least one value, so the group has its kind.
+        let kind = group.unwrap_or_default();
+        if ids.len() > 1 && (kind == "like" || (kind == "born" && ids.iter().any(|i| i.contains('-')))) {
+            return Err(format!(
+                "{item:?}: {kind} takes one {} per item, not a group",
+                if kind == "like" { "title" } else { "range" }
+            ));
+        }
+        out.push(Item { kind, exclude, id: ids.join("|") });
     }
     out.sort();
     out.dedup();
-    if out.len() > MAX_ITEMS {
-        return Err(format!("at most {MAX_ITEMS} values in one list"));
+    if out.iter().map(|i| i.id.split('|').count()).sum::<usize>() > MAX_ITEMS {
+        return Err(format!("at most {MAX_ITEMS} values in one list, counting each value of a group"));
     }
     let born: Vec<&Item> = out.iter().filter(|i| i.kind == "born" && !i.exclude).collect();
     if born.len() > 1 && born.iter().any(|i| i.id.contains('-')) {
@@ -632,6 +661,12 @@ mod tests {
             spelled(&["country:SE", "-language:en"])
         );
         assert!(items(&["country:Narnia".into()], Scope::All).unwrap_err().contains("names no country"));
+        // Each value of a group is read alone, then the group is spelled canonically.
+        assert_eq!(
+            spelled(&["country:Italy|French", "-language:English|sv"]),
+            "/index/filter/all/titles.json?sel=country:FR|IT,-language:en|sv"
+        );
+        assert!(items(&["country:France|Narnia".into()], Scope::All).is_err());
         assert!(items(&["language:Klingon".into()], Scope::All).is_err());
     }
 

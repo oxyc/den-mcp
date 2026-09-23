@@ -35,6 +35,12 @@ Every tool declares an `outputSchema` and answers with `structuredContent` and t
 Filter URLs are built in atlas's canonical spelling (`src/sel.rs`), held to atlas's own contract fixture
 (`testdata/facets-canonical.json`), so the same question is one cache entry here and in atlas.
 
+Either of several values of one kind is one item (den-atlas#89): `country:FR|IT` in `sel`, and a list in a trait
+argument (`citizenship: ["American", "British"]`, `role: ["cast", "director"]`); a list of lists holds every group
+(`[["US"], ["GB"]]`: dual citizens). Separate items still all hold. A group is sent sorted, each value once, with a
+literal `|`, and counts toward the 16-value cap by its values. A value atlas does not recognise is named in the
+answer's notes; the rest of its group still applies.
+
 A value is read the way a person writes it. Languages and countries may be named (`language:Swedish`,
 `country:Sweden`, a citizenship "Swedish" or "SE" → Q34), from Wikidata's tables in `src/names_table.rs`
 (`scripts/names-table.py` writes it). A short-list kind (moods, subgenres, regions, plot facets, …) is read against
