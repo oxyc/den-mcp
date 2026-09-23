@@ -1,0 +1,36 @@
+[package]
+name = "den-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "Den's MCP server: lets an LLM client (Claude, ChatGPT) search Den's film and series index through den-atlas, behind den-edge's OAuth"
+publish = false
+license = "MIT"
+
+[[bin]]
+name = "den-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# Single-threaded runtime: every request is a short relay to atlas, so one thread keeps idle RAM minimal.
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "signal"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+# server-graceful: stop accepting on SIGTERM and let in-flight requests finish. client-legacy: the pooled,
+# keep-alive client to atlas — plain HTTP on the LAN, so no TLS stack at all.
+hyper-util = { version = "0.1", features = ["tokio", "http1", "server-graceful", "client-legacy"] }
+http-body-util = "0.1"
+bytes = "1"
+serde_json = "1"
+# Verifies den-edge's access tokens (EdDSA JWS). Pure Rust; `fast` keeps the precomputed tables that make a
+# verify ~50 µs.
+ed25519-dalek = { version = "3", default-features = false, features = ["fast"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "signal", "test-util"] }
+
+# The fleet's release profile: fat LTO, one codegen unit, stripped. panic=unwind so a panic in one request
+# unwinds that connection rather than the whole server.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
