@@ -103,6 +103,8 @@ fn canned(path: &str) -> Option<Value> {
         title["cast"] = json!([{ "id": "Q2", "name": "Al Pacino" }]);
         title["castTotal"] = json!(40);
         title
+    } else if path == "/index/studios/movie/949.json" {
+        json!({ "studios": [{ "id": "Q159846", "name": "Warner Bros." }, { "id": "not-a-qid", "name": "x" }] })
     } else if path.starts_with("/index/title/") {
         json!({ "type": "movie", "id": 1, "indexed": false })
     } else {
@@ -690,6 +692,9 @@ async fn a_title_is_its_facts_and_an_unindexed_one_says_so() {
     );
     assert_eq!(heat["cast"], json!([{ "id": "Q2", "name": "Al Pacino" }]));
     assert!(heat["attribution"].as_str().unwrap().contains("CC BY-SA"));
+    // Its studios from their own route, each a Q-id and a name; and the makers said to be one list.
+    assert_eq!(heat["studios"], json!([{ "id": "Q159846", "name": "Warner Bros." }]));
+    assert!(heat["makers_note"].as_str().unwrap().contains("one list"));
     let unknown = s.tool("den_title", json!({ "type": "movie", "id": 1 })).await.unwrap();
     assert_eq!(unknown["indexed"], false);
     assert!(s.tool("den_title", json!({ "type": "tv", "id": 1 })).await.is_err(), "series, not tv");
@@ -727,13 +732,14 @@ async fn an_answer_is_kept_and_revalidated_by_etag() {
     let args = json!({ "type": "movie", "id": 949 });
     s.tool("den_title", args.clone()).await.unwrap();
     s.tool("den_title", args).await.unwrap();
-    assert_eq!(s.asked.lock().unwrap().len(), 1, "the second answer came from memory");
-    assert_eq!(s.state.atlas.used(), [1, 0, 1]);
+    // The title and its studios, each asked once: the second answer came from memory.
+    assert_eq!(s.asked.lock().unwrap().len(), 2, "the second answer came from memory");
+    assert_eq!(s.state.atlas.used(), [2, 0, 2]);
     // Stale: asked again with its ETag, and atlas's 304 is the cached answer.
     let stale = json!({ "type": "series", "id": 1396 });
     s.tool("den_title", stale.clone()).await.unwrap();
     assert_eq!(s.tool("den_title", stale).await.unwrap()["indexed"], false);
-    assert_eq!(s.state.atlas.used(), [1, 1, 2]);
+    assert_eq!(s.state.atlas.used(), [2, 1, 3]);
     let (status, _, metrics) = s.send("GET", "/metrics", "", &[("authorization", "Bearer m")]).await;
     assert_eq!(status, StatusCode::OK);
     assert!(

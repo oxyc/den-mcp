@@ -266,8 +266,10 @@ pub fn list() -> Value {
             "name": "den_title",
             "title": "A title's facts",
             "description": "One title as Den describes it: Den's genre, subgenres and moods, plot facets (ending, \
-                tone, pacing, …), countries, languages, runtime, what it adapts, directors/writers and cast with \
-                their Wikidata ids. No plot summary, ratings or availability: share its url for those.",
+                tone, pacing, …), countries, languages, runtime, what it adapts, its iconic studios, and \
+                directors/writers (one list) and cast with their Wikidata ids. Techniques, warnings, subjects and \
+                places are filters only (den_filter_titles), not listed here. No plot summary, ratings or \
+                availability: share its url for those.",
             "inputSchema": title_ref,
             "annotations": read_only,
         },
@@ -1531,8 +1533,26 @@ async fn title_facts(ctx: &Ctx<'_>, args: &Value) -> Answer {
             .collect()
     };
     out.insert("directors_writers".into(), Value::Array(people("makers", true)));
+    // Den's index names a title's makers as one list; which of them directed and which wrote, it doesn't say.
+    out.insert(
+        "makers_note".into(),
+        json!("directors_writers is one list: Den's index doesn't say which of them directed and which wrote."),
+    );
     out.insert("cast".into(), Value::Array(people("cast", false)));
     put(&mut out, "cast_total", count(answer.get("castTotal")));
+    // Its iconic studios, from their own route; one atlas without it, or a title with none, has no field.
+    if let Ok((studios, _)) = ctx.atlas.get(&format!("/index/studios/{kind}/{id}.json"), ctx.rid).await {
+        let listed: Vec<Value> = studios
+            .get("studios")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|s| Some(json!({ "id": qid(s.get("id"))?, "name": text(s.get("name"))? })))
+            .collect();
+        if !listed.is_empty() {
+            out.insert("studios".into(), Value::Array(listed));
+        }
+    }
     out.insert("attribution".into(), json!(ATTRIBUTION));
     Ok(Value::Object(out))
 }
