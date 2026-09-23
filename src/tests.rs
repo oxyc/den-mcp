@@ -357,6 +357,22 @@ async fn protocol_errors_are_json_rpc_errors() {
         .send("POST", "/mcp", "{}", &[("authorization", &s.bearer), ("mcp-protocol-version", "1999-01-01")])
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    // A batch: answered member by member where the version has batches (2025-03-26, and a request naming none),
+    // refused where it doesn't.
+    let batch = r#"[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","method":"notifications/x"},
+                    {"jsonrpc":"2.0","id":2,"method":"tools/list"}]"#;
+    for version in [None, Some("2025-03-26")] {
+        let mut headers = vec![("authorization", s.bearer.as_str())];
+        headers.extend(version.map(|v| ("mcp-protocol-version", v)));
+        let (status, _, body) = s.send("POST", "/mcp", batch, &headers).await;
+        let replies: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replies.as_array().map(Vec::len), Some(2), "{version:?}: {body}");
+        assert_eq!((&replies[0]["id"], &replies[1]["id"]), (&json!(1), &json!(2)));
+    }
+    let (_, _, body) =
+        s.send("POST", "/mcp", batch, &[("authorization", &s.bearer), ("mcp-protocol-version", "2025-06-18")]).await;
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["error"]["code"], crate::mcp::INVALID_REQUEST);
     // A tool's own failure is a result the model reads, not a protocol error.
     let bad = s.tool("den_search", json!({ "query": "x" })).await;
     assert!(bad.unwrap_err().contains("at least 2"));

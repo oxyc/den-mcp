@@ -1,4 +1,5 @@
-//! MCP over Streamable HTTP, by hand: one JSON-RPC message per POST to `/mcp`, answered with one JSON body. The
+//! MCP over Streamable HTTP, by hand: one JSON-RPC message per POST to `/mcp` (or, under protocol 2025-03-26 —
+//! the version a request naming none is taken to speak — a batch of them), answered with one JSON body. The
 //! server keeps no session and never opens a stream of its own, which the transport allows — so there is no
 //! `Mcp-Session-Id` and `GET /mcp` is a 405. Only what a tools server needs: `initialize`, `ping`, `tools/list` and
 //! `tools/call`.
@@ -27,13 +28,43 @@ pub enum Message {
     NoReply,
 }
 
-/// The message in a POST body, or the error to answer it with.
-pub fn read(body: &[u8]) -> Result<Message, Value> {
+/// The version a request speaks when it names none: the transport says to assume 2025-03-26.
+pub const DEFAULT_VERSION: &str = "2025-03-26";
+
+/// The most messages one batch may carry.
+pub const MAX_BATCH: usize = 16;
+
+/// Whether `version` has JSON-RPC batches: 2025-03-26 does, and 2025-06-18 removed them.
+pub fn batches(version: &str) -> bool {
+    version == "2025-03-26"
+}
+
+/// A POST body: one message, or a batch of them (each read on its own, so one bad member is answered alone).
+pub enum Body {
+    One(Message),
+    Batch(Vec<Result<Message, Value>>),
+}
+
+/// The message or messages in a POST body, or the error to answer it with. A batch is read only when `version`
+/// has them.
+pub fn read(body: &[u8], version: &str) -> Result<Body, Value> {
     let value: Value =
         serde_json::from_slice(body).map_err(|_| error(Value::Null, PARSE_ERROR, "Parse error"))?;
-    if value.is_array() {
-        return Err(error(Value::Null, INVALID_REQUEST, "Batches are not supported"));
+    match value {
+        Value::Array(_) if !batches(version) => {
+            Err(error(Value::Null, INVALID_REQUEST, &format!("Batches are not part of protocol {version}")))
+        }
+        Value::Array(list) if list.is_empty() || list.len() > MAX_BATCH => Err(error(
+            Value::Null,
+            INVALID_REQUEST,
+            &format!("A batch holds 1 to {MAX_BATCH} messages"),
+        )),
+        Value::Array(list) => Ok(Body::Batch(list.into_iter().map(message).collect())),
+        value => message(value).map(Body::One),
     }
+}
+
+fn message(value: Value) -> Result<Message, Value> {
     if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return Err(error(
             value.get("id").cloned().unwrap_or(Value::Null),
@@ -90,16 +121,32 @@ mod tests {
 
     #[test]
     fn a_body_is_one_request_a_notification_or_an_error() {
-        let request = read(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
+        let one = |body: &[u8]| match read(body, "2025-06-18") {
+            Ok(Body::One(message)) => Ok(message),
+            Ok(Body::Batch(_)) => panic!("not a batch"),
+            Err(e) => Err(e),
+        };
+        let request = one(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
         assert!(matches!(request, Message::Request { ref method, .. } if method == "tools/list"));
         assert!(matches!(
-            read(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#),
+            one(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#),
             Ok(Message::NoReply)
         ));
-        assert!(matches!(read(br#"{"jsonrpc":"2.0","id":1,"result":{}}"#), Ok(Message::NoReply)));
-        assert_eq!(read(b"{nope").err().unwrap()["error"]["code"], PARSE_ERROR);
-        assert_eq!(read(b"[]").err().unwrap()["error"]["code"], INVALID_REQUEST);
-        assert_eq!(read(br#"{"id":1,"method":"x"}"#).err().unwrap()["error"]["code"], INVALID_REQUEST);
+        assert!(matches!(one(br#"{"jsonrpc":"2.0","id":1,"result":{}}"#), Ok(Message::NoReply)));
+        assert_eq!(one(b"{nope").err().unwrap()["error"]["code"], PARSE_ERROR);
+        assert_eq!(one(br#"{"id":1,"method":"x"}"#).err().unwrap()["error"]["code"], INVALID_REQUEST);
+    }
+
+    #[test]
+    fn a_batch_is_read_only_where_the_version_has_batches() {
+        let batch = br#"[{"jsonrpc":"2.0","id":1,"method":"ping"},{"id":2,"method":"x"}]"#;
+        for version in ["2025-06-18", "2025-11-25"] {
+            assert_eq!(read(batch, version).err().unwrap()["error"]["code"], INVALID_REQUEST, "{version}");
+        }
+        let Ok(Body::Batch(members)) = read(batch, "2025-03-26") else { panic!("a 2025-03-26 batch is read") };
+        assert!(matches!(members[0], Ok(Message::Request { .. })));
+        assert_eq!(members[1].as_ref().err().unwrap()["error"]["code"], INVALID_REQUEST, "each member alone");
+        assert_eq!(read(b"[]", "2025-03-26").err().unwrap()["error"]["code"], INVALID_REQUEST);
     }
 
     #[test]

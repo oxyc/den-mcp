@@ -301,11 +301,22 @@ where
             None,
         );
     };
-    let (answer, tool) = match mcp::read(&body) {
+    let (answer, tool) = match mcp::read(&body, version.unwrap_or(mcp::DEFAULT_VERSION)) {
         Err(error) => (Some(error), None),
-        Ok(mcp::Message::NoReply) => (None, None),
-        Ok(mcp::Message::Request { id, method, params }) => {
-            answer(state, &caller, id, &method, &params, rid).await
+        Ok(mcp::Body::One(message)) => reply(state, &caller, message, rid).await,
+        Ok(mcp::Body::Batch(members)) => {
+            // Each member answered in turn; notifications add nothing, and a batch of only those is a 202.
+            let mut replies = Vec::new();
+            let mut first_tool = None;
+            for member in members {
+                let (answer, tool) = match member {
+                    Err(error) => (Some(error), None),
+                    Ok(message) => reply(state, &caller, message, rid).await,
+                };
+                replies.extend(answer);
+                first_tool = first_tool.or(tool);
+            }
+            ((!replies.is_empty()).then_some(Value::Array(replies)), first_tool)
         }
     };
     let mut resp = match answer {
@@ -316,6 +327,18 @@ where
         resp.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
     }
     (resp, tool)
+}
+
+async fn reply(
+    state: &AppState,
+    caller: &auth::Caller,
+    message: mcp::Message,
+    rid: Option<&str>,
+) -> (Option<Value>, Option<&'static str>) {
+    match message {
+        mcp::Message::NoReply => (None, None),
+        mcp::Message::Request { id, method, params } => answer(state, caller, id, &method, &params, rid).await,
+    }
 }
 
 /// The tools' names as `&'static str`, for the log and the metrics labels: never a name a client made up.
