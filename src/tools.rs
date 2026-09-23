@@ -1432,6 +1432,11 @@ async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
             if let Some(url) = person_url(ctx.cfg, p.get("tmdbId").and_then(Value::as_u64), name) {
                 out.insert("url".into(), json!(url));
             }
+            // Their best-known matching titles (den-atlas#80), as titles with their Den Web pages.
+            let known = titles(ctx.cfg, p.get("knownFor"));
+            if !known.is_empty() {
+                out.insert("known_for".into(), Value::Array(known.into_iter().take(3).collect()));
+            }
             Some(Value::Object(out))
         })
         .collect();
@@ -1456,6 +1461,9 @@ async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
     }
     notes.push(if sorted {
         format!("Sorted by {sort}.")
+    } else if answer.get("orderUnavailable").is_some() {
+        // An atlas that orders people but has no popularity order to rank prominence by (den-atlas#78).
+        format!("Sorted by credits (most matching titles): this Den has no popularity order to sort by {sort}.")
     } else {
         format!("Sorted by credits (most matching titles): this Den's index can't sort people by {sort} yet.")
     });

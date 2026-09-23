@@ -72,6 +72,9 @@ fn canned(path: &str) -> Option<Value> {
         });
         if born == 1984 {
             answer["people"][0]["died"] = json!({ "precision": "year", "year": 2024 });
+        } else {
+            // What they are known for (den-atlas#80): titles from the corpus, planted with a TMDB field.
+            answer["people"][0]["knownFor"] = json!([card("movie", 949, "Heat", 1995), { "type": "movie" }]);
         }
         // An atlas that orders by name says so; one that names no order ordered by credits.
         if path.contains("order=name") {
@@ -631,7 +634,9 @@ async fn people_by_traits_and_an_age_range() {
         people[0],
         json!({ "id": "Q1976", "name": "Actor 1976", "credits": 4, "roles": ["cast"], "gender": ["male"],
                 "citizenship": ["Sweden"], "born": "1976-05-01", "age": year - 1976,
-                "url": "https://den.example/person/99-actor-1976" })
+                "url": "https://den.example/person/99-actor-1976",
+                "known_for": [{ "type": "movie", "id": 949, "title": "Heat", "year": 1995, "genre": "Crime",
+                                "language": "sv", "url": "https://den.example/movie/949-heat" }] })
     );
     assert_eq!(answer["on_record"]["gender"], "98% of credited people");
     assert!(answer["notes"][0].as_str().unwrap().contains("not complete"));
