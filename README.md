@@ -42,9 +42,11 @@ Den's own vocabulary — `counts.json` with no selection, kept for the hour atla
 separators (`mood:tense edge of seat` is `mood:Tense/Edge-of-seat`), and the answer's `read_as` says so; a value Den
 does not have is refused with the nearest three.
 
-An age range becomes the birth decades it spans (atlas's `born` trait is one decade a question), one question each,
-merged by credits and then held to the exact birth years; the answer says ages are ±1 and that people with no record
-for a trait are never matched.
+An age range becomes one birth-year range, atlas's `born:<from>-<to>` trait (den-atlas#85), with an open end left open
+(`born:1976-`, `born:-1996`), and pages like any other list. An atlas older than ranges answers that trait with a 400;
+den-mcp then asks the decades the range spans, one question each, merged and held to the exact birth years, within
+the first 100 people, and the answer's note says so. The answer says ages are ±1 and that people with no record for a
+trait are never matched.
 
 ### What an answer may carry
 

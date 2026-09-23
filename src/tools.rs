@@ -236,7 +236,8 @@ pub fn list() -> Value {
                 filtered by what Wikidata states about them. `sort`: prominence (how well known the matching \
                 titles they're credited on are; the default), credits (most matching titles), name, youngest, \
                 oldest; the answer's note says which order was used, since Den's index may not offer every one. \
-                Ages are from birth years, today. Citizenship takes a country's name or code; occupation a Q-id \
+                Ages are birth years counted back from this year, so ±1; either end of an age or birth-year range \
+                may be left open. Citizenship takes a country's name or code; occupation a Q-id \
                 from den_filter_values. People Wikidata has no record for on a trait are left out, so a list is \
                 never complete; say so.",
             "inputSchema": {
@@ -1452,6 +1453,83 @@ fn exact_year(value: &Value) -> Option<i64> {
         .then(|| value.get("year")?.as_i64())?
 }
 
+/// Whether atlas ordered people as asked: it names the order it used. One that names none predates ordering, and
+/// ordered by credits.
+fn honoured(answer: &Value, order: &str) -> bool {
+    answer.get("order").and_then(Value::as_str) == Some(order)
+}
+
+/// People found by birth years on an atlas without `born` ranges: the decades the years span, one question each,
+/// and the people in them held to the exact years. Every decade's first pages are merged in the asked order and cut
+/// to the page, so a page further in than the first hundred of any decade is not offered.
+async fn by_decades(
+    ctx: &Ctx<'_>,
+    scope: Scope,
+    sel: &[Item],
+    traits: &[Item],
+    order: &str,
+    (page, limit): (usize, usize),
+    (min, max): (i64, i64),
+) -> Result<(Vec<Value>, Value, Option<u64>, Arc<Value>, bool), ToolError> {
+    if min > max {
+        return Err(bad("the birth-year range is empty"));
+    }
+    let decades: Vec<i64> = (min.div_euclid(10)..=max.div_euclid(10)).map(|d| d * 10).collect();
+    if decades.len() as i64 > MAX_DECADES {
+        return Err(bad(format!("this Den's index takes an age range of at most {MAX_DECADES} decades")));
+    }
+    let want = (page + 1) * limit;
+    if want > sel::MAX_PAGE {
+        return Err(bad(
+            "this Den's index takes an age range only while page × limit stays within 100 people",
+        ));
+    }
+    let mut merged: Vec<(usize, Value)> = Vec::new();
+    let mut labels = Map::new();
+    let mut total = 0;
+    let mut last = Arc::new(Value::Null);
+    let mut sorted = true;
+    let mut urls = Vec::with_capacity(decades.len());
+    for decade in decades {
+        let mut with_born = traits.to_vec();
+        with_born.extend(sel::items(&[format!("born:{decade}")], scope).map_err(bad)?);
+        with_born.sort();
+        urls.push(sel::people_url(scope, sel, &with_born, order, Some((0, want))));
+    }
+    // Every decade asked at once, within atlas's own cap on requests in flight, and read in decade order.
+    let answers = join_all(urls.iter().map(|url| ctx.atlas.get(url, ctx.rid))).await;
+    for answer in answers {
+        let (answer, _) = answer?;
+        total += answer.get("total").and_then(Value::as_u64).unwrap_or(0);
+        if let Some(l) = answer.get("labels").and_then(Value::as_object) {
+            labels.extend(l.clone());
+        }
+        sorted &= honoured(&answer, order);
+        let list = answer.get("people").and_then(Value::as_array).cloned().unwrap_or_default();
+        merged.extend(list.into_iter().enumerate());
+        last = answer;
+    }
+    merged.retain(|(_, p)| p.get("born").and_then(exact_year).is_none_or(|year| (min..=max).contains(&year)));
+    // Prominence has no number to compare across decades, so each decade's order is kept and the decades are
+    // interleaved by rank: the most prominent of each, then the next of each.
+    let effective = if sorted { order } else { "credits" };
+    merged.sort_by(|(ra, a), (rb, b)| {
+        let credits = |p: &Value| p.get("credits").and_then(Value::as_u64).unwrap_or(0);
+        let year = |p: &Value| p.get("born").and_then(|b| b.get("year")).and_then(Value::as_i64);
+        let name = |p: &Value| p.get("name").and_then(Value::as_str).unwrap_or("").to_lowercase();
+        let by = match effective {
+            "prominence" => ra.cmp(rb),
+            "name" => name(a).cmp(&name(b)),
+            "born_desc" => year(b).cmp(&year(a)),
+            "born_asc" => year(a).unwrap_or(i64::MAX).cmp(&year(b).unwrap_or(i64::MAX)),
+            _ => credits(b).cmp(&credits(a)),
+        };
+        by.then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+    });
+    let people: Vec<Value> = merged.into_iter().map(|(_, p)| p).skip(page * limit).take(limit).collect();
+    Ok((people, Value::Object(labels), Some(total), last, sorted))
+}
+
 async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
     let scope = scope(args)?;
     let (sel, mut read_as) = selection(ctx, args, scope).await?;
@@ -1480,20 +1558,27 @@ async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
         traits.push(format!("citizenship:{item}"));
     }
     traits.extend(strings(args, "occupation")?.into_iter().map(|id| format!("occupation:{id}")));
-    // An age is a birth year counted back from this year; a range of either is the decades it spans, one question
-    // each, and the people in them held to the exact years. An open end is bounded: no one older than 100 is
-    // looked for by age, and no one born before 1900.
+    // An age is a birth year counted back from this year; a range of either is one `born:<from>-<to>` trait, an
+    // open end left open. Atlas names years from 1800 to next year, so the ends are held to those.
     let (age_min, age_max) = (integer(args, "age_min")?, integer(args, "age_max")?);
+    let latest = ctx.year + 1;
     let born_min = match (integer(args, "born_min")?, age_max) {
         (Some(year), _) => Some(year),
         (None, Some(age)) => Some(ctx.year - age - 1),
         _ => None,
-    };
+    }
+    .map(|year| year.clamp(sel::FIRST_BIRTH_YEAR, latest));
     let born_max = match (integer(args, "born_max")?, age_min) {
         (Some(year), _) => Some(year),
         (None, Some(age)) => Some(ctx.year - age),
         _ => None,
-    };
+    }
+    .map(|year| year.clamp(sel::FIRST_BIRTH_YEAR, latest));
+    if let (Some(min), Some(max)) = (born_min, born_max) {
+        if min > max {
+            return Err(bad("the birth-year range is empty"));
+        }
+    }
     let living = args.get("living").and_then(Value::as_bool).unwrap_or(false);
     let sort = string(args, "sort")?.unwrap_or("prominence");
     let order = match sort {
@@ -1505,83 +1590,33 @@ async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
         _ => return Err(bad("sort is prominence, credits, name, youngest or oldest")),
     };
     let traits = sel::items(&traits, scope).map_err(bad)?;
-    let labels_of = |answer: &Value| answer.get("labels").cloned().unwrap_or(Value::Null);
-    // Whether atlas ordered as asked: it names the order it used. One that names none predates ordering, and
-    // ordered by credits.
-    let honoured = |answer: &Value| answer.get("order").and_then(Value::as_str) == Some(order);
-    let (mut people, labels, total, answer, sorted) = match (born_min, born_max) {
-        (None, None) => {
-            let (skip, limit) = sel::page(page, limit);
-            let url = sel::people_url(scope, &sel, &traits, order, Some((skip, limit)));
-            let (answer, _) = ctx.atlas.get(&url, ctx.rid).await?;
+    let ranged = born_min.is_some() || born_max.is_some();
+    let mut asked = traits.clone();
+    if ranged {
+        let end = |year: Option<i64>| year.map_or(String::new(), |y| y.to_string());
+        let range = format!("born:{}-{}", end(born_min), end(born_max));
+        asked.extend(sel::items(&[range], scope).map_err(bad)?);
+        asked.sort();
+    }
+    let (skip, page_limit) = sel::page(page, limit);
+    let url = sel::people_url(scope, &sel, &asked, order, Some((skip, page_limit)));
+    let mut by_decade = false;
+    let (mut people, labels, total, answer, sorted) = match ctx.atlas.get(&url, ctx.rid).await {
+        Ok((answer, _)) => {
             let people = answer.get("people").and_then(Value::as_array).cloned().unwrap_or_default();
-            let sorted = honoured(&answer);
-            (people, labels_of(&answer), answer.get("total").and_then(Value::as_u64), answer, sorted)
+            let sorted = honoured(&answer, order);
+            let labels = answer.get("labels").cloned().unwrap_or(Value::Null);
+            (people, labels, answer.get("total").and_then(Value::as_u64), answer, sorted)
         }
-        (min, max) => {
-            let max = max.unwrap_or(ctx.year);
-            let min = min.unwrap_or(if age_min.is_some() { ctx.year - 101 } else { 1900 });
-            if min > max {
-                return Err(bad("the birth-year range is empty"));
-            }
-            let decades: Vec<i64> = (min.div_euclid(10)..=max.div_euclid(10)).map(|d| d * 10).collect();
-            if decades.len() as i64 > MAX_DECADES {
-                return Err(bad(format!("an age range spans at most {MAX_DECADES} decades")));
-            }
-            // Every decade's first pages, merged in the asked order and cut to the page: a page further in than the
-            // first hundred of any decade is not offered.
-            let want = (page + 1) * limit;
-            if want > sel::MAX_PAGE {
-                return Err(bad("with an age range, page × limit stays within 100 people"));
-            }
-            let mut merged: Vec<(usize, Value)> = Vec::new();
-            let mut labels = Map::new();
-            let mut total = 0;
-            let mut last = Arc::new(Value::Null);
-            let mut sorted = true;
-            let mut urls = Vec::with_capacity(decades.len());
-            for decade in decades {
-                let mut with_born = traits.clone();
-                with_born.extend(sel::items(&[format!("born:{decade}")], scope).map_err(bad)?);
-                with_born.sort();
-                urls.push(sel::people_url(scope, &sel, &with_born, order, Some((0, want))));
-            }
-            // Every decade asked at once, within atlas's own cap on requests in flight, and read in decade order.
-            let answers = join_all(urls.iter().map(|url| ctx.atlas.get(url, ctx.rid))).await;
-            for answer in answers {
-                let (answer, _) = answer?;
-                total += answer.get("total").and_then(Value::as_u64).unwrap_or(0);
-                if let Some(l) = answer.get("labels").and_then(Value::as_object) {
-                    labels.extend(l.clone());
-                }
-                sorted &= honoured(&answer);
-                let list = answer.get("people").and_then(Value::as_array).cloned().unwrap_or_default();
-                merged.extend(list.into_iter().enumerate());
-                last = answer;
-            }
-            merged.retain(|(_, p)| {
-                p.get("born").and_then(exact_year).is_none_or(|year| (min..=max).contains(&year))
-            });
-            // Prominence has no number to compare across decades, so each decade's order is kept and the decades
-            // are interleaved by rank: the most prominent of each, then the next of each.
-            let effective = if sorted { order } else { "credits" };
-            merged.sort_by(|(ra, a), (rb, b)| {
-                let credits = |p: &Value| p.get("credits").and_then(Value::as_u64).unwrap_or(0);
-                let year = |p: &Value| p.get("born").and_then(|b| b.get("year")).and_then(Value::as_i64);
-                let name = |p: &Value| p.get("name").and_then(Value::as_str).unwrap_or("").to_lowercase();
-                let by = match effective {
-                    "prominence" => ra.cmp(rb),
-                    "name" => name(a).cmp(&name(b)),
-                    "born_desc" => year(b).cmp(&year(a)),
-                    "born_asc" => year(a).unwrap_or(i64::MAX).cmp(&year(b).unwrap_or(i64::MAX)),
-                    _ => credits(b).cmp(&credits(a)),
-                };
-                by.then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
-            });
-            let people: Vec<Value> =
-                merged.into_iter().map(|(_, p)| p).skip(page * limit).take(limit).collect();
-            (people, Value::Object(labels), Some(total), last, sorted)
+        // An atlas older than birth-year ranges (den-atlas#85) refuses one as a decade it cannot read: it is asked
+        // by decade instead, as before ranges.
+        Err(failed) if ranged && failed.status == Some(400) => {
+            by_decade = true;
+            let min = born_min.unwrap_or(if age_min.is_some() { ctx.year - 101 } else { 1900 });
+            let max = born_max.unwrap_or(ctx.year);
+            by_decades(ctx, scope, &sel, &traits, order, (page, limit), (min, max)).await?
         }
+        Err(failed) => return Err(failed.into()),
     };
     let dropped_dead = if living {
         let before = people.len();
@@ -1639,15 +1674,22 @@ async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
     let mut out = listing(results, total, page, limit);
     said(&mut out, read_as);
     let mut notes = vec!["Wikidata's credits and traits: no record, no match, so not complete.".to_owned()];
-    if born_min.is_some() || born_max.is_some() {
+    if by_decade {
         notes.push(
-            "Ages are this year minus the birth year, so ±1; people dated only to a decade are kept when \
-                    the decade overlaps. The total counts whole decades."
+            "This Den's index has no birth-year ranges yet, so it was asked by decade: ages are this year minus \
+                    the birth year, so ±1; people dated only to a decade are kept when the decade overlaps. The \
+                    total counts whole decades."
                 .to_owned(),
         );
-        if !living {
-            notes.push("People who have died match too; pass living: true to leave them out.".to_owned());
-        }
+    } else if ranged {
+        notes.push(
+            "Ages are this year minus the birth year, so ±1; people dated only to a decade or century are in \
+                    only when all of it is inside the range."
+                .to_owned(),
+        );
+    }
+    if ranged && !living {
+        notes.push("People who have died match too; pass living: true to leave them out.".to_owned());
     }
     if dropped_dead > 0 {
         notes.push(format!("{dropped_dead} who have died were left out of this page, so it may be short."));

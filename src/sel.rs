@@ -207,6 +207,8 @@ pub fn normalise(kind: &str, id: &str, scope: Scope) -> Result<(String, String),
             .to_owned()
     } else if INTEGER.contains(&k) {
         number()?.to_string()
+    } else if k == "born" && id.contains('-') {
+        born_range(id)?
     } else if DECADE.contains(&k) {
         (number()? / 10 * 10).to_string()
     } else if UPPER.contains(&k) {
@@ -241,7 +243,39 @@ pub fn normalise(kind: &str, id: &str, scope: Scope) -> Result<(String, String),
     Ok((kind, id))
 }
 
-/// A list of `[-]kind:id` items, normalised, sorted by kind, then positive before excluded, then id, each once.
+/// The earliest birth year a `born` range may name; the latest is next year.
+pub const FIRST_BIRTH_YEAR: i64 = 1800;
+
+/// A `born` range of birth years as atlas spells it (`1976-1996`, `1976-`, `-1996`): both ends inclusive, either
+/// left out, each a year from `FIRST_BIRTH_YEAR` to next year.
+fn born_range(id: &str) -> Result<String, String> {
+    let latest = crate::year_of(crate::unix_now()) + 1;
+    let (from, to) = id.split_once('-').ok_or_else(|| format!("born: {id:?} is not <year>-<year>"))?;
+    let year = |end: &str| -> Result<Option<i64>, String> {
+        let end = end.trim();
+        if end.is_empty() {
+            return Ok(None);
+        }
+        let year = end
+            .parse::<i64>()
+            .ok()
+            .filter(|_| end.bytes().all(|b| b.is_ascii_digit()))
+            .ok_or_else(|| format!("born: {id:?} is not <year>-<year>"))?;
+        if !(FIRST_BIRTH_YEAR..=latest).contains(&year) {
+            return Err(format!("born: {year} is not a birth year from {FIRST_BIRTH_YEAR} to {latest}"));
+        }
+        Ok(Some(year))
+    };
+    let end = |year: Option<i64>| year.map_or(String::new(), |y| y.to_string());
+    match (year(from)?, year(to)?) {
+        (None, None) => Err(format!("born: {id:?} names no year")),
+        (Some(from), Some(to)) if from > to => Err(format!("born: {id:?} ends before it starts")),
+        (from, to) => Ok(format!("{}-{}", end(from), end(to))),
+    }
+}
+
+/// A list of `[-]kind:id` items, normalised, sorted by kind, then positive before excluded, then id, each once. A
+/// `born` range beside another positive `born` pick is refused, as atlas refuses it.
 pub fn items(raw: &[String], scope: Scope) -> Result<Vec<Item>, String> {
     let mut out = Vec::with_capacity(raw.len());
     for item in raw.iter().flat_map(|i| i.split(',')).map(str::trim).filter(|i| !i.is_empty()) {
@@ -257,6 +291,10 @@ pub fn items(raw: &[String], scope: Scope) -> Result<Vec<Item>, String> {
     out.dedup();
     if out.len() > MAX_ITEMS {
         return Err(format!("at most {MAX_ITEMS} values in one list"));
+    }
+    let born: Vec<&Item> = out.iter().filter(|i| i.kind == "born" && !i.exclude).collect();
+    if born.len() > 1 && born.iter().any(|i| i.id.contains('-')) {
+        return Err("born: one range per request, and no other born pick beside it".to_owned());
     }
     Ok(out)
 }
@@ -427,6 +465,8 @@ mod tests {
             let number =
                 |name: &str, default: usize| params.get(name).map_or(default, |v| v.parse().unwrap());
             let limit = number("limit", PAGE).clamp(1, MAX_PAGE);
+            let order = params.get("order").map(|o| o.to_ascii_lowercase()).filter(|o| !o.is_empty());
+            let order = order.as_deref().unwrap_or("prominence");
             let built = match &segments[1..] {
                 ["counts.json"] => counts_url(scope, &list("sel")),
                 ["titles.json"] => titles_url(scope, &list("sel"), number("skip", 0), limit),
@@ -442,16 +482,14 @@ mod tests {
                     )
                     .unwrap()
                 }
-                ["people.json"] => people_url(
-                    scope,
-                    &list("sel"),
-                    &list("traits"),
-                    "prominence",
-                    Some((number("skip", 0), limit)),
-                ),
+                ["people.json"] => {
+                    people_url(scope, &list("sel"), &list("traits"), order, Some((number("skip", 0), limit)))
+                }
                 ["people", "counts.json"] => {
                     people_url(scope, &list("sel"), &list("traits"), "prominence", None)
                 }
+                // Asked here without traits: `a_trait_lookup_is_spelled_as_atlas_answers_it` checks these.
+                ["people", "values", _] => continue,
                 other => panic!("an unknown route in the fixture: {other:?}"),
             };
             assert_eq!(built, canonical, "{url}");
@@ -466,14 +504,19 @@ mod tests {
             let sel =
                 query.split('&').find_map(|p| p.strip_prefix("sel=").or_else(|| p.strip_prefix("traits=")));
             let paged = query.contains("skip=10&limit=24") || query.contains("skip=x");
+            let bad_order = query
+                .split('&')
+                .filter_map(|p| p.strip_prefix("order="))
+                .any(|o| !ORDERS.contains(&o.to_ascii_lowercase().as_str()));
             let short_q = url.contains("/values/") && !url.contains("q=")
                 || url.contains("q=b")
-                || url.contains("q=wa");
+                || url.contains("q=wa")
+                || query.split('&').any(|p| p == "q=i");
             if let Some(sel) = sel {
                 // born:1970s and gender:male are refused by what the id is, like every other sel refusal.
                 assert!(items(&[percent_decode(sel)], scope).is_err(), "{url} should be refused");
             } else {
-                assert!(paged || short_q, "{url}: a refusal this test does not model");
+                assert!(paged || short_q || bad_order, "{url}: a refusal this test does not model");
             }
         }
     }
