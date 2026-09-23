@@ -258,6 +258,23 @@ pub mod tests {
         assert_eq!(check("a.b", now), Err(Refused::Invalid("malformed")));
     }
 
+    /// A token den-edge's `oauth::access_token` signed (its `the_token_shape_den_mcp_holds_as_a_vector`), with the
+    /// same test key: what den-edge mints is what this verifies.
+    #[test]
+    fn a_token_den_edge_signs_verifies() {
+        const SIGNED: &str = "eyJhbGciOiJFZERTQSIsImtpZCI6ImZlODEyYzEyZjNhYjRjZTYiLCJ0eXAiOiJhdCtqd3QifQ.\
+            eyJhdWQiOiJodHRwczovL2Rlbi5leGFtcGxlL21jcCIsImNsaWVudF9pZCI6ImMxIiwiZXhwIjoxODAwMDAwOTAwLCJpYXQiOjE4MDAw\
+            MDAwMDAsImlzcyI6Imh0dHBzOi8vZGVuLmV4YW1wbGUiLCJqdGkiOiI0YWM4Y2MyMmU2MDkyNTYwYWFhZTJiODY2OWY3ZTE3NyIsImtp\
+            bmQiOiJndWVzdCIsInNjb3BlIjoiZGVuOnNlYXJjaCIsInN1YiI6IjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIn0.\
+            A5trlYJ9ziYFBg93YOOqg9L1-3reCylq-cKRPSFdrWnz4moZUHDByGU-8mzczQXd5HctPzZas7UPzJPqZhwtCw";
+        let caller = check(SIGNED, 1_800_000_100).unwrap();
+        assert_eq!(
+            caller,
+            Caller { session: "0123456789abcdef0123456789abcdef".into(), kind: "guest".into() }
+        );
+        assert_eq!(check(SIGNED, 1_800_000_900 + 31), Err(Refused::Invalid("expired")));
+    }
+
     #[test]
     fn a_session_gets_its_burst_then_its_rate() {
         let limit = RateLimit::new(60, 3);
