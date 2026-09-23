@@ -51,6 +51,9 @@ pub struct AppState {
     pub request_slots: tokio::sync::Semaphore,
 }
 
+/// The most connections open at once (den-edge keeps a few alive; a flood waits in the listen backlog).
+pub const MAX_CONNECTIONS: usize = 128;
+
 /// The most POSTs to /mcp handled at once: bodies are at most `MAX_BODY`, so this bounds what they can take.
 pub const MAX_REQUESTS: usize = 64;
 
@@ -447,8 +450,15 @@ pub async fn serve_until(
     grace: Duration,
 ) -> bool {
     let graceful = GracefulShutdown::new();
+    // Connections open at once. Each holds hyper's buffers and a task whether or not its request gets a slot, so a
+    // flood of them is bounded here: past this, a connection waits in the listen backlog until one closes.
+    let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     tokio::pin!(shutdown);
     loop {
+        let permit = tokio::select! {
+            permit = connections.clone().acquire_owned() => permit.expect("the semaphore is never closed"),
+            _ = &mut shutdown => break,
+        };
         let (stream, _) = tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok(pair) => pair,
@@ -475,6 +485,7 @@ pub async fn serve_until(
         let conn = graceful.watch(conn);
         tokio::spawn(async move {
             let _ = conn.await;
+            drop(permit);
         });
     }
     drop(listener);
