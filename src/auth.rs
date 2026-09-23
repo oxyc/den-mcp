@@ -74,9 +74,11 @@ pub fn verify(
     audience: &str,
     now: u64,
 ) -> Result<Caller, Refused> {
+    // The scheme is case-insensitive (RFC 9110 §11.1).
     let token = header
-        .and_then(|h| h.strip_prefix("Bearer ").or_else(|| h.strip_prefix("bearer ")))
-        .map(str::trim)
+        .and_then(|h| h.trim_start().split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token.trim())
         .ok_or(Refused::Missing)?;
     let bad = Refused::Invalid;
     let mut parts = token.split('.');
@@ -89,6 +91,11 @@ pub fn verify(
     // The algorithm is pinned, never read from the token: a token that names another is refused outright.
     if header.get("alg").and_then(Value::as_str) != Some("EdDSA") {
         return Err(bad("unsupported alg"));
+    }
+    // An access token, not some other JWT the same key might sign (RFC 9068 §4): `at+jwt`, or its full media type.
+    let typ = header.get("typ").and_then(Value::as_str).unwrap_or("");
+    if !typ.eq_ignore_ascii_case("at+jwt") && !typ.eq_ignore_ascii_case("application/at+jwt") {
+        return Err(bad("not an access token"));
     }
     let sig: [u8; 64] =
         b64url_decode(sig).and_then(|s| s.try_into().ok()).ok_or(bad("malformed signature"))?;
@@ -256,6 +263,35 @@ pub mod tests {
         assert_eq!(check(&parts.join("."), now), Err(Refused::Invalid("bad signature")));
         assert_eq!(verify(None, &[key().verifying_key()], "i", "a", now), Err(Refused::Missing));
         assert_eq!(check("a.b", now), Err(Refused::Invalid("malformed")));
+        // Signed by the right key but not an access token: a JWT of another type, or one that names none.
+        for head in [br#"{"alg":"EdDSA","typ":"JWT"}"#.as_slice(), br#"{"alg":"EdDSA"}"#] {
+            let signed = format!("{}.{}", b64url(head), b64url(claims(now).to_string().as_bytes()));
+            let sig = b64url(&key().sign(signed.as_bytes()).to_bytes());
+            assert_eq!(check(&format!("{signed}.{sig}"), now), Err(Refused::Invalid("not an access token")));
+        }
+    }
+
+    #[test]
+    fn the_bearer_scheme_is_read_in_any_case() {
+        let now = 1_800_000_000;
+        let token = token(&key(), &claims(now));
+        for scheme in ["Bearer", "bearer", "BEARER", "BeArEr"] {
+            let header = format!("{scheme} {token}");
+            let caller = verify(
+                Some(&header),
+                &[key().verifying_key()],
+                "https://den.example",
+                "https://den.example/mcp",
+                now,
+            );
+            assert!(caller.is_ok(), "{scheme}");
+        }
+        let basic = format!("Basic {token}");
+        assert_eq!(
+            verify(Some(&basic), &[key().verifying_key()], "i", "a", now),
+            Err(Refused::Missing),
+            "another scheme is no bearer token"
+        );
     }
 
     /// A token den-edge's `oauth::access_token` signed (its `the_token_shape_den_mcp_holds_as_a_vector`), with the
