@@ -20,12 +20,14 @@ hyper-util = { version = "0.1", features = ["tokio", "http1", "server-graceful",
 http-body-util = "0.1"
 bytes = "1"
 serde_json = "1"
+# join_all, to ask atlas for several things at once. Already built as hyper-util's own dependency.
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 # Verifies den-edge's access tokens (EdDSA JWS). Pure Rust; `fast` keeps the precomputed tables that make a
 # verify ~50 µs.
 ed25519-dalek = { version = "3", default-features = false, features = ["fast"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "signal", "test-util"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "signal", "test-util", "io-util"] }
 
 # The fleet's release profile: fat LTO, one codegen unit, stripped. panic=unwind so a panic in one request
 # unwinds that connection rather than the whole server.

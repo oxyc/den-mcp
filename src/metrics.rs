@@ -16,6 +16,7 @@ const HELP: &[(&str, &str)] = &[
     ("mcp_tool_calls_total", "Tool calls, by tool and outcome (ok, error)."),
     ("mcp_auth_refused_total", "Requests to /mcp refused a token, by reason."),
     ("mcp_rate_limited_total", "Requests refused by the per-session rate limit."),
+    ("mcp_busy_total", "Requests or tool calls turned away because as many as allowed were already running."),
 ];
 
 impl Metrics {
@@ -27,8 +28,9 @@ impl Metrics {
         *self.micros.lock().unwrap_or_else(|e| e.into_inner()).entry(name).or_default() += micros;
     }
 
-    /// `cached` is the atlas cache's entries and bytes; `used` its answers from the cache, revalidated, fetched.
-    pub fn render(&self, cached: (usize, usize), used: [u64; 3]) -> String {
+    /// `cached` is the atlas cache's entries and bytes; `used` its answers from the cache, revalidated, fetched, and
+    /// stale on an atlas error.
+    pub fn render(&self, cached: (usize, usize), used: [u64; 4]) -> String {
         let mut out = String::with_capacity(2048);
         let _ = writeln!(
             out,
@@ -36,8 +38,9 @@ impl Metrics {
              # TYPE mcp_atlas_answers_total counter\n\
              mcp_atlas_answers_total{{source=\"cache\"}} {}\n\
              mcp_atlas_answers_total{{source=\"revalidated\"}} {}\n\
-             mcp_atlas_answers_total{{source=\"fetched\"}} {}",
-            used[0], used[1], used[2]
+             mcp_atlas_answers_total{{source=\"fetched\"}} {}\n\
+             mcp_atlas_answers_total{{source=\"stale\"}} {}",
+            used[0], used[1], used[2], used[3]
         );
         let _ = writeln!(
             out,

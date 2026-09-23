@@ -133,6 +133,10 @@ async fn stub_atlas() -> (String, Asked) {
                         seen.lock().unwrap().push(path.clone());
                     }
                     let revalidating = req.headers().get("if-none-match").is_some_and(|v| v == "\"v1\"");
+                    // A slow question, for timing what is asked at once against what is asked in turn.
+                    if path.contains("decade:1950") {
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    }
                     // One title is stale at once, so asking for it again revalidates.
                     let max_age = if path.contains("/series/1396") { 0 } else { 3600 };
                     let cache_control = format!("public, max-age={max_age}");
@@ -187,7 +191,10 @@ struct Server {
 impl Server {
     async fn new() -> Server {
         let (atlas, asked) = stub_atlas().await;
-        Server::with(config(atlas), asked)
+        let s = Server::with(config(atlas), asked);
+        // What the background refresh does at startup: the TMDB kinds as atlas's schema names them.
+        assert!(s.state.atlas.refresh_tmdb_kinds(None).await);
+        s
     }
 
     fn with(cfg: crate::config::Config, asked: Asked) -> Server {
@@ -351,6 +358,12 @@ async fn calls_past_the_cap_are_told_to_come_back_and_atlas_sees_no_more_than_it
     let mut cfg = config(atlas);
     cfg.atlas.timeout = std::time::Duration::from_millis(200);
     let s = Server::with(cfg, asked);
+    // Every request slot taken: a POST is a 503 before its body is read.
+    let held = s.state.request_slots.try_acquire_many(crate::MAX_REQUESTS as u32).unwrap();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+    let (status, headers, _) = s.send("POST", "/mcp", body, &[("authorization", &s.bearer)]).await;
+    assert_eq!((status, headers.contains_key("retry-after")), (StatusCode::SERVICE_UNAVAILABLE, true));
+    drop(held);
     // Every tool slot taken: the call is refused at once, as a result the model can act on, and atlas is not asked.
     let held = s.state.tool_slots.try_acquire_many(crate::MAX_TOOL_CALLS as u32).unwrap();
     let busy = s.tool("den_filter_titles", json!({ "sel": ["genre:80"] })).await.unwrap_err();
@@ -364,49 +377,6 @@ async fn calls_past_the_cap_are_told_to_come_back_and_atlas_sees_no_more_than_it
     assert!(s.asked.lock().unwrap().is_empty());
     drop(held);
     assert!(s.tool("den_filter_titles", json!({ "sel": ["genre:80"] })).await.is_ok());
-}
-
-/// Calls that find the TMDB kinds stale together read atlas's schema once, not once each.
-#[tokio::test]
-async fn a_stale_schema_is_read_once_however_many_calls_find_it() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let reads = Arc::new(AtomicUsize::new(0));
-    let seen = reads.clone();
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = listener.accept().await.unwrap();
-            let seen = seen.clone();
-            let service = hyper::service::service_fn(move |_req: Request<hyper::body::Incoming>| {
-                let seen = seen.clone();
-                async move {
-                    seen.fetch_add(1, Ordering::SeqCst);
-                    // Slow enough that every call finds the reading stale before the first read ends.
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    let body = json!({ "tmdb": { "filterKinds": ["rating", "character", "later"] } });
-                    Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(Bytes::from(
-                        body.to_string(),
-                    ))))
-                }
-            });
-            tokio::spawn(async move {
-                let io = hyper_util::rt::TokioIo::new(stream);
-                let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
-            });
-        }
-    });
-    let atlas = crate::atlas::Atlas::new(format!("http://{addr}"), std::time::Duration::from_secs(5));
-    let (a, b, c, d) = tokio::join!(
-        atlas.tmdb_kinds(None),
-        atlas.tmdb_kinds(None),
-        atlas.tmdb_kinds(None),
-        atlas.tmdb_kinds(None)
-    );
-    for kinds in [a, b, c, d] {
-        assert!(kinds.contains(&"later".to_owned()), "{kinds:?}");
-    }
-    assert_eq!(reads.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -659,7 +629,8 @@ async fn people_by_traits_and_an_age_range() {
         )
         .await
         .unwrap();
-    let asked = s.asked.lock().unwrap().clone();
+    let mut asked = s.asked.lock().unwrap().clone();
+    asked.sort();
     assert_eq!(
         asked,
         [
@@ -691,6 +662,18 @@ async fn people_by_traits_and_an_age_range() {
     let danes = s.tool("den_find_people", json!({ "citizenship": ["DK"], "type": "movie" })).await.unwrap();
     assert!(danes["read_as"][0].as_str().unwrap().contains("Q756617"));
     assert!(s.tool("den_find_people", json!({ "citizenship": ["Narnia"] })).await.is_err());
+}
+
+/// An age range's decades are asked at once: four slow questions take about as long as one, not four times as long.
+#[tokio::test]
+async fn an_age_ranges_decades_are_asked_at_once() {
+    let s = Server::new().await;
+    let started = std::time::Instant::now();
+    let args = json!({ "sel": ["decade:1950"], "born_min": 1900, "born_max": 1939 });
+    s.tool("den_find_people", args).await.unwrap();
+    assert_eq!(s.asked.lock().unwrap().len(), 4, "one question a decade");
+    // Each takes 300 ms: in turn that is 1.2 s.
+    assert!(started.elapsed() < std::time::Duration::from_millis(900), "{:?}", started.elapsed());
 }
 
 #[tokio::test]
@@ -807,12 +790,12 @@ async fn an_answer_is_kept_and_revalidated_by_etag() {
     s.tool("den_title", args).await.unwrap();
     // The title and its studios, each asked once: the second answer came from memory.
     assert_eq!(s.asked.lock().unwrap().len(), 2, "the second answer came from memory");
-    assert_eq!(s.state.atlas.used(), [2, 0, 2]);
+    assert_eq!(s.state.atlas.used(), [2, 0, 2, 0]);
     // Stale: asked again with its ETag, and atlas's 304 is the cached answer.
     let stale = json!({ "type": "series", "id": 1396 });
     s.tool("den_title", stale.clone()).await.unwrap();
     assert_eq!(s.tool("den_title", stale).await.unwrap()["indexed"], false);
-    assert_eq!(s.state.atlas.used(), [2, 1, 3]);
+    assert_eq!(s.state.atlas.used(), [2, 1, 3, 0]);
     let (status, _, metrics) = s.send("GET", "/metrics", "", &[("authorization", "Bearer m")]).await;
     assert_eq!(status, StatusCode::OK);
     assert!(

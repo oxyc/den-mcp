@@ -22,7 +22,9 @@ use crate::atlas::{encode, Atlas, Failed};
 use crate::config::Config;
 use crate::names;
 use crate::sel::{self, Item, Scope};
+use futures_util::future::join_all;
 use serde_json::{json, Map, Value};
+use std::sync::Arc;
 
 /// Said with every list: what the results are drawn from.
 const CORPUS: &str =
@@ -642,14 +644,14 @@ const SPELLED: &[&str] = &[
 
 /// Den's own vocabulary: every value of every short-list kind, with its label where it has one. counts.json with no
 /// selection lists them whole; atlas marks it fresh for an hour, and it is kept here for that long.
-async fn vocabulary_of(ctx: &Ctx<'_>) -> Option<Value> {
+async fn vocabulary_of(ctx: &Ctx<'_>) -> Option<Arc<Value>> {
     ctx.atlas.get(&sel::counts_url(Scope::All, &[]), ctx.rid).await.ok().map(|(v, _)| v)
 }
 
 /// `sel` read against Den's vocabulary: "mood:tense edge of seat" is `mood:Tense/Edge-of-seat`, "genre:crime" is
 /// `genre:80`. What was read differently is said back, and a value Den does not have is refused with the nearest.
 async fn vocabulary(ctx: &Ctx<'_>, raw: Vec<String>) -> Result<(Vec<String>, Vec<String>), ToolError> {
-    let mut vocab: Option<Option<Value>> = None;
+    let mut vocab: Option<Option<Arc<Value>>> = None;
     let mut out = Vec::with_capacity(raw.len());
     let mut read_as = Vec::new();
     for item in raw.iter().flat_map(|i| i.split(',')).map(str::trim).filter(|i| !i.is_empty()) {
@@ -1537,14 +1539,19 @@ async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
             let mut merged: Vec<(usize, Value)> = Vec::new();
             let mut labels = Map::new();
             let mut total = 0;
-            let mut last = Value::Null;
+            let mut last = Arc::new(Value::Null);
             let mut sorted = true;
+            let mut urls = Vec::with_capacity(decades.len());
             for decade in decades {
                 let mut with_born = traits.clone();
                 with_born.extend(sel::items(&[format!("born:{decade}")], scope).map_err(bad)?);
                 with_born.sort();
-                let url = sel::people_url(scope, &sel, &with_born, order, Some((0, want)));
-                let (answer, _) = ctx.atlas.get(&url, ctx.rid).await?;
+                urls.push(sel::people_url(scope, &sel, &with_born, order, Some((0, want))));
+            }
+            // Every decade asked at once, within atlas's own cap on requests in flight, and read in decade order.
+            let answers = join_all(urls.iter().map(|url| ctx.atlas.get(url, ctx.rid))).await;
+            for answer in answers {
+                let (answer, _) = answer?;
                 total += answer.get("total").and_then(Value::as_u64).unwrap_or(0);
                 if let Some(l) = answer.get("labels").and_then(Value::as_object) {
                     labels.extend(l.clone());
@@ -1815,9 +1822,11 @@ async fn similar(ctx: &Ctx<'_>, args: &Value) -> Answer {
     }
     // Each seed's row, interleaved: the first of each, then the second of each, so no one seed crowds out the
     // others. A title in several rows is listed once, where it first comes up; the seeds themselves never are.
+    // Every seed's row asked at once, within atlas's own cap on requests in flight.
+    let urls: Vec<String> = seeds.iter().map(|&(kind, id)| ask(kind, id)).collect::<Result<_, _>>()?;
     let mut rows = Vec::with_capacity(seeds.len());
-    for &(kind, id) in &seeds {
-        let (answer, _) = ctx.atlas.get(&ask(kind, id)?, ctx.rid).await?;
+    for answer in join_all(urls.iter().map(|url| ctx.atlas.get(url, ctx.rid))).await {
+        let (answer, _) = answer?;
         rows.push(titles(ctx.cfg, answer.get("titles")));
     }
     let key = |t: &Value| (t["type"].as_str().unwrap_or("").to_owned(), t["id"].as_u64().unwrap_or(0));

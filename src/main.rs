@@ -44,7 +44,16 @@ pub struct AppState {
     /// Tool calls running at once, across every session: past it a call is told to come back, so a burst queues at
     /// the client rather than in this server's memory or at atlas.
     pub tool_slots: tokio::sync::Semaphore,
+    /// POSTs to /mcp being handled at once, taken before a body is read: past it the request is a 503, so a flood of
+    /// connections cannot hold a body each in memory.
+    pub request_slots: tokio::sync::Semaphore,
 }
+
+/// The most POSTs to /mcp handled at once: bodies are at most `MAX_BODY`, so this bounds what they can take.
+pub const MAX_REQUESTS: usize = 64;
+
+/// The longest a tool call may take, all its questions to atlas included: under den-edge's 60 s relay timeout.
+const TOOL_DEADLINE: Duration = Duration::from_secs(45);
 
 /// The most tool calls run at once. A call takes a few milliseconds of atlas's time, so this is far above any one
 /// household's use and bounds what many sessions together can put on atlas.
@@ -60,6 +69,7 @@ impl AppState {
             limit,
             metrics: metrics::Metrics::default(),
             tool_slots: tokio::sync::Semaphore::new(MAX_TOOL_CALLS),
+            request_slots: tokio::sync::Semaphore::new(MAX_REQUESTS),
         }
     }
 }
@@ -260,6 +270,13 @@ where
     B: hyper::body::Body<Data = Bytes> + Send + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    // Before anything is read: past the cap, the request is turned away while it costs only its head.
+    let Ok(_slot) = state.request_slots.try_acquire() else {
+        state.metrics.count("mcp_busy_total", String::new());
+        let mut resp = json_response(StatusCode::SERVICE_UNAVAILABLE, &json!({ "error": "busy" }));
+        resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(2u32));
+        return (resp, None);
+    };
     let cors = match origin_allowed(state, &parts.headers) {
         Ok(cors) => cors,
         Err(()) => {
@@ -385,15 +402,22 @@ async fn answer(
                 return (Some(mcp::result(id, mcp::tool_result(busy))), Some(tool));
             };
             let started = Instant::now();
-            let tmdb_kinds = state.atlas.tmdb_kinds(rid).await;
+            let tmdb_kinds = state.atlas.tmdb_kinds();
             let ctx = tools::Ctx {
                 atlas: &state.atlas,
                 cfg: &state.cfg,
                 rid,
                 year: year_of(unix_now()),
-                tmdb_kinds: &tmdb_kinds,
+                tmdb_kinds: &tmdb_kinds[..],
             };
-            let answer = tools::call(&ctx, tool, &args).await.expect("a known tool runs");
+            // However many questions to atlas a call takes, it answers within TOOL_DEADLINE: under den-edge's own
+            // relay timeout, so the person hears "too long" from Den rather than a broken connection.
+            let answer = match tokio::time::timeout(TOOL_DEADLINE, tools::call(&ctx, tool, &args)).await {
+                Ok(answer) => answer.expect("a known tool runs"),
+                Err(_) => {
+                    Err(tools::ToolError("Den took too long to answer; try a narrower question.".into()))
+                }
+            };
             state.metrics.time("mcp_tool_seconds_total", started.elapsed().as_micros() as u64);
             let outcome = if answer.is_ok() { "ok" } else { "error" };
             state.metrics.count(
@@ -502,6 +526,15 @@ async fn run(cfg: config::Config) -> std::io::Result<()> {
     let shutdown = shutdown_signal();
     let listener = TcpListener::bind(("0.0.0.0", cfg.port)).await?;
     let state = Arc::new(AppState::new(cfg));
+    // The TMDB kinds are read from atlas's schema now and then hourly, off every call's path: a call reads the last
+    // good reading and never waits for the schema.
+    let schema = state.clone();
+    tokio::spawn(async move {
+        loop {
+            let read = schema.atlas.refresh_tmdb_kinds(None).await;
+            tokio::time::sleep(if read { atlas::SCHEMA_EVERY } else { atlas::SCHEMA_RETRY }).await;
+        }
+    });
     let cfg = &state.cfg;
     eprintln!(
         "den-mcp {} listening on :{} — atlas={} origin={} issuer={} token_keys={} rate={}/min burst={} metrics={} \
