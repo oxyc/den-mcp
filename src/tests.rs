@@ -50,7 +50,9 @@ fn canned(path: &str) -> Option<Value> {
                 "total": 2, "order": "like:movie-550", "coverage": {}, "ignored": [] })
     } else if path.starts_with("/index/filter/") && path.contains("/titles.json") {
         json!({ "titles": [card("movie", 5, "Let the Right One In", 2008)], "total": 31, "order": "x",
-                "coverage": {}, "ignored": [], "unknownValues": ["mood:tense"], "denominator": 47613 })
+                "coverage": { "language": { "count": 27, "denominator": 100 },
+                              "rating": { "count": 90, "denominator": 100 } },
+                "ignored": [], "unknownValues": ["mood:tense"], "denominator": 47613 })
     } else if path.contains("/values/") && !path.contains("/people/values/") {
         json!({ "kind": "person", "mode": "and", "complete": true,
                 "values": [{ "id": "Q25191", "name": "Christopher Nolan", "count": 12, "tmdbId": 525 }] })
@@ -508,6 +510,12 @@ async fn filter_titles_builds_the_canonical_url_and_refuses_ratings() {
     assert_eq!((answer["total"].clone(), answer["more"].clone()), (json!(31), json!(true)));
     assert_eq!(answer["unknown_values"], json!(["mood:tense"]));
     assert_eq!(answer["out_of"], "47,613 indexed titles");
+    // How much of the type each applied kind is on record for; a TMDB kind's share is never said.
+    assert_eq!(answer["on_record"], json!({ "language": "27% of films" }));
+    // Only popular order for now, and another is said rather than faked.
+    let newest = s.tool("den_filter_titles", json!({ "sel": ["genre:80"], "order": "newest" })).await.unwrap();
+    assert!(newest["order_note"].as_str().unwrap().contains("can't order titles by newest"));
+    assert!(s.tool("den_filter_titles", json!({ "order": "best" })).await.is_err());
     // TMDB's kinds are refused: the two this server knows, and one only atlas's schema names.
     for sel in ["rating:8", "character:walter white", "futuretmdb:1"] {
         let refused = s.tool("den_filter_titles", json!({ "sel": [sel] })).await.unwrap_err();

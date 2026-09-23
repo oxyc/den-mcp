@@ -193,7 +193,14 @@ pub fn list() -> Value {
                 once per value and merge, and use decades.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "type": type_all, "sel": sel_items, "page": page, "limit": limit20 },
+                "properties": {
+                    "type": type_all,
+                    "sel": sel_items,
+                    "order": { "type": "string", "enum": ["popular", "newest", "oldest"], "default": "popular",
+                               "description": "Only popular for now; the answer says so for the others" },
+                    "page": page,
+                    "limit": limit20,
+                },
             },
             "annotations": read_only,
         },
@@ -867,6 +874,10 @@ pub fn genre_name(id: u64) -> Option<&'static str> {
 
 async fn filter_titles(ctx: &Ctx<'_>, args: &Value) -> Answer {
     let scope = scope(args)?;
+    let order = string(args, "order")?;
+    if !matches!(order, None | Some("popular" | "newest" | "oldest")) {
+        return Err(bad("order is popular, newest or oldest"));
+    }
     let (sel, read_as) = selection(ctx, args, scope).await?;
     let (page, limit) = paging(args, 20)?;
     let (skip, limit) = sel::page(page, limit);
@@ -874,6 +885,36 @@ async fn filter_titles(ctx: &Ctx<'_>, args: &Value) -> Answer {
     let results = titles(ctx.cfg, answer.get("titles"));
     let mut out = listing(results, answer.get("total").and_then(Value::as_u64), page, limit);
     out_of(&mut out, answer.get("denominator"));
+    // How much of the corpus each applied kind is on record for: a filter on a kind known for a quarter of the
+    // titles can only ever find within that quarter.
+    let of = match scope {
+        Scope::Movie => "films",
+        Scope::Series => "series",
+        Scope::All => "titles",
+    };
+    if let Some(coverage) = answer.get("coverage").and_then(Value::as_object) {
+        let shares: Map<String, Value> = coverage
+            .iter()
+            .filter(|(kind, _)| !ctx.tmdb_kinds.contains(*kind))
+            .filter_map(|(kind, c)| {
+                let (n, total) = (c.get("count")?.as_f64()?, c.get("denominator")?.as_f64()?);
+                (total > 0.0).then(|| (kind.clone(), json!(format!("{:.0}% of {of}", n / total * 100.0))))
+            })
+            .collect();
+        if !shares.is_empty() {
+            out.insert("on_record".into(), Value::Object(shares));
+        }
+    }
+    // Titles come most popular first. Atlas has no other order for them yet, so another is said, not faked.
+    if let Some(order @ ("newest" | "oldest")) = order {
+        out.insert(
+            "order_note".into(),
+            json!(format!(
+                "Den's index can't order titles by {order} yet; these are most popular first. Narrow by \
+                 decade:<year> instead, or den_search with year_min/year_max."
+            )),
+        );
+    }
     said(&mut out, read_as);
     caveats(ctx, &mut out, &answer);
     Ok(Value::Object(out))
