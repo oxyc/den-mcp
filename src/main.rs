@@ -40,6 +40,8 @@ pub struct AppState {
     pub cfg: config::Config,
     pub atlas: atlas::Atlas,
     pub limit: auth::RateLimit,
+    /// Tokens already verified, until they expire: a signature is checked once per token, not per call.
+    pub tokens: auth::Verified,
     pub metrics: metrics::Metrics,
     /// Tool calls running at once, across every session: past it a call is told to come back, so a burst queues at
     /// the client rather than in this server's memory or at atlas.
@@ -67,6 +69,7 @@ impl AppState {
             cfg,
             atlas,
             limit,
+            tokens: auth::Verified::default(),
             metrics: metrics::Metrics::default(),
             tool_slots: tokio::sync::Semaphore::new(MAX_TOOL_CALLS),
             request_slots: tokio::sync::Semaphore::new(MAX_REQUESTS),
@@ -284,7 +287,7 @@ where
         }
     };
     let authorization = parts.headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
-    let caller = match auth::verify(
+    let caller = match state.tokens.verify(
         authorization,
         &state.cfg.token_keys,
         &state.cfg.issuer,

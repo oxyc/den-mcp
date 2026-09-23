@@ -760,13 +760,20 @@ fn edit_distance(a: &str, b: &str) -> usize {
 
 /// A title's name as Den Web writes it in a link (`route.ts` `slug`): lowercase words and hyphens, at most ~60.
 pub fn slug(name: &str) -> String {
-    let folded: String = name.to_lowercase().chars().map(fold).collect();
-    let mut words = String::with_capacity(folded.len());
-    for c in folded.chars() {
+    let mut words = String::with_capacity(name.len());
+    let mut push = |c: char| {
         if c.is_ascii_alphanumeric() {
             words.push(c);
         } else if !words.ends_with('-') {
             words.push('-');
+        }
+    };
+    // One pass: an ASCII letter is lower-cased where it stands, anything else lower-cased and folded.
+    for c in name.chars() {
+        if c.is_ascii() {
+            push(c.to_ascii_lowercase());
+        } else {
+            c.to_lowercase().for_each(|l| push(sel::fold_char(l)));
         }
     }
     let words = words.trim_matches('-');
@@ -775,12 +782,6 @@ pub fn slug(name: &str) -> String {
     }
     let cut = &words[..60];
     cut.rfind('-').map_or(cut, |i| &cut[..i]).trim_end_matches('-').to_owned()
-}
-
-fn fold(c: char) -> char {
-    const FROM: &str = "àáâãäåāăąçćčďèéêëēėęěìíîïīįñńňòóôõöøōőŕřśšşťùúûüūůűųýÿźżžðł";
-    const TO: &str = "aaaaaaaaacccdeeeeeeeeiiiiiinnnooooooooorrssstuuuuuuuuyyzzzdl";
-    FROM.chars().position(|f| f == c).and_then(|i| TO.chars().nth(i)).unwrap_or(c)
 }
 
 fn title_url(cfg: &Config, kind: &str, id: u64, name: Option<&str>) -> String {

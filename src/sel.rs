@@ -138,7 +138,10 @@ fn resolve_axis(kind: String, id: &str) -> String {
 
 /// Letters with a diacritic, folded to their base the way atlas's NFD fold does for Latin scripts. Anything else is
 /// only lower-cased: atlas answers another spelling too, so this is about sharing a cache entry, not correctness.
-fn fold_char(c: char) -> char {
+pub fn fold_char(c: char) -> char {
+    if c.is_ascii() {
+        return c;
+    }
     const FROM: &str = "àáâãäåāăąçćčďèéêëēėęěìíîïīįñńňòóôõöøōőŕřśšşťùúûüūůűųýÿźżžðł";
     const TO: &str = "aaaaaaaaacccdeeeeeeeeiiiiiinnnooooooooorrssstuuuuuuuuyyzzzdl";
     FROM.chars().position(|f| f == c).and_then(|i| TO.chars().nth(i)).unwrap_or(c)
@@ -146,10 +149,13 @@ fn fold_char(c: char) -> char {
 
 /// A name as atlas looks it up (`facts::name_key`): folded, and its words joined by single spaces.
 pub fn name_key(name: &str) -> String {
-    name.to_lowercase()
-        .chars()
-        .map(fold_char)
-        .collect::<String>()
+    // Most names are ASCII, which needs lower-casing and nothing else.
+    let lowered = if name.is_ascii() {
+        name.to_ascii_lowercase()
+    } else {
+        name.to_lowercase().chars().map(fold_char).collect::<String>()
+    };
+    lowered
         .replace('&', " and ")
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())

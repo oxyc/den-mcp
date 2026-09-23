@@ -31,6 +31,17 @@ pub fn b64url(bytes: &[u8]) -> String {
     out
 }
 
+/// Each byte's base64url value, or 0xFF for a byte that is none: one lookup a character rather than a search.
+const DECODE: [u8; 256] = {
+    let mut table = [0xFF; 256];
+    let mut i = 0;
+    while i < 64 {
+        table[B64[i] as usize] = i as u8;
+        i += 1;
+    }
+    table
+};
+
 /// Unpadded base64url, canonical only (leftover bits zero).
 pub fn b64url_decode(s: &str) -> Option<Vec<u8>> {
     if s.len() % 4 == 1 {
@@ -39,7 +50,11 @@ pub fn b64url_decode(s: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(s.len() * 3 / 4);
     let (mut acc, mut bits) = (0u32, 0);
     for b in s.bytes() {
-        acc = acc << 6 | B64.iter().position(|c| *c == b)? as u32;
+        let value = DECODE[b as usize];
+        if value == 0xFF {
+            return None;
+        }
+        acc = acc << 6 | u32::from(value);
         bits += 6;
         if bits >= 8 {
             bits -= 8;
@@ -66,6 +81,15 @@ pub enum Refused {
     Invalid(&'static str),
 }
 
+/// The bearer token in an `Authorization` header. The scheme is case-insensitive (RFC 9110 §11.1).
+fn bearer(header: Option<&str>) -> Result<&str, Refused> {
+    header
+        .and_then(|h| h.trim_start().split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token.trim())
+        .ok_or(Refused::Missing)
+}
+
 /// The `Authorization: Bearer` token, checked: signature by one of `keys`, issuer, audience, expiry, scope.
 pub fn verify(
     header: Option<&str>,
@@ -74,12 +98,63 @@ pub fn verify(
     audience: &str,
     now: u64,
 ) -> Result<Caller, Refused> {
-    // The scheme is case-insensitive (RFC 9110 §11.1).
-    let token = header
-        .and_then(|h| h.trim_start().split_once(' '))
-        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
-        .map(|(_, token)| token.trim())
-        .ok_or(Refused::Missing)?;
+    check(bearer(header)?, keys, issuer, audience, now).map(|(caller, _)| caller)
+}
+
+/// Tokens already verified, and when each expires: a client presents the same token for up to fifteen minutes, so a
+/// signature is checked once, not on every call. Keyed by the whole token, so nothing but that exact token (its claims
+/// and signature both) is taken from here. Bounded; the issuer, audience and keys are the server's own and never
+/// change while it runs.
+#[derive(Default)]
+pub struct Verified {
+    seen: Mutex<HashMap<String, (Caller, u64)>>,
+}
+
+/// The most verified tokens kept.
+const VERIFIED_KEPT: usize = 1024;
+
+impl Verified {
+    pub fn verify(
+        &self,
+        header: Option<&str>,
+        keys: &[VerifyingKey],
+        issuer: &str,
+        audience: &str,
+        now: u64,
+    ) -> Result<Caller, Refused> {
+        let token = bearer(header)?;
+        let fresh = |exp: u64| now <= exp + LEEWAY_SECS;
+        if let Some((caller, exp)) = self.seen.lock().unwrap_or_else(|e| e.into_inner()).get(token) {
+            if fresh(*exp) {
+                return Ok(caller.clone());
+            }
+        }
+        let (caller, exp) = check(token, keys, issuer, audience, now)?;
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() >= VERIFIED_KEPT {
+            seen.retain(|_, (_, exp)| fresh(*exp));
+            if seen.len() >= VERIFIED_KEPT {
+                seen.clear();
+            }
+        }
+        seen.insert(token.to_owned(), (caller.clone(), exp));
+        Ok(caller)
+    }
+
+    #[cfg(test)]
+    pub fn kept(&self) -> usize {
+        self.seen.lock().unwrap().len()
+    }
+}
+
+/// A token checked, and its expiry.
+fn check(
+    token: &str,
+    keys: &[VerifyingKey],
+    issuer: &str,
+    audience: &str,
+    now: u64,
+) -> Result<(Caller, u64), Refused> {
     let bad = Refused::Invalid;
     let mut parts = token.split('.');
     let (Some(head), Some(body), Some(sig), None) = (parts.next(), parts.next(), parts.next(), parts.next())
@@ -138,7 +213,7 @@ pub fn verify(
         Some("guest") => "guest",
         _ => "member",
     };
-    Ok(Caller { session: session.to_owned(), kind: kind.to_owned() })
+    Ok((Caller { session: session.to_owned(), kind: kind.to_owned() }, exp))
 }
 
 /// A token bucket per session: `burst` calls at once, refilled at `per_minute`.
@@ -309,6 +384,36 @@ pub mod tests {
             Caller { session: "0123456789abcdef0123456789abcdef".into(), kind: "guest".into() }
         );
         assert_eq!(check(SIGNED, 1_800_000_900 + 31), Err(Refused::Invalid("expired")));
+    }
+
+    #[test]
+    fn a_verified_token_is_kept_until_it_expires_and_only_that_token() {
+        let now = 1_800_000_000;
+        let verified = Verified::default();
+        let (iss, aud) = ("https://den.example", "https://den.example/mcp");
+        let good = format!("Bearer {}", token(&key(), &claims(now)));
+        assert!(verified.verify(Some(&good), &[key().verifying_key()], iss, aud, now).is_ok());
+        // Kept: the same token again needs no key at all — its signature is not checked a second time.
+        assert!(verified.verify(Some(&good), &[], iss, aud, now + 60).is_ok());
+        // Another token, even one differing only in its claims, is checked from scratch.
+        let mut other = claims(now);
+        other["sub"] = "s2".into();
+        let other = format!("Bearer {}", token(&key(), &other));
+        assert_eq!(verified.verify(Some(&other), &[], iss, aud, now), Err(Refused::Invalid("bad signature")));
+        // Past its expiry, a kept token is checked again, and refused.
+        let later = now + 900 + LEEWAY_SECS + 1;
+        assert_eq!(
+            verified.verify(Some(&good), &[key().verifying_key()], iss, aud, later),
+            Err(Refused::Invalid("expired"))
+        );
+        // Bounded, however many tokens come.
+        for n in 0..(VERIFIED_KEPT as u64 + 50) {
+            let mut c = claims(now);
+            c["sub"] = format!("s{n}").into();
+            let t = format!("Bearer {}", token(&key(), &c));
+            verified.verify(Some(&t), &[key().verifying_key()], iss, aud, now).unwrap();
+        }
+        assert!(verified.kept() <= VERIFIED_KEPT);
     }
 
     #[test]
