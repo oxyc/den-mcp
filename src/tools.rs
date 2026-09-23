@@ -164,7 +164,8 @@ pub fn list() -> Value {
             "description": "Search Den's film and series index in plain words: a title, a person, \"the one where …\", \
                 a mood or theme (\"slow-burn 90s thrillers\", \"bleak korean heist\"). Den reads the words itself; put \
                 a year window or language you worked out in the parameters. Returns titles best first, what Den \
-                understood, and people the words named. For exact criteria use den_filter_titles.",
+                understood, and people the words named; `candidates` is how many the words reached, not a count \
+                of matches. For exact criteria use den_filter_titles.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -172,8 +173,10 @@ pub fn list() -> Value {
                     "type": { "type": "string", "enum": ["movie", "series"] },
                     "year_min": { "type": "integer" },
                     "year_max": { "type": "integer" },
-                    "language": { "type": "string", "description": "Original language, ISO 639-1" },
+                    "language": { "type": "string", "description": "Original language: a name or ISO 639-1" },
                     "runtime_max": { "type": "integer", "description": "Minutes; films only" },
+                    "broadcaster": { "type": "string",
+                                     "description": "Series only: a network's Q-id (den_filter_values kind=network)" },
                     "page": page,
                     "limit": limit10,
                 },
@@ -706,10 +709,15 @@ async fn search(ctx: &Ctx<'_>, args: &Value) -> Answer {
         }
     }
     if let Some(language) = string(args, "language")? {
-        if language.len() != 2 || !language.bytes().all(|b| b.is_ascii_alphabetic()) {
-            return Err(bad("language is an ISO 639-1 code, e.g. sv"));
-        }
-        url.push_str(&format!("&language={}", language.to_ascii_lowercase()));
+        let code = names::language(language)
+            .ok_or_else(|| bad("language is a language's name or ISO 639-1 code, e.g. Swedish or sv"))?;
+        url.push_str(&format!("&language={code}"));
+    }
+    // A series' broadcaster, as the network kind's Q-id.
+    if let Some(broadcaster) = string(args, "broadcaster")? {
+        let (_, qid) = sel::normalise("network", broadcaster, Scope::All)
+            .map_err(|_| bad("broadcaster is a network's Q-id from den_filter_values kind=network"))?;
+        url.push_str(&format!("&broadcaster={qid}"));
     }
     url.push_str(&format!("&skip={}&limit={limit}", page * limit));
     let (answer, _) = ctx.atlas.get(&url, ctx.rid).await?;
@@ -719,7 +727,19 @@ async fn search(ctx: &Ctx<'_>, args: &Value) -> Answer {
     let (named, tmdb): (Vec<Value>, Vec<Value>) =
         hits.into_iter().partition(|h| h.get("titleFrom").and_then(Value::as_str) != Some("tmdb"));
     let results = titles(ctx.cfg, Some(&Value::Array(named)));
-    let mut out = listing(results, answer.get("total").and_then(Value::as_u64), page, limit);
+    let shown = (page * limit + results.len()) as u64;
+    let mut out = listing(results, None, page, limit);
+    // Search ranks candidates rather than filtering to a set, so its count is how many titles the words reached, not
+    // how many match: said as such, never as a total.
+    if let Some(candidates) = answer.get("total").and_then(Value::as_u64) {
+        out.insert("candidates".into(), json!(candidates));
+        out.insert("more".into(), json!(candidates > shown));
+        out.insert(
+            "candidates_note".into(),
+            json!("How many titles the words reached, best first; not a count of exact matches. For an exact \
+                   count, den_filter_titles."),
+        );
+    }
     if !tmdb.is_empty() {
         out.insert(
             "left_out".into(),
@@ -762,6 +782,23 @@ async fn search(ctx: &Ctx<'_>, args: &Value) -> Answer {
             understood.insert("genres".into(), Value::Array(genres));
         }
         put(&mut understood, "excluded", texts(answer.pointer("/parse/excluded/phrases"), 16));
+        // Words read as something to leave out ("without gore") that matched nothing Den can leave out: nothing
+        // was, and a model should not say otherwise.
+        if let Some(excluded) = parse.get("excluded").filter(|e| e.is_object()) {
+            let listed = |key: &str| excluded.get(key).and_then(Value::as_array).is_some_and(|l| !l.is_empty());
+            let kinds =
+                ["countries", "decades", "mediaTypes", "genres", "labels", "plotFacets", "basedOnKind", "people"];
+            let matched = kinds.iter().any(|k| listed(k))
+                || excluded.get("titles").and_then(Value::as_u64).unwrap_or(0) > 0;
+            if !matched && listed("phrases") {
+                out.insert(
+                    "exclusion_note".into(),
+                    json!("Den read part of the question as something to leave out but matched it to nothing, so \
+                           nothing was left out. For content, den_filter_titles with -warning:<id> (den_filter_values \
+                           kind=warning lists them), or another -kind:<id>."),
+                );
+            }
+        }
     }
     if !understood.is_empty() {
         out.insert("understood".into(), Value::Object(understood));

@@ -25,6 +25,14 @@ fn canned(path: &str) -> Option<Value> {
     Some(if path == "/index/schema.json" {
         // A kind atlas grew after this server shipped: refused because the schema names it TMDB's.
         json!({ "tmdb": { "filterKinds": ["rating", "character", "futuretmdb"] } })
+    } else if path.starts_with("/index/query.json?q=heists%20without%20gore") {
+        // "without gore" read as something to leave out, matched to nothing Den can leave out.
+        json!({
+            "parse": { "leftover": "heists", "excluded": { "phrases": ["gore"], "countries": [], "decades": [],
+                       "mediaTypes": [], "genres": [], "labels": [], "plotFacets": [], "basedOnKind": [],
+                       "people": [], "titles": 0 } },
+            "hits": [card("movie", 949, "Heat", 1995)], "total": 480, "ignored": [], "unknownValues": [],
+        })
     } else if path.starts_with("/index/query.json") {
         json!({
             "parse": { "mediaType": null, "country": "SE", "decade": 1990, "genres": [53], "labels": ["Slow Burn"],
@@ -468,6 +476,22 @@ async fn search_answers_titles_people_and_what_it_understood() {
     assert_eq!(answer["results"].as_array().unwrap().len(), 2);
     assert!(answer["left_out"].as_str().unwrap().starts_with("1 "));
     assert_eq!(answer["not_applied"], json!(["country=FI"]));
+    // Search's count is how many titles the words reached, said as such and never as a total.
+    assert_eq!(answer["candidates"], 3);
+    assert!(answer.get("total").is_none());
+    assert!(answer["candidates_note"].as_str().unwrap().contains("not a count"));
+    assert!(answer.get("exclusion_note").is_none());
+    // An exclusion read and matched to nothing says nothing was left out, and where to leave it out instead.
+    let gore = s.tool("den_search", json!({ "query": "heists without gore" })).await.unwrap();
+    assert!(gore["exclusion_note"].as_str().unwrap().contains("-warning:"), "{gore}");
+    // A language by name, and a series' broadcaster by its Q-id.
+    s.tool("den_search", json!({ "query": "noir", "language": "Swedish", "broadcaster": "q907311" })).await.unwrap();
+    assert!(s
+        .asked
+        .lock()
+        .unwrap()
+        .contains(&"/index/query.json?q=noir&language=sv&broadcaster=Q907311&skip=0&limit=10".to_owned()));
+    assert!(s.tool("den_search", json!({ "query": "noir", "broadcaster": "Netflix" })).await.is_err());
 }
 
 #[tokio::test]
