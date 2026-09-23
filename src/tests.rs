@@ -722,6 +722,50 @@ async fn people_by_traits_and_an_age_range() {
     assert!(s.tool("den_find_people", json!({ "citizenship": ["Narnia"] })).await.is_err());
 }
 
+/// Several values of one trait or kind in one list are either; separate items, or a list of lists, all hold. Each is
+/// one item in atlas's canonical spelling, its `|` sent literally.
+#[tokio::test]
+async fn either_groups_are_one_item_each() {
+    let s = Server::new().await;
+    let last = |s: &Server| s.asked.lock().unwrap().last().unwrap().clone();
+    let answer = s
+        .tool(
+            "den_find_people",
+            json!({ "type": "movie", "sel": ["decade:2020"], "citizenship": ["American", "British"],
+                    "role": ["director", "cast"] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        last(&s),
+        "/index/filter/movie/people.json?sel=decade:2020&traits=citizenship:Q145|Q30,role:cast|director"
+    );
+    assert_eq!(answer["read_as"].as_array().unwrap().len(), 2, "{answer}");
+    // A single string still works, and a list of lists is dual citizens.
+    s.tool("den_find_people", json!({ "type": "movie", "citizenship": [["US"], ["GB"]], "role": "cast" }))
+        .await
+        .unwrap();
+    assert_eq!(last(&s), "/index/filter/movie/people.json?traits=citizenship:Q145,citizenship:Q30,role:cast");
+    s.tool(
+        "den_filter_titles",
+        json!({ "type": "movie", "sel": ["country:Italy|France", "-genre:horror|27"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(last(&s), "/index/filter/movie/titles.json?sel=country:FR|IT,-genre:27");
+    // A value atlas did not recognise is named in a note; the rest applied.
+    let unknown = s.tool("den_filter_titles", json!({ "sel": ["country:FR|IT"] })).await.unwrap();
+    assert!(unknown["notes"][0].as_str().unwrap().starts_with("mood:tense wasn't recognised"), "{unknown}");
+    // A kind counted under its own either-group is counted without it, and the answer says so.
+    let values =
+        s.tool("den_filter_values", json!({ "kind": "company", "sel": ["company:Q1|Q2"] })).await.unwrap();
+    assert!(
+        values["counts_note"].as_str().unwrap().contains("without your company either-group"),
+        "{values}"
+    );
+    assert!(s.tool("den_filter_titles", json!({ "sel": ["country:FR|"] })).await.is_err());
+}
+
 /// An atlas older than birth-year ranges refuses one; the range is then asked by decade, the decades at once: four
 /// slow questions take about as long as one, not four times as long.
 #[tokio::test]

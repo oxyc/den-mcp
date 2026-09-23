@@ -136,8 +136,10 @@ pub fn list() -> Value {
     });
     let sel_items = json!({
         "type": "array", "items": { "type": "string" }, "maxItems": 16,
-        "description": "Filters, all must hold, each \"kind:id\" (\"-kind:id\" excludes). Two values of one kind mean \
-            both; for either, ask once per value and merge. An example id per kind: language:sv or language:Swedish, \
+        "description": "Filters, all must hold, each \"kind:id\" (\"-kind:id\" excludes); at most 16 values in all. \
+            Several values in one item, joined by |, mean either: [\"country:FR|IT\"] is French or Italian titles, \
+            [\"-country:FR|IT\"] neither. Separate items of one kind mean all: [\"country:FR\", \"country:IT\"] is \
+            French-Italian co-productions. Every kind takes a group but like. An example id per kind: language:sv or language:Swedish, \
             country:SE or country:Sweden, region:scandinavian, decade:1990 (no year range: use the decades, or \
             den_search's year_min/year_max), primary:Crime, genre:80 or genre:Crime, subgenre:Heist, \
             mood:Tense/Edge-of-seat, animated:yes, runtime:under-90, source:book, ending:tragic, tone:bleak, \
@@ -149,6 +151,10 @@ pub fn list() -> Value {
             values and turns names into ids.",
     });
     let type_all = json!({ "type": "string", "enum": ["movie", "series", "all"], "default": "all" });
+    let role = json!({ "type": "string", "enum": ["cast", "director", "writer", "creator"] });
+    // A value, or a list of values any of which will do.
+    let trait_value =
+        json!({ "anyOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }] });
     let paging = |default: u32, max: u32| {
         (
             json!({ "type": "integer", "minimum": 0, "default": 0, "description": "0-based page" }),
@@ -192,8 +198,9 @@ pub fn list() -> Value {
             "title": "Filter Den's titles",
             "description": "Titles carrying every filter in `sel`, most popular first, paged, with the total. \
                 Languages and countries may be named (language:Swedish); people, companies and places need their \
-                Q-id from den_filter_values (\"Christopher Nolan\" → made:Q25191). No OR and no year range: ask \
-                once per value and merge, and use decades.",
+                Q-id from den_filter_values (\"Christopher Nolan\" → made:Q25191). Either of several values is one \
+                item joined by | ([\"decade:1980|1990\"] for the 80s or 90s); separate items all hold. No year \
+                range: use decades.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -238,8 +245,9 @@ pub fn list() -> Value {
                 oldest; the answer's note says which order was used, since Den's index may not offer every one. \
                 Ages are birth years counted back from this year, so ±1; either end of an age or birth-year range \
                 may be left open. Citizenship takes a country's name or code; occupation a Q-id \
-                from den_filter_values. People Wikidata has no record for on a trait are left out, so a list is \
-                never complete; say so.",
+                from den_filter_values. A trait's list is either (citizenship [\"American\", \"British\"]); a \
+                list of lists all ([[\"US\"], [\"GB\"]]: dual citizens). People Wikidata has no record for on a trait are left out, \
+                so a list is never complete; say so.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -250,16 +258,24 @@ pub fn list() -> Value {
                         "enum": ["prominence", "credits", "name", "youngest", "oldest"],
                         "default": "prominence",
                     },
-                    "role": { "type": "string", "enum": ["cast", "director", "writer", "creator"] },
-                    "gender": { "type": "string", "description": "male, female, non-binary, or a Wikidata Q-id" },
+                    "role": {
+                        "anyOf": [role, { "type": "array", "items": role }],
+                        "description": "A list is either: [\"cast\", \"director\"]",
+                    },
+                    "gender": {
+                        "anyOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }],
+                        "description": "male, female, non-binary, or a Wikidata Q-id; a list is either",
+                    },
                     "age_min": { "type": "integer" },
                     "age_max": { "type": "integer" },
                     "born_min": { "type": "integer", "description": "Birth year, instead of an age" },
                     "born_max": { "type": "integer" },
                     "living": { "type": "boolean", "description": "Leave out people who have died" },
-                    "citizenship": { "type": "array", "items": { "type": "string" },
-                                     "description": "Countries (Sweden, SE) or Q-ids, all held" },
-                    "occupation": { "type": "array", "items": { "type": "string" }, "description": "Q-ids, all held" },
+                    "citizenship": { "type": "array", "items": trait_value,
+                                     "description": "Countries (Sweden, SE) or Q-ids. A list is either \
+                                                     ([\"US\", \"GB\"]); a list of lists all ([[\"US\"], [\"GB\"]])" },
+                    "occupation": { "type": "array", "items": trait_value,
+                                    "description": "Q-ids. A list is either; a list of lists all" },
                     "page": page,
                     "limit": limit24,
                 },
@@ -650,7 +666,8 @@ async fn vocabulary_of(ctx: &Ctx<'_>) -> Option<Arc<Value>> {
 }
 
 /// `sel` read against Den's vocabulary: "mood:tense edge of seat" is `mood:Tense/Edge-of-seat`, "genre:crime" is
-/// `genre:80`. What was read differently is said back, and a value Den does not have is refused with the nearest.
+/// `genre:80`, each value of an OR group alone. What was read differently is said back, and a value Den does not
+/// have is refused with the nearest.
 async fn vocabulary(ctx: &Ctx<'_>, raw: Vec<String>) -> Result<(Vec<String>, Vec<String>), ToolError> {
     let mut vocab: Option<Option<Arc<Value>>> = None;
     let mut out = Vec::with_capacity(raw.len());
@@ -660,66 +677,74 @@ async fn vocabulary(ctx: &Ctx<'_>, raw: Vec<String>) -> Result<(Vec<String>, Vec
             Some(rest) => ("-", rest),
             None => ("", item),
         };
-        let Some((kind, id)) = rest.split_once(':') else {
+        let Some((kind, ids)) = rest.split_once(':') else {
             out.push(item.to_owned());
             continue;
         };
-        let (kind, id) = (kind.trim().to_ascii_lowercase(), id.trim());
-        let known: Vec<(String, Option<String>)> = if kind == "genre" {
-            if id.parse::<u32>().is_ok() {
-                out.push(item.to_owned());
-                continue;
-            }
-            GENRES.iter().map(|&(n, name)| (n.to_string(), Some(name.to_owned()))).collect()
-        } else if SPELLED.contains(&kind.as_str()) {
-            if vocab.is_none() {
-                vocab = Some(vocabulary_of(ctx).await);
-            }
-            let about =
-                vocab.as_ref().and_then(Option::as_ref).and_then(|v| v.pointer(&format!("/kinds/{kind}")));
-            let labels = about.and_then(|a| a.get("labels"));
-            match about.and_then(|a| a.get("values")).and_then(Value::as_object) {
-                Some(values) => values
-                    .keys()
-                    .map(|k| {
-                        (k.clone(), labels.and_then(|l| l.get(k)).and_then(Value::as_str).map(str::to_owned))
-                    })
-                    .collect(),
-                // Atlas did not list the kind (or could not be asked): the value goes as given, and atlas says
-                // whether it knows it.
-                None => {
-                    out.push(item.to_owned());
-                    continue;
-                }
-            }
-        } else {
-            out.push(item.to_owned());
-            continue;
-        };
-        if known.iter().any(|(k, _)| k == id) {
-            out.push(item.to_owned());
-            continue;
+        let kind = kind.trim().to_ascii_lowercase();
+        let mut read = Vec::new();
+        for id in ids.split('|').map(str::trim) {
+            read.push(vocabulary_value(ctx, &mut vocab, &kind, id, &mut read_as).await?);
         }
-        let key = sel::name_key(id);
-        let matched: Vec<&String> = known
-            .iter()
-            .filter(|(k, label)| {
-                sel::name_key(k) == key || label.as_deref().is_some_and(|l| sel::name_key(l) == key)
-            })
-            .map(|(k, _)| k)
-            .collect();
-        if let [one] = matched[..] {
-            read_as.push(format!("{kind}:{id} as {kind}:{one}"));
-            out.push(format!("{exclude}{kind}:{one}"));
-            continue;
-        }
-        let nearest = nearest(&key, &known);
-        return Err(bad(format!(
-            "{kind}:{id:?} is not one of Den's {kind} values. Nearest: {}. den_filter_values kind={kind} lists them.",
-            nearest.join(", ")
-        )));
+        out.push(format!("{exclude}{kind}:{}", read.join("|")));
     }
     Ok((out, read_as))
+}
+
+/// One value of `kind` as Den spells it (`vocabulary`); a value of a kind Den has no short list for goes as given.
+async fn vocabulary_value(
+    ctx: &Ctx<'_>,
+    vocab: &mut Option<Option<Arc<Value>>>,
+    kind: &str,
+    id: &str,
+    read_as: &mut Vec<String>,
+) -> Result<String, ToolError> {
+    let known: Vec<(String, Option<String>)> = if kind == "genre" {
+        if id.parse::<u32>().is_ok() {
+            return Ok(id.to_owned());
+        }
+        GENRES.iter().map(|&(n, name)| (n.to_string(), Some(name.to_owned()))).collect()
+    } else if SPELLED.contains(&kind) {
+        if vocab.is_none() {
+            *vocab = Some(vocabulary_of(ctx).await);
+        }
+        let about =
+            vocab.as_ref().and_then(Option::as_ref).and_then(|v| v.pointer(&format!("/kinds/{kind}")));
+        let labels = about.and_then(|a| a.get("labels"));
+        match about.and_then(|a| a.get("values")).and_then(Value::as_object) {
+            Some(values) => values
+                .keys()
+                .map(|k| {
+                    (k.clone(), labels.and_then(|l| l.get(k)).and_then(Value::as_str).map(str::to_owned))
+                })
+                .collect(),
+            // Atlas did not list the kind (or could not be asked): the value goes as given, and atlas says whether
+            // it knows it.
+            None => return Ok(id.to_owned()),
+        }
+    } else {
+        return Ok(id.to_owned());
+    };
+    if known.iter().any(|(k, _)| k == id) {
+        return Ok(id.to_owned());
+    }
+    let key = sel::name_key(id);
+    let matched: Vec<&String> = known
+        .iter()
+        .filter(|(k, label)| {
+            sel::name_key(k) == key || label.as_deref().is_some_and(|l| sel::name_key(l) == key)
+        })
+        .map(|(k, _)| k)
+        .collect();
+    if let [one] = matched[..] {
+        read_as.push(format!("{kind}:{id} as {kind}:{one}"));
+        return Ok(one.clone());
+    }
+    let nearest = nearest(&key, &known);
+    Err(bad(format!(
+        "{kind}:{id:?} is not one of Den's {kind} values. Nearest: {}. den_filter_values kind={kind} lists them.",
+        nearest.join(", ")
+    )))
 }
 
 /// The three values nearest a folded `key`: containing it or contained in it first, then by edit distance.
@@ -878,6 +903,27 @@ fn caveats(ctx: &Ctx<'_>, out: &mut Map<String, Value>, answer: &Value) {
             .collect();
         if !kept.is_empty() {
             out.insert(key.into(), Value::Array(kept));
+        }
+    }
+    // Atlas checks each value of a group alone: an unknown one matches nothing and the others still apply.
+    let unknown: Vec<String> = ["unknown_values", "unknown_traits"]
+        .iter()
+        .filter_map(|k| out.get(*k).and_then(Value::as_array))
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect();
+    if !unknown.is_empty() {
+        let note = format!(
+            "{} {} recognised, so matched nothing; the rest of the question applied, other values in the same \
+             either-group included.",
+            unknown.join(", "),
+            if unknown.len() == 1 { "wasn't" } else { "weren't" }
+        );
+        match out.get_mut("notes").and_then(Value::as_array_mut) {
+            Some(notes) => notes.push(json!(note)),
+            None => {
+                out.insert("notes".into(), json!([note]));
+            }
         }
     }
 }
@@ -1155,6 +1201,7 @@ async fn filter_values(ctx: &Ctx<'_>, args: &Value) -> Answer {
         counts.pointer(&format!("/kinds/{kind}")).filter(|a| a.get("complete") == Some(&json!(true)))
     {
         let mut out = whole_list(&kind, about, q);
+        group_note(&mut out, &sel, &kind);
         out_of(&mut out, counts.get("denominator"));
         said(&mut out, read_as);
         caveats(ctx, &mut out, &counts);
@@ -1192,10 +1239,25 @@ async fn filter_values(ctx: &Ctx<'_>, args: &Value) -> Answer {
     out.insert("use_as".into(), json!(format!("\"{kind}:<id>\" in sel")));
     out.insert("values".into(), Value::Array(values));
     put(&mut out, "complete", boolean(answer.get("complete")));
+    group_note(&mut out, &sel, &kind);
     out_of(&mut out, answer.get("denominator"));
     said(&mut out, read_as);
     caveats(ctx, &mut out, &answer);
     Ok(Value::Object(out))
+}
+
+/// Under an either-group of `kind` itself, atlas counts the kind's values without that group: each count is what
+/// adding the value to the group would bring, not how many of the selection carry it.
+fn group_note(out: &mut Map<String, Value>, sel: &[Item], kind: &str) {
+    if sel.iter().any(|i| i.kind == kind && !i.exclude && i.is_group()) {
+        out.insert(
+            "counts_note".into(),
+            json!(format!(
+                "Counted without your {kind} either-group, so each count is what that {kind} would bring if \
+                 added to it; the rest of sel applies."
+            )),
+        );
+    }
 }
 
 /// A value's name as a model should read it: a language's or country's English name, a genre's, else atlas's label.
@@ -1425,6 +1487,53 @@ fn gender_id(given: &str) -> Result<String, ToolError> {
     })
 }
 
+/// A citizenship is a Wikidata item, or a country as people name it: "Sweden", "Swedish", "SE" → Q34, said back in
+/// `read_as`.
+fn citizenship_id(given: &str, scope: Scope, read_as: &mut Vec<String>) -> Result<String, ToolError> {
+    if sel::normalise("citizenship", given, scope).is_ok() {
+        return Ok(given.to_owned());
+    }
+    let item = names::country(given).and_then(|code| Some((names::country_item(code)?, code)));
+    let Some((item, code)) = item else {
+        return Err(bad(format!(
+            "citizenship {given:?}: a country's name or ISO code, or a Q-id from den_filter_values kind=citizenship"
+        )));
+    };
+    read_as.push(format!("citizenship {given} as {} ({item})", names::country_name(code).unwrap_or(code)));
+    Ok(item.to_owned())
+}
+
+/// A trait argument as its groups of values. A string, or a list of strings, is one group: any of its values will
+/// do ("a|b" in a string is two). A list of lists is a group per inner list, every one held.
+fn trait_groups(args: &Value, key: &str) -> Result<Vec<Vec<String>>, ToolError> {
+    let group = |v: &Value| -> Result<Vec<String>, ToolError> {
+        let values = match v {
+            Value::Null => Vec::new(),
+            Value::String(s) => vec![s.as_str()],
+            Value::Array(list) => list
+                .iter()
+                .map(|x| x.as_str().ok_or_else(|| bad(format!("{key} holds strings, or lists of them"))))
+                .collect::<Result<_, _>>()?,
+            _ => return Err(bad(format!("{key} is a string or a list"))),
+        };
+        Ok(values
+            .iter()
+            .flat_map(|s| s.split('|'))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect())
+    };
+    let groups = match args.get(key) {
+        None => Vec::new(),
+        Some(Value::Array(list)) if list.iter().any(Value::is_array) => {
+            list.iter().map(group).collect::<Result<Vec<_>, _>>()?
+        }
+        Some(v) => vec![group(v)?],
+    };
+    Ok(groups.into_iter().filter(|g| !g.is_empty()).collect())
+}
+
 /// A birth or death as Wikidata dates it, as a model reads it: a date, a year, a decade or a century.
 fn date(value: &Value) -> Option<Value> {
     Some(match value.get("precision")?.as_str()? {
@@ -1534,30 +1643,22 @@ async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
     let scope = scope(args)?;
     let (sel, mut read_as) = selection(ctx, args, scope).await?;
     let (page, limit) = paging(args, sel::PAGE)?;
+    // Each trait argument is its OR groups, each one `trait:a|b` item: any of a group's values will do, and every
+    // group must hold.
     let mut traits: Vec<String> = Vec::new();
-    if let Some(role) = string(args, "role")? {
-        traits.push(format!("role:{role}"));
-    }
-    if let Some(gender) = string(args, "gender")? {
-        traits.push(format!("gender:{}", gender_id(gender)?));
-    }
-    // A citizenship is a Wikidata item, or a country as people name it: "Sweden", "Swedish", "SE" → Q34.
-    for given in strings(args, "citizenship")? {
-        if sel::normalise("citizenship", &given, scope).is_ok() {
-            traits.push(format!("citizenship:{given}"));
-            continue;
+    for kind in ["role", "gender", "citizenship", "occupation"] {
+        for group in trait_groups(args, kind)? {
+            let mut ids = Vec::with_capacity(group.len());
+            for given in group {
+                ids.push(match kind {
+                    "gender" => gender_id(&given)?,
+                    "citizenship" => citizenship_id(&given, scope, &mut read_as)?,
+                    _ => given,
+                });
+            }
+            traits.push(format!("{kind}:{}", ids.join("|")));
         }
-        let item = names::country(&given).and_then(|code| Some((names::country_item(code)?, code)));
-        let Some((item, code)) = item else {
-            return Err(bad(format!(
-                "citizenship {given:?}: a country's name or ISO code, or a Q-id from den_filter_values kind=citizenship"
-            )));
-        };
-        read_as
-            .push(format!("citizenship {given} as {} ({item})", names::country_name(code).unwrap_or(code)));
-        traits.push(format!("citizenship:{item}"));
     }
-    traits.extend(strings(args, "occupation")?.into_iter().map(|id| format!("occupation:{id}")));
     // An age is a birth year counted back from this year; a range of either is one `born:<from>-<to>` trait, an
     // open end left open. Atlas names years from 1800 to next year, so the ends are held to those.
     let (age_min, age_max) = (integer(args, "age_min")?, integer(args, "age_max")?);
