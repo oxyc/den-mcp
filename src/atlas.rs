@@ -92,7 +92,10 @@ impl Atlas {
     }
 
     /// Send `req`, once a slot is free, all within the request timeout.
-    async fn send(&self, req: Request<Full<Bytes>>) -> Result<hyper::Response<hyper::body::Incoming>, Failed> {
+    async fn send(
+        &self,
+        req: Request<Full<Bytes>>,
+    ) -> Result<hyper::Response<hyper::body::Incoming>, Failed> {
         tokio::time::timeout(self.timeout, async {
             let _slot = self.in_flight.acquire().await.map_err(|_| failed(None, "shutting down".into()))?;
             self.client.request(req).await.map_err(|e| failed(None, format!("atlas unreachable: {e}")))

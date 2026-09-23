@@ -185,7 +185,21 @@ pub fn normalise(kind: &str, id: &str, scope: Scope) -> Result<(String, String),
     }
     let k = kind.as_str();
     let number = || id.parse::<u32>().map_err(|_| format!("{kind}: {id:?} is not an integer"));
-    let id = if INTEGER.contains(&k) {
+    let two_letters = id.len() == 2 && id.bytes().all(|b| b.is_ascii_alphabetic());
+    let id = if k == "country" && !two_letters {
+        // A name or demonym: "Sweden", "Swedish" → SE.
+        crate::names::country(id)
+            .ok_or_else(|| {
+                format!("country: {id:?} names no country; use its English name or ISO 3166-1 code")
+            })?
+            .to_owned()
+    } else if k == "language" && !two_letters {
+        crate::names::language(id)
+            .ok_or_else(|| {
+                format!("language: {id:?} names no language; use its English name or ISO 639-1 code")
+            })?
+            .to_owned()
+    } else if INTEGER.contains(&k) {
         number()?.to_string()
     } else if DECADE.contains(&k) {
         (number()? / 10 * 10).to_string()
@@ -305,6 +319,33 @@ pub fn values_url(scope: Scope, kind: &str, sel: &[Item], q: Option<&str>, limit
         parts.push(format!("limit={limit}"));
     }
     Some(format!("/index/filter/{}/values/{kind}.json{}", scope.segment(), query(parts)))
+}
+
+/// `/index/filter/<scope>/people/values/<trait>.json` (den-atlas#80), for the traits whose values are Wikidata items:
+/// every value counted under the selection, found by `q` (folded, at least 2 letters). `None` for another trait.
+pub fn people_values_url(
+    scope: Scope,
+    sel: &[Item],
+    kind: &str,
+    q: Option<&str>,
+    limit: usize,
+) -> Option<String> {
+    if !matches!(kind, "gender" | "citizenship" | "occupation") {
+        return None;
+    }
+    let most = 10;
+    let limit = limit.clamp(1, most);
+    let mut parts = Vec::new();
+    if !sel.is_empty() {
+        parts.push(format!("sel={}", joined(sel)));
+    }
+    if let Some(q) = q.map(name_key).filter(|q| q.chars().count() >= 2) {
+        parts.push(format!("q={}", encode(&q)));
+    }
+    if limit != most {
+        parts.push(format!("limit={limit}"));
+    }
+    Some(format!("/index/filter/{}/people/values/{kind}.json{}", scope.segment(), query(parts)))
 }
 
 /// `/index/filter/<scope>/people.json` in `order` (one of `ORDERS`; the default left out), or `people/counts.json`
@@ -491,11 +532,58 @@ mod tests {
         );
     }
 
+    /// den-atlas#80's own canonical cases for its trait lookup (its `facets-canonical.json`), as this server asks
+    /// them: it sends no `traits`, so the one case carrying them is checked without.
+    #[test]
+    fn a_trait_lookup_is_spelled_as_atlas_answers_it() {
+        assert_eq!(
+            people_values_url(Scope::Movie, &[], "citizenship", Some("Iceland"), 10).unwrap(),
+            "/index/filter/movie/people/values/citizenship.json?q=iceland"
+        );
+        let drama = items(&["genre:18".into()], Scope::All).unwrap();
+        assert_eq!(
+            people_values_url(Scope::All, &drama, "occupation", Some("Film Dir"), 10).unwrap(),
+            "/index/filter/all/people/values/occupation.json?sel=genre:18&q=film%20dir"
+        );
+        assert_eq!(
+            people_values_url(Scope::Series, &[], "gender", None, 3).unwrap(),
+            "/index/filter/series/people/values/gender.json?limit=3"
+        );
+        assert_eq!(
+            people_values_url(Scope::Movie, &[], "citizenship", Some("i"), 10).unwrap(),
+            "/index/filter/movie/people/values/citizenship.json",
+            "a one-letter q, which atlas refuses, is not sent"
+        );
+        assert_eq!(
+            people_values_url(Scope::All, &[], "born", None, 10),
+            None,
+            "born is listed whole elsewhere"
+        );
+    }
+
     #[test]
     fn a_page_is_a_whole_number_of_pages() {
         assert_eq!(page(2, 20), (40, 20));
         assert_eq!(page(0, 500), (0, 100));
         assert_eq!(page(3, 0), (3, 1));
+    }
+
+    #[test]
+    fn a_country_or_language_may_be_named() {
+        let spelled = |raw: &[&str]| {
+            let raw: Vec<String> = raw.iter().map(|s| (*s).to_owned()).collect();
+            titles_url(Scope::All, &items(&raw, Scope::All).unwrap(), 0, PAGE)
+        };
+        assert_eq!(
+            spelled(&["language:Swedish", "country:Denmark"]),
+            "/index/filter/all/titles.json?sel=country:DK,language:sv"
+        );
+        assert_eq!(
+            spelled(&["country:swedish", "-language:English"]),
+            spelled(&["country:SE", "-language:en"])
+        );
+        assert!(items(&["country:Narnia".into()], Scope::All).unwrap_err().contains("names no country"));
+        assert!(items(&["language:Klingon".into()], Scope::All).is_err());
     }
 
     #[test]

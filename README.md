@@ -20,15 +20,22 @@ Titles are always `{type: movie|series, id}`; every title carries its Den Web `u
 
 | Tool | Parameters | Asks atlas |
 |---|---|---|
-| `den_search` | `query`, `type?`, `year_min?`, `year_max?`, `language?`, `runtime_max?`, `page?`, `limit?` (10, ≤50) | `/index/query.json` |
+| `den_search` | `query`, `type?`, `year_min?`, `year_max?`, `language?`, `runtime_max?`, `page?`, `limit?` (10, ≤100) | `/index/query.json` |
 | `den_filter_titles` | `type?` (all), `sel?` (`["kind:id", "-kind:id"]`), `page?`, `limit?` (20, ≤100) | `/index/filter/<type>/titles.json` |
-| `den_filter_values` | `kind?`, `q?`, `type?`, `sel?`, `limit?` (10, ≤30) | `values/<kind>.json`; a person trait from `people/counts.json`; no kind: `counts.json` |
-| `den_find_people` | `type?`, `sel?`, `sort?` (prominence, credits, name, youngest, oldest), `role?`, `gender?`, `age_min?`, `age_max?`, `born_min?`, `born_max?`, `living?`, `citizenship?`, `occupation?`, `page?`, `limit?` | `/index/filter/<type>/people.json` with `order=`; an atlas that answers no `order` ordered by credits, and the answer's note says so |
+| `den_filter_values` | `kind?`, `q?`, `kinds?`, `type?`, `sel?`, `limit?` (10, ≤10) | a short-list kind whole from `counts.json`; others `values/<kind>.json`; a person trait `people/values/<trait>.json` (den-atlas#80), else `people/counts.json`; no kind: `counts.json` |
+| `den_find_people` | `type?`, `sel?`, `sort?` (prominence, credits, name, youngest, oldest), `role?`, `gender?`, `age_min?`, `age_max?`, `born_min?`, `born_max?`, `living?`, `citizenship?` (names, codes or Q-ids), `occupation?`, `page?`, `limit?` | `/index/filter/<type>/people.json` with `order=`; an atlas that answers no `order` ordered by credits, and the answer's note says so |
 | `den_title` | `type`, `id` | `/index/title/<type>/<id>.json` |
 | `den_similar` | `titles` (1–8), `sel?`, `mix_types?` (true), `page?`, `limit?` | `titles.json?sel=like:…` per title, interleaved |
 
 Filter URLs are built in atlas's canonical spelling (`src/sel.rs`), held to atlas's own contract fixture
 (`testdata/facets-canonical.json`), so the same question is one cache entry here and in atlas.
+
+A value is read the way a person writes it. Languages and countries may be named (`language:Swedish`,
+`country:Sweden`, a citizenship "Swedish" or "SE" → Q34), from Wikidata's tables in `src/names_table.rs`
+(`scripts/names-table.py` writes it). A short-list kind (moods, subgenres, regions, plot facets, …) is read against
+Den's own vocabulary — `counts.json` with no selection, kept for the hour atlas marks it fresh — whatever the case or
+separators (`mood:tense edge of seat` is `mood:Tense/Edge-of-seat`), and the answer's `read_as` says so; a value Den
+does not have is refused with the nearest three.
 
 An age range becomes the birth decades it spans (atlas's `born` trait is one decade a question), one question each,
 merged by credits and then held to the exact birth years; the answer says ages are ±1 and that people with no record

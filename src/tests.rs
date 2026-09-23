@@ -43,7 +43,7 @@ fn canned(path: &str) -> Option<Value> {
     } else if path.starts_with("/index/filter/") && path.contains("/titles.json") {
         json!({ "titles": [card("movie", 5, "Let the Right One In", 2008)], "total": 31, "order": "x",
                 "coverage": {}, "ignored": [], "unknownValues": ["mood:tense"], "denominator": 47613 })
-    } else if path.contains("/values/") {
+    } else if path.contains("/values/") && !path.contains("/people/values/") {
         json!({ "kind": "person", "mode": "and", "complete": true,
                 "values": [{ "id": "Q25191", "name": "Christopher Nolan", "count": 12, "tmdbId": 525 }] })
     } else if path.contains("/people/counts.json") {
@@ -68,11 +68,20 @@ fn canned(path: &str) -> Option<Value> {
             answer["order"] = json!("name");
         }
         answer
+    } else if path.contains("/people/values/citizenship.json?q=iceland") {
+        // Atlas's own trait lookup (den-atlas#80), for one question only: any other is a 404, as on an atlas
+        // without the route.
+        json!({ "kind": "citizenship", "values": [{ "id": "Q189", "name": "Iceland", "count": 4 }],
+                "complete": true, "denominator": 100 })
     } else if path.starts_with("/index/filter/") && path.contains("/counts.json") {
-        json!({ "total": 40, "kinds": {
-            "genre": { "values": { "80": 20, "18": 30 } },
-            "rating": { "values": { "7": 10 } },
-            "person": { "values": { "Q1": 3 }, "labels": { "Q1": "Ann Actor" } } } })
+        json!({ "total": 40, "denominator": 47613, "kinds": {
+            "genre": { "values": { "80": 20, "18": 30 }, "complete": true },
+            "rating": { "values": { "7": 10 }, "complete": true },
+            "mood": { "values": { "Tense/Edge-of-seat": 10, "Slow-burn": 5 }, "complete": true },
+            "region": { "values": { "scandinavian": 5, "nordic": 6 },
+                        "labels": { "scandinavian": "Scandinavian", "nordic": "Nordic" }, "complete": true },
+            "language": { "values": { "sv": 3, "en": 30 }, "complete": true },
+            "person": { "values": { "Q1": 3 }, "labels": { "Q1": "Ann Actor" }, "complete": false } } })
     } else if path == "/index/title/movie/949.json" {
         let mut title = card("movie", 949, "Heat", 1995);
         title["indexed"] = json!(true);
@@ -325,7 +334,9 @@ async fn a_stale_schema_is_read_once_however_many_calls_find_it() {
                     // Slow enough that every call finds the reading stale before the first read ends.
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     let body = json!({ "tmdb": { "filterKinds": ["rating", "character", "later"] } });
-                    Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(Bytes::from(body.to_string()))))
+                    Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(Bytes::from(
+                        body.to_string(),
+                    ))))
                 }
             });
             tokio::spawn(async move {
@@ -335,8 +346,12 @@ async fn a_stale_schema_is_read_once_however_many_calls_find_it() {
         }
     });
     let atlas = crate::atlas::Atlas::new(format!("http://{addr}"), std::time::Duration::from_secs(5));
-    let (a, b, c, d) =
-        tokio::join!(atlas.tmdb_kinds(None), atlas.tmdb_kinds(None), atlas.tmdb_kinds(None), atlas.tmdb_kinds(None));
+    let (a, b, c, d) = tokio::join!(
+        atlas.tmdb_kinds(None),
+        atlas.tmdb_kinds(None),
+        atlas.tmdb_kinds(None),
+        atlas.tmdb_kinds(None)
+    );
     for kinds in [a, b, c, d] {
         assert!(kinds.contains(&"later".to_owned()), "{kinds:?}");
     }
@@ -370,8 +385,9 @@ async fn protocol_errors_are_json_rpc_errors() {
         assert_eq!(replies.as_array().map(Vec::len), Some(2), "{version:?}: {body}");
         assert_eq!((&replies[0]["id"], &replies[1]["id"]), (&json!(1), &json!(2)));
     }
-    let (_, _, body) =
-        s.send("POST", "/mcp", batch, &[("authorization", &s.bearer), ("mcp-protocol-version", "2025-06-18")]).await;
+    let (_, _, body) = s
+        .send("POST", "/mcp", batch, &[("authorization", &s.bearer), ("mcp-protocol-version", "2025-06-18")])
+        .await;
     assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["error"]["code"], crate::mcp::INVALID_REQUEST);
     // A tool's own failure is a result the model reads, not a protocol error.
     let bad = s.tool("den_search", json!({ "query": "x" })).await;
@@ -473,21 +489,80 @@ async fn filter_titles_builds_the_canonical_url_and_refuses_ratings() {
         let refused = s.tool("den_filter_titles", json!({ "sel": [sel] })).await.unwrap_err();
         assert!(refused.contains("not offered"), "{sel}: {refused}");
     }
+    // Den's own vocabulary, whatever the case or separators, said back; a value Den lacks refused with the nearest.
+    let read = s
+        .tool(
+            "den_filter_titles",
+            json!({ "sel": ["genre:action", "mood:tense edge of seat", "language:Swedish", "region:SCANDINAVIAN"] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        read["read_as"],
+        json!([
+            "genre:action as genre:28",
+            "mood:tense edge of seat as mood:Tense/Edge-of-seat",
+            "region:SCANDINAVIAN as region:scandinavian"
+        ])
+    );
+    let asked = s.asked.lock().unwrap().clone();
+    assert!(
+        asked.contains(
+            &"/index/filter/all/titles.json?sel=genre:28,language:sv,mood:Tense%2FEdge-of-seat,region:scandinavian&limit=20"
+                .to_owned()
+        ),
+        "{asked:?}"
+    );
+    let unknown = s.tool("den_filter_titles", json!({ "sel": ["mood:tense"] })).await.unwrap_err();
+    assert!(unknown.contains("Nearest: Tense/Edge-of-seat"), "{unknown}");
     assert!(s
-        .tool("den_filter_titles", json!({ "sel": ["genre:action"] }))
+        .tool("den_filter_titles", json!({ "sel": ["genre:nonsense"] }))
         .await
         .unwrap_err()
-        .contains("integer"));
+        .contains("Nearest"));
+    // Refused as another tool's: a title like another, and a person trait.
+    assert!(s
+        .tool("den_filter_titles", json!({ "sel": ["like:movie-1"] }))
+        .await
+        .unwrap_err()
+        .contains("den_similar"));
+    assert!(s
+        .tool("den_filter_titles", json!({ "sel": ["gender:Q1"] }))
+        .await
+        .unwrap_err()
+        .contains("den_find_people"));
 }
 
 #[tokio::test]
 async fn filter_values_resolve_names_title_kinds_and_person_traits() {
     let s = Server::new().await;
     let nolan = s.tool("den_filter_values", json!({ "kind": "person", "q": "Nolan" })).await.unwrap();
-    assert_eq!(nolan["values"], json!([{ "id": "Q25191", "name": "Christopher Nolan", "count": 12 }]));
-    assert_eq!(s.asked.lock().unwrap()[0], "/index/filter/all/values/person.json?q=nolan");
+    // A person comes with their Den Web page.
+    assert_eq!(
+        nolan["values"],
+        json!([{ "id": "Q25191", "name": "Christopher Nolan", "count": 12,
+                 "url": "https://den.example/person/525-christopher-nolan" }])
+    );
+    assert!(s.asked.lock().unwrap().contains(&"/index/filter/all/values/person.json?q=nolan".to_owned()));
+    // A short list comes whole from counts.json, named: "Swedish" finds sv whatever the kind calls it.
+    let swedish = s.tool("den_filter_values", json!({ "kind": "language", "q": "Swedish" })).await.unwrap();
+    assert_eq!(swedish["values"], json!([{ "id": "sv", "name": "Swedish", "count": 3 }]));
+    let moods = s.tool("den_filter_values", json!({ "kind": "mood" })).await.unwrap();
+    assert_eq!(moods["values"].as_array().unwrap().len(), 2);
+    assert_eq!(moods["complete"], true);
     let gender = s.tool("den_filter_values", json!({ "kind": "gender", "q": "fem" })).await.unwrap();
     assert_eq!(gender["values"], json!([{ "id": "Q6581072", "name": "female", "people": 2 }]));
+    // Atlas's trait lookup where it answers (den-atlas#80), its `complete` passed through.
+    let iceland =
+        s.tool("den_filter_values", json!({ "kind": "citizenship", "q": "Iceland" })).await.unwrap();
+    assert_eq!(iceland["values"], json!([{ "id": "Q189", "name": "Iceland", "people": 4 }]));
+    assert_eq!(iceland["complete"], true);
+    // Where it doesn't (a 404), the commonest from people/counts.json, never called complete when atlas didn't say
+    // so; a country named in q is its citizenship item from Wikidata's table all the same.
+    let sweden = s.tool("den_filter_values", json!({ "kind": "citizenship", "q": "Sweden" })).await.unwrap();
+    assert_eq!(sweden["values"], json!([{ "id": "Q34", "name": "Sweden" }]));
+    assert_eq!(sweden["complete"], false);
+    assert!(sweden["note"].as_str().unwrap().contains("commonest"));
     let overview = s.tool("den_filter_values", json!({ "sel": ["country:se"] })).await.unwrap();
     assert_eq!(overview["kinds"]["genre"][0], json!({ "id": "18", "name": "Drama", "count": 30 }));
     assert_eq!(overview["kinds"]["person"][0], json!({ "id": "Q1", "name": "Ann Actor", "count": 3 }));
@@ -530,6 +605,14 @@ async fn people_by_traits_and_an_age_range() {
     let narrow = s.tool("den_find_people", json!({ "born_min": 1980, "born_max": 1985 })).await.unwrap();
     assert!(narrow["results"].as_array().unwrap().iter().all(|p| p["id"] != "Q1976"), "{narrow}");
     assert!(s.tool("den_find_people", json!({ "gender": "robot" })).await.is_err());
+    // A citizenship by name or code is its Wikidata item, and the answer says how it was read.
+    let swedes =
+        s.tool("den_find_people", json!({ "citizenship": ["Swedish"], "type": "movie" })).await.unwrap();
+    assert!(s.asked.lock().unwrap().last().unwrap().contains("traits=citizenship:Q34"));
+    assert_eq!(swedes["read_as"], json!(["citizenship Swedish as Sweden (Q34)"]));
+    let danes = s.tool("den_find_people", json!({ "citizenship": ["DK"], "type": "movie" })).await.unwrap();
+    assert!(danes["read_as"][0].as_str().unwrap().contains("Q756617"));
+    assert!(s.tool("den_find_people", json!({ "citizenship": ["Narnia"] })).await.is_err());
 }
 
 #[tokio::test]
@@ -590,10 +673,9 @@ async fn similar_to_one_title_narrowed_and_to_several_interleaved() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        s.asked.lock().unwrap()[0],
-        "/index/filter/all/titles.json?sel=like:movie-949,region:scandinavian&limit=20"
-    );
+    assert!(s.asked.lock().unwrap().contains(
+        &"/index/filter/all/titles.json?sel=like:movie-949,region:scandinavian&limit=20".to_owned()
+    ));
     assert_eq!(heat["results"][1]["url"], "https://den.example/tv/2-the-bridge");
     let both = s
         .tool(

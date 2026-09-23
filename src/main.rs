@@ -13,6 +13,8 @@ mod auth;
 mod config;
 mod mcp;
 mod metrics;
+mod names;
+mod names_table;
 mod sel;
 mod tools;
 
@@ -337,7 +339,9 @@ async fn reply(
 ) -> (Option<Value>, Option<&'static str>) {
     match message {
         mcp::Message::NoReply => (None, None),
-        mcp::Message::Request { id, method, params } => answer(state, caller, id, &method, &params, rid).await,
+        mcp::Message::Request { id, method, params } => {
+            answer(state, caller, id, &method, &params, rid).await
+        }
     }
 }
 

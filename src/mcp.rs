@@ -54,11 +54,9 @@ pub fn read(body: &[u8], version: &str) -> Result<Body, Value> {
         Value::Array(_) if !batches(version) => {
             Err(error(Value::Null, INVALID_REQUEST, &format!("Batches are not part of protocol {version}")))
         }
-        Value::Array(list) if list.is_empty() || list.len() > MAX_BATCH => Err(error(
-            Value::Null,
-            INVALID_REQUEST,
-            &format!("A batch holds 1 to {MAX_BATCH} messages"),
-        )),
+        Value::Array(list) if list.is_empty() || list.len() > MAX_BATCH => {
+            Err(error(Value::Null, INVALID_REQUEST, &format!("A batch holds 1 to {MAX_BATCH} messages")))
+        }
         Value::Array(list) => Ok(Body::Batch(list.into_iter().map(message).collect())),
         value => message(value).map(Body::One),
     }
@@ -143,7 +141,9 @@ mod tests {
         for version in ["2025-06-18", "2025-11-25"] {
             assert_eq!(read(batch, version).err().unwrap()["error"]["code"], INVALID_REQUEST, "{version}");
         }
-        let Ok(Body::Batch(members)) = read(batch, "2025-03-26") else { panic!("a 2025-03-26 batch is read") };
+        let Ok(Body::Batch(members)) = read(batch, "2025-03-26") else {
+            panic!("a 2025-03-26 batch is read")
+        };
         assert!(matches!(members[0], Ok(Message::Request { .. })));
         assert_eq!(members[1].as_ref().err().unwrap()["error"]["code"], INVALID_REQUEST, "each member alone");
         assert_eq!(read(b"[]", "2025-03-26").err().unwrap()["error"]["code"], INVALID_REQUEST);

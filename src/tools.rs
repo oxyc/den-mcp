@@ -20,6 +20,7 @@
 
 use crate::atlas::{encode, Atlas, Failed};
 use crate::config::Config;
+use crate::names;
 use crate::sel::{self, Item, Scope};
 use serde_json::{json, Map, Value};
 
@@ -134,14 +135,17 @@ pub fn list() -> Value {
     });
     let sel_items = json!({
         "type": "array", "items": { "type": "string" }, "maxItems": 16,
-        "description": "Filters ANDed together, each \"kind:id\" (\"-kind:id\" excludes). Kinds: language (ISO 639-1), \
-            country (ISO 3166-1), region (nordic, scandinavian, east-asian, …), decade (1990), primary (Den's primary \
-            genre: Crime, Drama, …), subgenre and mood (Den labels, exact case: \"Psychological Thriller\", \"Tense/Edge-of-seat\"), \
-            genre (TMDB genre id), animated (yes|no), runtime (under-90|90-120|120-150|over-150), source (book, play, \
-            comic, game, …), plot facets ending|tone|pacing|era|setting|scope|chronology|continuity|conflict|ensemble|\
-            timespan|archetype, technique, audience, critique, warning, and Wikidata Q-ids for person, made (director/\
-            writer/creator), cast, company, network, subject, place, format. Resolve names and exact labels with \
-            den_filter_values first.",
+        "description": "Filters, all must hold, each \"kind:id\" (\"-kind:id\" excludes). Two values of one kind mean \
+            both; for either, ask once per value and merge. An example id per kind: language:sv or language:Swedish, \
+            country:SE or country:Sweden, region:scandinavian, decade:1990 (no year range: use the decades, or \
+            den_search's year_min/year_max), primary:Crime, genre:80 or genre:Crime, subgenre:Heist, \
+            mood:Tense/Edge-of-seat, animated:yes, runtime:under-90, source:book, ending:tragic, tone:bleak, \
+            pacing:slow-burn, era:medieval, setting:rural, scope:global, chronology:nonlinear, continuity:episodic, \
+            conflict:person-vs-self, ensemble:ensemble-led, timespan:single-day, archetype:rebirth, \
+            technique:stop_motion, audience:made_for_children, critique:class, warning:graphic_violence, \
+            studio:Q16248298 (A24); Wikidata Q-ids for person, made (director/writer/creator), cast, company, \
+            network, subject, place, format. Case and separators are forgiven. den_filter_values lists any kind's \
+            values and turns names into ids.",
     });
     let type_all = json!({ "type": "string", "enum": ["movie", "series", "all"], "default": "all" });
     let paging = |default: u32, max: u32| {
@@ -151,7 +155,7 @@ pub fn list() -> Value {
         )
     };
     let (page, limit20) = paging(20, 100);
-    let (_, limit10) = paging(10, 50);
+    let (_, limit10) = paging(10, 100);
     let read_only = json!({ "readOnlyHint": true, "openWorldHint": false });
     json!([
         {
@@ -181,8 +185,9 @@ pub fn list() -> Value {
             "name": "den_filter_titles",
             "title": "Filter Den's titles",
             "description": "Titles carrying every filter in `sel`, most popular first, paged, with the total. \
-                Chain: den_filter_values to turn names into ids (\"Swedish\" → language:sv, \"Christopher Nolan\" → \
-                made:Q25191), then this.",
+                Languages and countries may be named (language:Swedish); people, companies and places need their \
+                Q-id from den_filter_values (\"Christopher Nolan\" → made:Q25191). No OR and no year range: ask \
+                once per value and merge, and use decades.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "type": type_all, "sel": sel_items, "page": page, "limit": limit20 },
@@ -192,18 +197,21 @@ pub fn list() -> Value {
         {
             "name": "den_filter_values",
             "title": "Look up filter values",
-            "description": "Resolve a name to the id a filter takes, with how many titles carry it under `sel`. \
-                `kind` is any den_filter_titles kind, or a person trait for den_find_people: gender, citizenship, \
-                occupation, born (decade), role. `q` matches the start of a word in the name (\"nol\" → Christopher \
-                Nolan). Without `kind`: an overview of the commonest values of every kind under `sel`.",
+            "description": "Turn a name into the id a filter takes, with how many titles carry it under `sel`. \
+                `kind` is a den_filter_titles kind or a den_find_people trait (gender, citizenship, occupation, born, \
+                role). A short list (moods, subgenres, languages, countries, plot facets, …) comes whole; people, \
+                companies, places and the like come 10 at most, found by `q`, the start of a word (\"nol\" → \
+                Christopher Nolan). `complete: false` means more exist. Without `kind`: each kind's commonest \
+                values, or only `kinds`'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "kind": { "type": "string" },
                     "q": { "type": "string" },
+                    "kinds": { "type": "array", "items": { "type": "string" }, "description": "Overview only these" },
                     "type": type_all,
                     "sel": sel_items,
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 30, "default": 10 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 10, "default": 10 },
                 },
             },
             "annotations": read_only,
@@ -215,9 +223,9 @@ pub fn list() -> Value {
                 filtered by what Wikidata states about them. `sort`: prominence (how well known the matching \
                 titles they're credited on are; the default), credits (most matching titles), name, youngest, \
                 oldest; the answer's note says which order was used, since Den's index may not offer every one. \
-                Ages are from birth years, today. Resolve citizenship/occupation Q-ids with \
-                den_filter_values. People Wikidata has no record for on a trait are left out, so a list is never \
-                complete; say so.",
+                Ages are from birth years, today. Citizenship takes a country's name or code; occupation a Q-id \
+                from den_filter_values. People Wikidata has no record for on a trait are left out, so a list is \
+                never complete; say so.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -235,7 +243,8 @@ pub fn list() -> Value {
                     "born_min": { "type": "integer", "description": "Birth year, instead of an age" },
                     "born_max": { "type": "integer" },
                     "living": { "type": "boolean", "description": "Leave out people who have died" },
-                    "citizenship": { "type": "array", "items": { "type": "string" }, "description": "Q-ids, all held" },
+                    "citizenship": { "type": "array", "items": { "type": "string" },
+                                     "description": "Countries (Sweden, SE) or Q-ids, all held" },
                     "occupation": { "type": "array", "items": { "type": "string" }, "description": "Q-ids, all held" },
                     "page": page,
                     "limit": limit20,
@@ -379,19 +388,12 @@ fn paging(args: &Value, default: usize) -> Result<(usize, usize), ToolError> {
     Ok((page as usize, (limit as usize).min(sel::MAX_PAGE)))
 }
 
-/// A title selection, refusing what a tool does not offer: the kinds that are TMDB's (ratings, characters), `like`,
-/// which is den_similar's, and the person traits, which are den_find_people's.
-fn selection(args: &Value, scope: Scope, tmdb_kinds: &[String]) -> Result<Vec<Item>, ToolError> {
+/// A title selection, and how any value in it was read (`read_as`). Refused: the kinds that are TMDB's (ratings,
+/// characters), `like`, which is den_similar's, and the person traits, which are den_find_people's.
+async fn selection(ctx: &Ctx<'_>, args: &Value, scope: Scope) -> Result<(Vec<Item>, Vec<String>), ToolError> {
     let raw = strings(args, "sel")?;
-    // A TMDB-backed kind is refused as such before anything else reads it, the ones only atlas's schema names too.
-    for item in &raw {
-        let kind = item.trim().trim_start_matches('-').split(':').next().unwrap_or("").trim().to_lowercase();
-        if tmdb_kinds.contains(&kind) {
-            return Err(bad(format!(
-                "{kind} is not offered here; a title's url shows what Den Web has on it"
-            )));
-        }
-    }
+    refuse_tmdb_kinds(&raw, ctx.tmdb_kinds)?;
+    let (raw, read_as) = vocabulary(ctx, raw).await?;
     let items = sel::items(&raw, scope).map_err(bad)?;
     for item in &items {
         let kind = item.kind.as_str();
@@ -402,7 +404,162 @@ fn selection(args: &Value, scope: Scope, tmdb_kinds: &[String]) -> Result<Vec<It
             return Err(bad(format!("{kind} is a person trait: pass it to den_find_people")));
         }
     }
-    Ok(items)
+    Ok((items, read_as))
+}
+
+/// A TMDB-backed kind is refused as such before anything else reads it, the ones only atlas's schema names too.
+fn refuse_tmdb_kinds(raw: &[String], tmdb_kinds: &[String]) -> Result<(), ToolError> {
+    for item in raw.iter().flat_map(|i| i.split(',')) {
+        let kind = item.trim().trim_start_matches('-').split(':').next().unwrap_or("").trim().to_lowercase();
+        if tmdb_kinds.contains(&kind) {
+            return Err(bad(format!(
+                "{kind} is not offered here; a title's url shows what Den Web has on it"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The kinds whose values are a short list Den spells exactly: a value is read against the list, whatever its case
+/// or separators, and an unknown one is refused with the nearest.
+const SPELLED: &[&str] = &[
+    "mood",
+    "subgenre",
+    "primary",
+    "region",
+    "animated",
+    "runtime",
+    "source",
+    "technique",
+    "audience",
+    "critique",
+    "warning",
+    "era",
+    "setting",
+    "scope",
+    "ending",
+    "pacing",
+    "chronology",
+    "continuity",
+    "conflict",
+    "ensemble",
+    "tone",
+    "timespan",
+    "archetype",
+];
+
+/// Den's own vocabulary: every value of every short-list kind, with its label where it has one. counts.json with no
+/// selection lists them whole; atlas marks it fresh for an hour, and it is kept here for that long.
+async fn vocabulary_of(ctx: &Ctx<'_>) -> Option<Value> {
+    ctx.atlas.get(&sel::counts_url(Scope::All, &[]), ctx.rid).await.ok().map(|(v, _)| v)
+}
+
+/// `sel` read against Den's vocabulary: "mood:tense edge of seat" is `mood:Tense/Edge-of-seat`, "genre:crime" is
+/// `genre:80`. What was read differently is said back, and a value Den does not have is refused with the nearest.
+async fn vocabulary(ctx: &Ctx<'_>, raw: Vec<String>) -> Result<(Vec<String>, Vec<String>), ToolError> {
+    let mut vocab: Option<Option<Value>> = None;
+    let mut out = Vec::with_capacity(raw.len());
+    let mut read_as = Vec::new();
+    for item in raw.iter().flat_map(|i| i.split(',')).map(str::trim).filter(|i| !i.is_empty()) {
+        let (exclude, rest) = match item.strip_prefix('-') {
+            Some(rest) => ("-", rest),
+            None => ("", item),
+        };
+        let Some((kind, id)) = rest.split_once(':') else {
+            out.push(item.to_owned());
+            continue;
+        };
+        let (kind, id) = (kind.trim().to_ascii_lowercase(), id.trim());
+        let known: Vec<(String, Option<String>)> = if kind == "genre" {
+            if id.parse::<u32>().is_ok() {
+                out.push(item.to_owned());
+                continue;
+            }
+            GENRES.iter().map(|&(n, name)| (n.to_string(), Some(name.to_owned()))).collect()
+        } else if SPELLED.contains(&kind.as_str()) {
+            if vocab.is_none() {
+                vocab = Some(vocabulary_of(ctx).await);
+            }
+            let about =
+                vocab.as_ref().and_then(Option::as_ref).and_then(|v| v.pointer(&format!("/kinds/{kind}")));
+            let labels = about.and_then(|a| a.get("labels"));
+            match about.and_then(|a| a.get("values")).and_then(Value::as_object) {
+                Some(values) => values
+                    .keys()
+                    .map(|k| {
+                        (k.clone(), labels.and_then(|l| l.get(k)).and_then(Value::as_str).map(str::to_owned))
+                    })
+                    .collect(),
+                // Atlas did not list the kind (or could not be asked): the value goes as given, and atlas says
+                // whether it knows it.
+                None => {
+                    out.push(item.to_owned());
+                    continue;
+                }
+            }
+        } else {
+            out.push(item.to_owned());
+            continue;
+        };
+        if known.iter().any(|(k, _)| k == id) {
+            out.push(item.to_owned());
+            continue;
+        }
+        let key = sel::name_key(id);
+        let matched: Vec<&String> = known
+            .iter()
+            .filter(|(k, label)| {
+                sel::name_key(k) == key || label.as_deref().is_some_and(|l| sel::name_key(l) == key)
+            })
+            .map(|(k, _)| k)
+            .collect();
+        if let [one] = matched[..] {
+            read_as.push(format!("{kind}:{id} as {kind}:{one}"));
+            out.push(format!("{exclude}{kind}:{one}"));
+            continue;
+        }
+        let nearest = nearest(&key, &known);
+        return Err(bad(format!(
+            "{kind}:{id:?} is not one of Den's {kind} values. Nearest: {}. den_filter_values kind={kind} lists them.",
+            nearest.join(", ")
+        )));
+    }
+    Ok((out, read_as))
+}
+
+/// The three values nearest a folded `key`: containing it or contained in it first, then by edit distance.
+fn nearest(key: &str, known: &[(String, Option<String>)]) -> Vec<String> {
+    let mut scored: Vec<(usize, &String)> = known
+        .iter()
+        .map(|(k, label)| {
+            let name = sel::name_key(label.as_deref().unwrap_or(k));
+            let folded = sel::name_key(k);
+            let score =
+                if !key.is_empty() && (folded.contains(key) || key.contains(&folded) || name.contains(key)) {
+                    0
+                } else {
+                    1 + edit_distance(key, &folded).min(edit_distance(key, &name))
+                };
+            (score, k)
+        })
+        .collect();
+    scored.sort();
+    scored.into_iter().take(3).map(|(_, k)| k.clone()).collect()
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let here = row[j + 1];
+            row[j + 1] = (prev + usize::from(ca != *cb)).min(row[j] + 1).min(here + 1);
+            prev = here;
+        }
+    }
+    row[b.len()]
 }
 
 // ---- what an answer is made of
@@ -635,52 +792,61 @@ async fn search(ctx: &Ctx<'_>, args: &Value) -> Answer {
 }
 
 /// TMDB's genre names, for the ids Den's `genre` kind and search's reading of words are written in.
+const GENRES: &[(u64, &str)] = &[
+    (28, "Action"),
+    (12, "Adventure"),
+    (16, "Animation"),
+    (35, "Comedy"),
+    (80, "Crime"),
+    (99, "Documentary"),
+    (18, "Drama"),
+    (10751, "Family"),
+    (14, "Fantasy"),
+    (36, "History"),
+    (27, "Horror"),
+    (10402, "Music"),
+    (9648, "Mystery"),
+    (10749, "Romance"),
+    (878, "Science Fiction"),
+    (10770, "TV Movie"),
+    (53, "Thriller"),
+    (10752, "War"),
+    (37, "Western"),
+    (10759, "Action & Adventure"),
+    (10762, "Kids"),
+    (10763, "News"),
+    (10764, "Reality"),
+    (10765, "Sci-Fi & Fantasy"),
+    (10766, "Soap"),
+    (10767, "Talk"),
+    (10768, "War & Politics"),
+];
+
 pub fn genre_name(id: u64) -> Option<&'static str> {
-    Some(match id {
-        28 => "Action",
-        12 => "Adventure",
-        16 => "Animation",
-        35 => "Comedy",
-        80 => "Crime",
-        99 => "Documentary",
-        18 => "Drama",
-        10751 => "Family",
-        14 => "Fantasy",
-        36 => "History",
-        27 => "Horror",
-        10402 => "Music",
-        9648 => "Mystery",
-        10749 => "Romance",
-        878 => "Science Fiction",
-        10770 => "TV Movie",
-        53 => "Thriller",
-        10752 => "War",
-        37 => "Western",
-        10759 => "Action & Adventure",
-        10762 => "Kids",
-        10763 => "News",
-        10764 => "Reality",
-        10765 => "Sci-Fi & Fantasy",
-        10766 => "Soap",
-        10767 => "Talk",
-        10768 => "War & Politics",
-        _ => return None,
-    })
+    GENRES.iter().find(|(n, _)| *n == id).map(|(_, name)| *name)
 }
 
 // ---- den_filter_titles
 
 async fn filter_titles(ctx: &Ctx<'_>, args: &Value) -> Answer {
     let scope = scope(args)?;
-    let sel = selection(args, scope, ctx.tmdb_kinds)?;
+    let (sel, read_as) = selection(ctx, args, scope).await?;
     let (page, limit) = paging(args, 20)?;
     let (skip, limit) = sel::page(page, limit);
     let (answer, _) = ctx.atlas.get(&sel::titles_url(scope, &sel, skip, limit), ctx.rid).await?;
     let results = titles(ctx.cfg, answer.get("titles"));
     let mut out = listing(results, answer.get("total").and_then(Value::as_u64), page, limit);
     out_of(&mut out, answer.get("denominator"));
+    said(&mut out, read_as);
     caveats(ctx, &mut out, &answer);
     Ok(Value::Object(out))
+}
+
+/// How values in the question were read, when not as given: "mood:tense edge of seat as mood:Tense/Edge-of-seat".
+fn said(out: &mut Map<String, Value>, read_as: Vec<String>) {
+    if !read_as.is_empty() {
+        out.insert("read_as".into(), json!(read_as));
+    }
 }
 
 // ---- den_filter_values
@@ -690,11 +856,13 @@ const OVERVIEW_TOP: usize = 8;
 
 async fn filter_values(ctx: &Ctx<'_>, args: &Value) -> Answer {
     let scope = scope(args)?;
-    let sel = selection(args, scope, ctx.tmdb_kinds)?;
-    let limit = integer(args, "limit")?.unwrap_or(10).clamp(1, 30) as usize;
+    let (sel, read_as) = selection(ctx, args, scope).await?;
+    let limit = integer(args, "limit")?.unwrap_or(10).clamp(1, 10) as usize;
     let q = string(args, "q")?;
     let Some(kind) = string(args, "kind")?.map(str::to_ascii_lowercase) else {
-        return overview(ctx, scope, &sel).await;
+        let only: Vec<String> =
+            strings(args, "kinds")?.iter().map(|k| k.trim().to_ascii_lowercase()).collect();
+        return overview(ctx, scope, &sel, &only, read_as).await;
     };
     // Only a kind from the known list reaches a URL: it is a path segment there (`sel::values_url`).
     if ctx.tmdb_kinds.contains(&kind) {
@@ -706,6 +874,20 @@ async fn filter_values(ctx: &Ctx<'_>, args: &Value) -> Answer {
     if sel::TRAITS.contains(&kind.as_str()) {
         return trait_values(ctx, scope, &sel, &kind, q, limit).await;
     }
+    if !sel::title_kind(&kind) {
+        return Err(bad("kind is one of den_filter_titles' kinds, or a person trait"));
+    }
+    // A kind atlas lists whole comes back whole, named, and matched by q here.
+    let (counts, _) = ctx.atlas.get(&sel::counts_url(scope, &sel), ctx.rid).await?;
+    if let Some(about) =
+        counts.pointer(&format!("/kinds/{kind}")).filter(|a| a.get("complete") == Some(&json!(true)))
+    {
+        let mut out = whole_list(&kind, about, q);
+        out_of(&mut out, counts.get("denominator"));
+        said(&mut out, read_as);
+        caveats(ctx, &mut out, &counts);
+        return Ok(Value::Object(out));
+    }
     if let Some(q) = q.filter(|q| sel::name_key(q).chars().count() < 2) {
         return Err(bad(format!("q {q:?}: at least 2 letters")));
     }
@@ -713,6 +895,7 @@ async fn filter_values(ctx: &Ctx<'_>, args: &Value) -> Answer {
         return Err(bad("kind is one of den_filter_titles' kinds, or a person trait"));
     };
     let (answer, _) = ctx.atlas.get(&url, ctx.rid).await?;
+    let people = matches!(kind.as_str(), "person" | "made" | "cast");
     let values: Vec<Value> = answer
         .get("values")
         .and_then(Value::as_array)
@@ -720,13 +903,15 @@ async fn filter_values(ctx: &Ctx<'_>, args: &Value) -> Answer {
         .flatten()
         .filter_map(|v| {
             let id = text(v.get("id"))?;
-            let name =
-                match (kind.as_str(), id.as_str().and_then(|i| i.parse::<u64>().ok()).and_then(genre_name)) {
-                    ("genre", Some(name)) => json!(name),
-                    _ => text(v.get("name")).unwrap_or_else(|| id.clone()),
-                };
+            let name = text(v.get("name")).unwrap_or_else(|| id.clone());
             let mut value = json!({ "id": id, "name": name });
-            put(value.as_object_mut()?, "count", count(v.get("count")));
+            let map = value.as_object_mut()?;
+            put(map, "count", count(v.get("count")));
+            // A person's Den Web page, from the TMDB id atlas names them by: the id itself is never shown.
+            if people {
+                let url = person_url(ctx.cfg, v.get("tmdbId").and_then(Value::as_u64), name.as_str());
+                put(map, "url", url.map(|u| json!(u)));
+            }
             Some(value)
         })
         .collect();
@@ -736,16 +921,87 @@ async fn filter_values(ctx: &Ctx<'_>, args: &Value) -> Answer {
     out.insert("values".into(), Value::Array(values));
     put(&mut out, "complete", boolean(answer.get("complete")));
     out_of(&mut out, answer.get("denominator"));
+    said(&mut out, read_as);
     caveats(ctx, &mut out, &answer);
     Ok(Value::Object(out))
 }
 
-/// Every kind's commonest values under the selection, named.
-async fn overview(ctx: &Ctx<'_>, scope: Scope, sel: &[Item]) -> Answer {
+/// A value's name as a model should read it: a language's or country's English name, a genre's, else atlas's label.
+fn value_name(kind: &str, id: &str, labels: Option<&Value>) -> Option<String> {
+    match kind {
+        "language" => names::language_name(id).map(str::to_owned),
+        "country" => names::country_name(id).map(str::to_owned),
+        "genre" => id.parse().ok().and_then(genre_name).map(str::to_owned),
+        _ => labels.and_then(|l| l.get(id)).and_then(Value::as_str).map(str::to_owned),
+    }
+}
+
+/// A short-list kind whole, from counts.json: every value with its count under the selection, most titles first,
+/// matched by `q` on its name, its id, or (for a language or country) any other name for it.
+fn whole_list(kind: &str, about: &Value, q: Option<&str>) -> Map<String, Value> {
+    let labels = about.get("labels");
+    let q_key = q.map(sel::name_key).filter(|q| !q.is_empty());
+    let named_by_q: Vec<&str> = match (kind, q) {
+        ("language", Some(q)) => names::languages_matching(q),
+        ("country", Some(q)) => names::countries_matching(q),
+        _ => Vec::new(),
+    };
+    let starts = |text: &str, q: &str| {
+        let key = sel::name_key(text);
+        key.starts_with(q) || key.split(' ').any(|w| w.starts_with(q))
+    };
+    let mut values: Vec<(String, Option<String>, u64)> = about
+        .get("values")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(id, n)| Some((id.clone(), value_name(kind, id, labels), n.as_u64()?)))
+        .filter(|(id, name, _)| {
+            q_key.as_deref().is_none_or(|q| {
+                named_by_q.contains(&id.as_str())
+                    || starts(id, q)
+                    || name.as_deref().is_some_and(|n| starts(n, q))
+            })
+        })
+        .collect();
+    values.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+    let listed: Vec<Value> = values
+        .into_iter()
+        .map(|(id, name, n)| match name.filter(|name| *name != id) {
+            Some(name) => json!({ "id": id, "name": name, "count": n }),
+            None => json!({ "id": id, "count": n }),
+        })
+        .collect();
+    let mut out = Map::new();
+    out.insert("kind".into(), json!(kind));
+    out.insert("use_as".into(), json!(format!("\"{kind}:<id>\" in sel")));
+    if listed.is_empty() {
+        if let Some(q) = q {
+            out.insert(
+                "note".into(),
+                json!(format!(
+                    "No {kind} under this sel matches {q:?}; without q the whole list comes back."
+                )),
+            );
+        }
+    }
+    out.insert("values".into(), Value::Array(listed));
+    out.insert("complete".into(), json!(true));
+    out
+}
+
+/// Every kind's commonest values under the selection, named; only the kinds in `only` when it names any.
+async fn overview(
+    ctx: &Ctx<'_>,
+    scope: Scope,
+    sel: &[Item],
+    only: &[String],
+    read_as: Vec<String>,
+) -> Answer {
     let (answer, _) = ctx.atlas.get(&sel::counts_url(scope, sel), ctx.rid).await?;
     let mut kinds = Map::new();
     for (kind, about) in answer.get("kinds").and_then(Value::as_object).into_iter().flatten() {
-        if ctx.tmdb_kinds.contains(kind) {
+        if ctx.tmdb_kinds.contains(kind) || (!only.is_empty() && !only.contains(kind)) {
             continue;
         }
         let labels = about.get("labels");
@@ -760,20 +1016,9 @@ async fn overview(ctx: &Ctx<'_>, scope: Scope, sel: &[Item]) -> Answer {
         let listed: Vec<Value> = values
             .into_iter()
             .take(OVERVIEW_TOP)
-            .map(|(id, n)| {
-                let name =
-                    labels.and_then(|l| l.get(&id)).and_then(Value::as_str).map(str::to_owned).or_else(
-                        || {
-                            (kind == "genre")
-                                .then(|| id.parse().ok().and_then(genre_name))
-                                .flatten()
-                                .map(str::to_owned)
-                        },
-                    );
-                match name {
-                    Some(name) => json!({ "id": id, "name": name, "count": n }),
-                    None => json!({ "id": id, "count": n }),
-                }
+            .map(|(id, n)| match value_name(kind, &id, labels).filter(|name| *name != id) {
+                Some(name) => json!({ "id": id, "name": name, "count": n }),
+                None => json!({ "id": id, "count": n }),
             })
             .collect();
         if !listed.is_empty() {
@@ -785,11 +1030,14 @@ async fn overview(ctx: &Ctx<'_>, scope: Scope, sel: &[Item]) -> Answer {
     out_of(&mut out, answer.get("denominator"));
     out.insert("kinds".into(), Value::Object(kinds));
     out.insert("corpus".into(), json!(CORPUS));
+    said(&mut out, read_as);
     caveats(ctx, &mut out, &answer);
     Ok(Value::Object(out))
 }
 
-/// A person trait's values under the selection, from `people/counts.json`, named and matched by `q`.
+/// A person trait's values under the selection, named and matched by `q`: from atlas's own lookup where it has one
+/// (`people/values/<trait>.json`, den-atlas#80), which counts and searches every value, else from
+/// `people/counts.json`, which lists the commonest. `complete` is atlas's word, never claimed past it.
 async fn trait_values(
     ctx: &Ctx<'_>,
     scope: Scope,
@@ -798,38 +1046,92 @@ async fn trait_values(
     q: Option<&str>,
     limit: usize,
 ) -> Answer {
-    let (answer, _) = ctx.atlas.get(&sel::people_url(scope, sel, &[], sel::ORDERS[0], None), ctx.rid).await?;
-    let about = answer.pointer(&format!("/traits/{kind}"));
-    let labels = about.and_then(|a| a.get("labels"));
-    let q = q.map(sel::name_key).filter(|q| !q.is_empty());
-    let mut values: Vec<(String, String, u64)> = about
-        .and_then(|a| a.get("values"))
-        .and_then(Value::as_object)
-        .into_iter()
+    // A country named in q is its citizenship item from Wikidata's table, whether or not atlas lists it among the
+    // commonest.
+    let named = (kind == "citizenship")
+        .then(|| q.and_then(names::country))
         .flatten()
-        .filter_map(|(id, n)| {
-            let name = labels.and_then(|l| l.get(id)).and_then(Value::as_str).unwrap_or(id).to_owned();
-            Some((id.clone(), name, n.as_u64()?))
-        })
-        .filter(|(id, name, _)| {
-            q.as_deref().is_none_or(|q| {
-                let key = sel::name_key(name);
-                key.starts_with(q) || key.split(' ').any(|w| w.starts_with(q)) || id.eq_ignore_ascii_case(q)
-            })
-        })
-        .collect();
-    values.sort_by(|a, b| b.2.cmp(&a.2).then(a.1.cmp(&b.1)));
-    let total = values.len();
-    let listed: Vec<Value> = values
-        .into_iter()
-        .take(limit)
-        .map(|(id, name, n)| json!({ "id": id, "name": name, "people": n }))
-        .collect();
+        .and_then(|code| Some((names::country_item(code)?, names::country_name(code)?)));
     let mut out = Map::new();
     out.insert("kind".into(), json!(kind));
     out.insert("use_as".into(), json!(format!("den_find_people's {kind}")));
+    let lookup =
+        sel::people_values_url(scope, sel, kind, q.filter(|q| sel::name_key(q).chars().count() >= 2), limit);
+    let from_route = match lookup {
+        Some(url) => match ctx.atlas.get(&url, ctx.rid).await {
+            Ok((answer, _)) => Some(answer),
+            // An atlas without the route: the counts below.
+            Err(crate::atlas::Failed { status: Some(404), .. }) => None,
+            Err(e) => return Err(e.into()),
+        },
+        None => None,
+    };
+    let (mut listed, complete, answer) = match from_route {
+        Some(answer) => {
+            let listed: Vec<Value> = answer
+                .get("values")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|v| {
+                    let id = text(v.get("id"))?;
+                    let name = text(v.get("name")).unwrap_or_else(|| id.clone());
+                    Some(json!({ "id": id, "name": name, "people": count(v.get("count")) }))
+                })
+                .collect();
+            let complete = answer.get("complete") == Some(&json!(true));
+            (listed, complete, answer)
+        }
+        None => {
+            let (answer, _) =
+                ctx.atlas.get(&sel::people_url(scope, sel, &[], sel::ORDERS[0], None), ctx.rid).await?;
+            let about = answer.pointer(&format!("/traits/{kind}"));
+            let labels = about.and_then(|a| a.get("labels"));
+            let q = q.map(sel::name_key).filter(|q| !q.is_empty());
+            let mut values: Vec<(String, String, u64)> = about
+                .and_then(|a| a.get("values"))
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+                .filter_map(|(id, n)| {
+                    let name =
+                        labels.and_then(|l| l.get(id)).and_then(Value::as_str).unwrap_or(id).to_owned();
+                    Some((id.clone(), name, n.as_u64()?))
+                })
+                .filter(|(id, name, _)| {
+                    q.as_deref().is_none_or(|q| {
+                        let key = sel::name_key(name);
+                        key.starts_with(q)
+                            || key.split(' ').any(|w| w.starts_with(q))
+                            || id.eq_ignore_ascii_case(q)
+                    })
+                })
+                .collect();
+            values.sort_by(|a, b| b.2.cmp(&a.2).then(a.1.cmp(&b.1)));
+            let shown_all = values.len() <= limit;
+            // people/counts.json lists a trait's commonest values; it says whether that is all of them.
+            let complete = shown_all && about.and_then(|a| a.get("complete")) == Some(&json!(true));
+            let listed = values
+                .into_iter()
+                .take(limit)
+                .map(|(id, name, n)| json!({ "id": id, "name": name, "people": n }))
+                .collect();
+            if !complete {
+                out.insert(
+                    "note".into(),
+                    json!("Only the commonest values are listed; one missing here may still match people."),
+                );
+            }
+            (listed, complete, answer)
+        }
+    };
+    if let Some((item, name)) = named {
+        if !listed.iter().any(|v| v["id"] == item) {
+            listed.insert(0, json!({ "id": item, "name": name }));
+        }
+    }
     out.insert("values".into(), Value::Array(listed));
-    out.insert("complete".into(), json!(total <= limit));
+    out.insert("complete".into(), json!(complete));
     caveats(ctx, &mut out, &answer);
     Ok(Value::Object(out))
 }
@@ -881,7 +1183,7 @@ fn exact_year(value: &Value) -> Option<i64> {
 
 async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
     let scope = scope(args)?;
-    let sel = selection(args, scope, ctx.tmdb_kinds)?;
+    let (sel, mut read_as) = selection(ctx, args, scope).await?;
     let (page, limit) = paging(args, 20)?;
     let mut traits: Vec<String> = Vec::new();
     if let Some(role) = string(args, "role")? {
@@ -890,9 +1192,23 @@ async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
     if let Some(gender) = string(args, "gender")? {
         traits.push(format!("gender:{}", gender_id(gender)?));
     }
-    for (key, kind) in [("citizenship", "citizenship"), ("occupation", "occupation")] {
-        traits.extend(strings(args, key)?.into_iter().map(|id| format!("{kind}:{id}")));
+    // A citizenship is a Wikidata item, or a country as people name it: "Sweden", "Swedish", "SE" → Q34.
+    for given in strings(args, "citizenship")? {
+        if sel::normalise("citizenship", &given, scope).is_ok() {
+            traits.push(format!("citizenship:{given}"));
+            continue;
+        }
+        let item = names::country(&given).and_then(|code| Some((names::country_item(code)?, code)));
+        let Some((item, code)) = item else {
+            return Err(bad(format!(
+                "citizenship {given:?}: a country's name or ISO code, or a Q-id from den_filter_values kind=citizenship"
+            )));
+        };
+        read_as
+            .push(format!("citizenship {given} as {} ({item})", names::country_name(code).unwrap_or(code)));
+        traits.push(format!("citizenship:{item}"));
     }
+    traits.extend(strings(args, "occupation")?.into_iter().map(|id| format!("occupation:{id}")));
     // An age is a birth year counted back from this year; a range of either is the decades it spans, one question
     // each, and the people in them held to the exact years. An open end is bounded: no one older than 100 is
     // looked for by age, and no one born before 1900.
@@ -1040,6 +1356,7 @@ async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
         })
         .collect();
     let mut out = listing(results, total, page, limit);
+    said(&mut out, read_as);
     let mut notes =
         vec!["Credits and traits are Wikidata's; a person with no record for a trait is not matched, so \
                           this list is not complete."
@@ -1153,10 +1470,12 @@ async fn similar(ctx: &Ctx<'_>, args: &Value) -> Answer {
     };
     let mix = args.get("mix_types").and_then(Value::as_bool).unwrap_or(true);
     let (page, limit) = paging(args, 20)?;
+    // The narrowing is the same for every seed: `sel` carries no `like`, the one kind whose spelling depends on scope.
+    let (narrowing, read_as) = selection(ctx, args, Scope::All).await?;
     let ask = |kind: &str, id: u64| -> Result<String, ToolError> {
         let scope = if mix { Scope::All } else { Scope::parse(kind).unwrap_or(Scope::All) };
         let like = if mix { format!("like:{kind}-{id}") } else { format!("like:{id}") };
-        let mut sel = selection(args, scope, ctx.tmdb_kinds)?;
+        let mut sel = narrowing.clone();
         sel.extend(sel::items(&[like], scope).map_err(bad)?);
         sel.sort();
         Ok(match seeds.len() {
@@ -1186,6 +1505,7 @@ async fn similar(ctx: &Ctx<'_>, args: &Value) -> Answer {
                        and moods: pass those with the same sel to den_filter_titles, or den_search in words."),
             );
         }
+        said(&mut out, read_as);
         caveats(ctx, &mut out, &answer);
         return Ok(Value::Object(out));
     }
@@ -1213,7 +1533,9 @@ async fn similar(ctx: &Ctx<'_>, args: &Value) -> Answer {
         }
     }
     let results: Vec<Value> = merged.into_iter().skip(page * limit).take(limit).collect();
-    Ok(Value::Object(listing(results, None, page, limit)))
+    let mut out = listing(results, None, page, limit);
+    said(&mut out, read_as);
+    Ok(Value::Object(out))
 }
 
 #[cfg(test)]
@@ -1247,12 +1569,23 @@ mod tests {
     }
 
     #[test]
-    fn tmdb_kinds_like_and_traits_are_not_title_filters_here() {
+    fn tmdb_kinds_are_refused_however_they_are_written() {
         let tmdb: Vec<String> = vec!["rating".into(), "character".into(), "future".into()];
-        for sel in ["rating:7", "character:walter white", "future:x", "like:movie-1", "gender:Q6581097"] {
-            assert!(selection(&json!({ "sel": [sel] }), Scope::All, &tmdb).is_err(), "{sel}");
+        for sel in ["rating:7", "character:walter white", "future:x", "-Rating:8", "genre:80, rating:7"] {
+            assert!(refuse_tmdb_kinds(&[sel.to_owned()], &tmdb).is_err(), "{sel}");
         }
-        assert!(selection(&json!({ "sel": ["country:se"] }), Scope::All, &tmdb).is_ok());
+        assert!(refuse_tmdb_kinds(&["country:se".to_owned()], &tmdb).is_ok());
+    }
+
+    #[test]
+    fn the_nearest_values_are_the_ones_a_person_meant() {
+        let known: Vec<(String, Option<String>)> =
+            ["Tense/Edge-of-seat", "Feel-good", "Slow-burn", "Dark & Gritty"]
+                .map(|k| (k.to_owned(), None))
+                .to_vec();
+        assert_eq!(nearest(&sel::name_key("tense"), &known)[0], "Tense/Edge-of-seat");
+        assert_eq!(nearest(&sel::name_key("slowburn"), &known)[0], "Slow-burn");
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
     }
 
     #[test]
