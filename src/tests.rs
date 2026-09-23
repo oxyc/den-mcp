@@ -53,13 +53,21 @@ fn canned(path: &str) -> Option<Value> {
             "labels": { "Q6581097": "male", "Q6581072": "female" } } } })
     } else if path.contains("/people.json") {
         let born = if path.contains("born:1980") { 1984 } else { 1976 };
-        json!({
+        let mut answer = json!({
             "people": [{ "id": format!("Q{born}"), "name": format!("Actor {born}"), "tmdbId": 99, "credits": 4,
                          "roles": ["cast"], "gender": ["Q6581097"], "citizenship": ["Q34"],
                          "born": { "precision": "day", "date": format!("{born}-05-01"), "year": born } }],
             "total": 1, "labels": { "Q6581097": "male", "Q34": "Sweden" },
             "traitCoverage": { "gender": { "count": 98, "denominator": 100 } }, "coverage": {}, "ignored": [],
-        })
+        });
+        if born == 1984 {
+            answer["people"][0]["died"] = json!({ "precision": "year", "year": 2024 });
+        }
+        // An atlas that orders by name says so; one that names no order ordered by credits.
+        if path.contains("order=name") {
+            answer["order"] = json!("name");
+        }
+        answer
     } else if path.starts_with("/index/filter/") && path.contains("/counts.json") {
         json!({ "total": 40, "kinds": {
             "genre": { "values": { "80": 20, "18": 30 } },
@@ -448,6 +456,36 @@ async fn people_by_traits_and_an_age_range() {
     let narrow = s.tool("den_find_people", json!({ "born_min": 1980, "born_max": 1985 })).await.unwrap();
     assert!(narrow["results"].as_array().unwrap().iter().all(|p| p["id"] != "Q1976"), "{narrow}");
     assert!(s.tool("den_find_people", json!({ "gender": "robot" })).await.is_err());
+}
+
+#[tokio::test]
+async fn people_sort_as_asked_or_say_the_order_they_came_in() {
+    let s = Server::new().await;
+    let notes = |answer: &Value| {
+        answer["notes"].as_array().unwrap().iter().map(|n| n.to_string()).collect::<String>()
+    };
+    let by_name = s.tool("den_find_people", json!({ "sel": ["decade:2020"], "sort": "name" })).await.unwrap();
+    assert_eq!(
+        s.asked.lock().unwrap()[0],
+        "/index/filter/all/people.json?sel=decade:2020&order=name&limit=20"
+    );
+    assert!(notes(&by_name).contains("Sorted by name."), "{by_name}");
+    // Prominence is atlas's default, so it is not spelled; an atlas that names no order ordered by credits.
+    let default = s.tool("den_find_people", json!({ "sel": ["decade:2010"] })).await.unwrap();
+    assert_eq!(s.asked.lock().unwrap()[1], "/index/filter/all/people.json?sel=decade:2010&limit=20");
+    assert!(notes(&default).contains("Sorted by credits"), "{default}");
+    let youngest =
+        s.tool("den_find_people", json!({ "sel": ["decade:2000"], "sort": "youngest" })).await.unwrap();
+    assert!(s.asked.lock().unwrap()[2].contains("order=born_desc"));
+    assert!(notes(&youngest).contains("can't sort people by youngest"), "{youngest}");
+    assert!(s.tool("den_find_people", json!({ "sort": "fame" })).await.is_err());
+    // Living leaves out the actor born 1984, who has died, and says the page may be short.
+    let living = s
+        .tool("den_find_people", json!({ "born_min": 1980, "born_max": 1985, "living": true }))
+        .await
+        .unwrap();
+    assert!(living["results"].as_array().unwrap().is_empty(), "{living}");
+    assert!(notes(&living).contains("1 who have died were left out"), "{living}");
 }
 
 #[tokio::test]

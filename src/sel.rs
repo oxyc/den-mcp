@@ -23,6 +23,7 @@ const QID: &[&str] = &[
     "made",
     "cast",
     "company",
+    "studio",
     "network",
     "subject",
     "place",
@@ -61,6 +62,24 @@ const LOWER: &[&str] = &[
 /// The person traits `people.json` takes as `traits`, rather than in `sel`.
 pub const TRAITS: &[&str] = &["gender", "citizenship", "occupation", "born", "role"];
 
+/// Whether atlas knows `kind`: a kind this server can spell canonically. Nothing else goes into a URL — a kind is a
+/// path segment in `values/<kind>.json` and a prefix in `sel`, and one built from anything a caller sends could
+/// reach another route (`../title/…`) or smuggle a parameter (`x&sel=…`).
+pub fn known_kind(kind: &str) -> bool {
+    [INTEGER, DECADE, UPPER, LABEL, QID, LOWER].iter().any(|list| list.contains(&kind))
+        || matches!(kind, "character" | "like")
+}
+
+/// Whether `kind` is one a title filter or `values/<kind>.json` takes: known, and not a person trait. `like` is
+/// among them here; the tools that must not offer it refuse it themselves.
+pub fn title_kind(kind: &str) -> bool {
+    known_kind(kind) && !TRAITS.contains(&kind)
+}
+
+/// How `people.json` orders people (`order`), as den-atlas takes it. `prominence` is atlas's default and so is left
+/// out of the canonical URL.
+pub const ORDERS: &[&str] = &["prominence", "credits", "name", "born_desc", "born_asc"];
+
 /// Which list an item is for: the title selection (`sel`), where a `like` names its title typed only under `all`.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Scope {
@@ -98,7 +117,9 @@ pub struct Item {
 
 impl Item {
     fn spelled(&self) -> String {
-        format!("{}{}:{}", if self.exclude { "-" } else { "" }, self.kind, encode(&self.id))
+        // The kind is a known name of lower-case letters (`normalise`); it is encoded all the same, so nothing that
+        // ever reaches here can end the item or the parameter.
+        format!("{}{}:{}", if self.exclude { "-" } else { "" }, encode(&self.kind), encode(&self.id))
     }
 }
 
@@ -147,8 +168,8 @@ fn typed_title(id: &str) -> Option<(&'static str, u32)> {
     Some((media, n.parse().ok()?))
 }
 
-/// A kind and an id as their canonical pair, or why atlas would refuse it. An unknown kind is kept, lower-cased,
-/// with its id as sent — atlas reports it as ignored rather than refusing.
+/// A kind and an id as their canonical pair, or why it is refused. Atlas would keep a kind it does not know and report
+/// it as ignored; here an unknown kind is refused (`known_kind`), since it would go into the URL as sent.
 pub fn normalise(kind: &str, id: &str, scope: Scope) -> Result<(String, String), String> {
     let kind = kind.trim().to_ascii_lowercase();
     let id = id.trim();
@@ -159,6 +180,9 @@ pub fn normalise(kind: &str, id: &str, scope: Scope) -> Result<(String, String),
         return Err(format!("{kind}: an empty id"));
     }
     let kind = resolve_axis(kind, id);
+    if !kind.bytes().all(|b| b.is_ascii_lowercase()) || !known_kind(&kind) {
+        return Err(format!("{kind:?} is not a kind Den filters by"));
+    }
     let k = kind.as_str();
     let number = || id.parse::<u32>().map_err(|_| format!("{kind}: {id:?} is not an integer"));
     let id = if INTEGER.contains(&k) {
@@ -260,9 +284,12 @@ pub fn counts_url(scope: Scope, sel: &[Item]) -> String {
     format!("/index/filter/{}/counts.json{}", scope.segment(), query(parts))
 }
 
-/// `/index/filter/<scope>/values/<kind>.json`. `limit` is the kind's own page, which is also its most: 10, and 5
-/// for a character.
-pub fn values_url(scope: Scope, kind: &str, sel: &[Item], q: Option<&str>, limit: usize) -> String {
+/// `/index/filter/<scope>/values/<kind>.json`, `None` for a kind that is not a title kind (`title_kind`): the kind
+/// is a path segment. `limit` is the kind's own page, which is also its most: 10, and 5 for a character.
+pub fn values_url(scope: Scope, kind: &str, sel: &[Item], q: Option<&str>, limit: usize) -> Option<String> {
+    if !title_kind(kind) || kind == "like" {
+        return None;
+    }
     let most = if kind == "character" { 5 } else { 10 };
     let limit = limit.clamp(1, most);
     let mut parts = Vec::new();
@@ -277,11 +304,18 @@ pub fn values_url(scope: Scope, kind: &str, sel: &[Item], q: Option<&str>, limit
     if limit != most {
         parts.push(format!("limit={limit}"));
     }
-    format!("/index/filter/{}/values/{kind}.json{}", scope.segment(), query(parts))
+    Some(format!("/index/filter/{}/values/{kind}.json{}", scope.segment(), query(parts)))
 }
 
-/// `/index/filter/<scope>/people.json`, or `people/counts.json` with no page.
-pub fn people_url(scope: Scope, sel: &[Item], traits: &[Item], page: Option<(usize, usize)>) -> String {
+/// `/index/filter/<scope>/people.json` in `order` (one of `ORDERS`; the default left out), or `people/counts.json`
+/// with no page.
+pub fn people_url(
+    scope: Scope,
+    sel: &[Item],
+    traits: &[Item],
+    order: &str,
+    page: Option<(usize, usize)>,
+) -> String {
     let mut parts = Vec::new();
     if !sel.is_empty() {
         parts.push(format!("sel={}", joined(sel)));
@@ -291,6 +325,9 @@ pub fn people_url(scope: Scope, sel: &[Item], traits: &[Item], page: Option<(usi
     }
     let route = match page {
         Some((skip, limit)) => {
+            if order != ORDERS[0] && ORDERS.contains(&order) {
+                parts.push(format!("order={order}"));
+            }
             paging(&mut parts, skip, limit);
             "people.json"
         }
@@ -321,6 +358,22 @@ mod tests {
                 .collect();
             let segments: Vec<&str> = path.trim_start_matches("/index/filter/").split('/').collect();
             let scope = Scope::parse(segments[0]).unwrap();
+            // A kind this server does not know is refused here where atlas would ignore it (`normalise`): the
+            // fixture's `future:` case is checked for that and skipped.
+            let unknown = ["sel", "traits"].iter().filter_map(|n| params.get(n)).any(|v| {
+                v.split(',').filter_map(|i| i.trim_start_matches('-').split_once(':')).any(|(k, _)| {
+                    let k = k.trim().to_ascii_lowercase();
+                    !known_kind(&k) && k != "structure"
+                })
+            });
+            if unknown {
+                let sel = params.get("sel").unwrap();
+                assert!(
+                    items(std::slice::from_ref(sel), scope).is_err(),
+                    "{url}: an unknown kind is refused"
+                );
+                continue;
+            }
             let list = |name: &str| -> Vec<Item> {
                 params.get(name).map(|v| items(std::slice::from_ref(v), scope).unwrap()).unwrap_or_default()
             };
@@ -340,11 +393,18 @@ mod tests {
                         params.get("q").map(String::as_str),
                         number("limit", most),
                     )
+                    .unwrap()
                 }
-                ["people.json"] => {
-                    people_url(scope, &list("sel"), &list("traits"), Some((number("skip", 0), limit)))
+                ["people.json"] => people_url(
+                    scope,
+                    &list("sel"),
+                    &list("traits"),
+                    "prominence",
+                    Some((number("skip", 0), limit)),
+                ),
+                ["people", "counts.json"] => {
+                    people_url(scope, &list("sel"), &list("traits"), "prominence", None)
                 }
-                ["people", "counts.json"] => people_url(scope, &list("sel"), &list("traits"), None),
                 other => panic!("an unknown route in the fixture: {other:?}"),
             };
             assert_eq!(built, canonical, "{url}");
@@ -387,6 +447,48 @@ mod tests {
             i += 1;
         }
         String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// A kind is a path segment in `values/<kind>.json` and a prefix in `sel`: one built from what a caller sent could
+    /// reach another route or carry a second parameter. Only a known kind of lower-case letters gets into a URL.
+    #[test]
+    fn a_kind_is_one_atlas_knows_or_nothing() {
+        for kind in [
+            "rating.json#",
+            "character.json?q=walter%20white#",
+            "../../../title/movie/1.json#",
+            "x&sel=y",
+            "",
+        ] {
+            assert_eq!(values_url(Scope::All, kind, &[], None, 10), None, "{kind}");
+        }
+        assert_eq!(values_url(Scope::All, "like", &[], None, 10), None, "like has no values");
+        assert_eq!(values_url(Scope::All, "gender", &[], None, 10), None, "a trait is people/counts.json's");
+        assert!(values_url(Scope::All, "person", &[], None, 10).is_some());
+        for item in ["zz&sel=rating%3A8&yy:1", "zz:1", "Pers on:Q1", "person/../x:Q1", "future:X1"] {
+            assert!(items(&[item.to_owned()], Scope::All).is_err(), "{item}");
+        }
+        assert_eq!(
+            titles_url(Scope::All, &items(&["studio:q60".into()], Scope::All).unwrap(), 0, 24),
+            "/index/filter/all/titles.json?sel=studio:Q60"
+        );
+    }
+
+    #[test]
+    fn a_people_order_follows_the_traits_and_the_default_is_left_out() {
+        let traits = items(&["role:cast".into()], Scope::Movie).unwrap();
+        assert_eq!(
+            people_url(Scope::Movie, &[], &traits, "born_desc", Some((20, 20))),
+            "/index/filter/movie/people.json?traits=role:cast&order=born_desc&skip=20&limit=20"
+        );
+        assert_eq!(
+            people_url(Scope::Movie, &[], &traits, "prominence", Some((0, 24))),
+            "/index/filter/movie/people.json?traits=role:cast"
+        );
+        assert_eq!(
+            people_url(Scope::Movie, &[], &[], "name", None),
+            "/index/filter/movie/people/counts.json"
+        );
     }
 
     #[test]

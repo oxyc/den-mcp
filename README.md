@@ -23,7 +23,7 @@ Titles are always `{type: movie|series, id}`; every title carries its Den Web `u
 | `den_search` | `query`, `type?`, `year_min?`, `year_max?`, `language?`, `runtime_max?`, `page?`, `limit?` (10, ≤50) | `/index/query.json` |
 | `den_filter_titles` | `type?` (all), `sel?` (`["kind:id", "-kind:id"]`), `page?`, `limit?` (20, ≤100) | `/index/filter/<type>/titles.json` |
 | `den_filter_values` | `kind?`, `q?`, `type?`, `sel?`, `limit?` (10, ≤30) | `values/<kind>.json`; a person trait from `people/counts.json`; no kind: `counts.json` |
-| `den_find_people` | `type?`, `sel?`, `role?`, `gender?`, `age_min?`, `age_max?`, `born_min?`, `born_max?`, `citizenship?`, `occupation?`, `page?`, `limit?` | `/index/filter/<type>/people.json` |
+| `den_find_people` | `type?`, `sel?`, `sort?` (prominence, credits, name, youngest, oldest), `role?`, `gender?`, `age_min?`, `age_max?`, `born_min?`, `born_max?`, `living?`, `citizenship?`, `occupation?`, `page?`, `limit?` | `/index/filter/<type>/people.json` with `order=`; an atlas that answers no `order` ordered by credits, and the answer's note says so |
 | `den_title` | `type`, `id` | `/index/title/<type>/<id>.json` |
 | `den_similar` | `titles` (1–8), `sel?`, `mix_types?` (true), `page?`, `limit?` | `titles.json?sel=like:…` per title, interleaved |
 

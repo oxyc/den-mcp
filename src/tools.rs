@@ -45,13 +45,74 @@ pub struct Ctx<'a> {
 pub struct ToolError(pub String);
 
 impl From<Failed> for ToolError {
+    /// Atlas's own words only for a refused question, where they say what to fix. Any other failure is said in
+    /// general terms and its detail goes to the log: it can name the network, an address or an internal error.
     fn from(f: Failed) -> Self {
         match f.status {
-            Some(400) => ToolError(format!("Den refused the question: {}", f.detail)),
+            Some(400) => ToolError(format!("Den refused the question: {}", clip(&f.detail, 300))),
             Some(404) => ToolError("Den's index does not answer that question.".into()),
             Some(503) => ToolError("Den's index is loading or busy; try again in a few seconds.".into()),
-            _ => ToolError(format!("Den's index is unavailable ({})", f.detail)),
+            _ => {
+                eprintln!("atlas: {}", f.detail);
+                ToolError("Den's index is unavailable right now; try again later.".into())
+            }
         }
+    }
+}
+
+fn clip(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
+// ---- the allowlist, value by value
+//
+// A field copied from atlas is copied as the type it is meant to be, never wholesale: a string field whose value is
+// an object, or a list of strings that holds something else, is left out rather than passed through.
+
+/// A short string.
+fn text(v: Option<&Value>) -> Option<Value> {
+    v?.as_str().map(str::trim).filter(|s| !s.is_empty() && s.chars().count() <= 200).map(|s| json!(s))
+}
+
+/// A list of short strings, at most `cap`; `None` when empty.
+fn texts(v: Option<&Value>, cap: usize) -> Option<Value> {
+    let list: Vec<Value> = v?.as_array()?.iter().filter_map(|x| text(Some(x))).take(cap).collect();
+    (!list.is_empty()).then_some(Value::Array(list))
+}
+
+fn count(v: Option<&Value>) -> Option<Value> {
+    v?.as_u64().map(|n| json!(n))
+}
+
+fn integer_value(v: Option<&Value>) -> Option<Value> {
+    v?.as_i64().map(|n| json!(n))
+}
+
+fn boolean(v: Option<&Value>) -> Option<Value> {
+    v?.as_bool().map(|b| json!(b))
+}
+
+/// A Wikidata item id: `Q` and digits.
+fn qid(v: Option<&Value>) -> Option<Value> {
+    let s = v?.as_str()?;
+    (s.len() > 1 && s.len() <= 12 && s.starts_with('Q') && s[1..].bytes().all(|b| b.is_ascii_digit()))
+        .then(|| json!(s))
+}
+
+/// An object of short strings keyed by short lower-case names: plot facets.
+fn text_map(v: Option<&Value>) -> Option<Value> {
+    let map: Map<String, Value> = v?
+        .as_object()?
+        .iter()
+        .filter(|(k, _)| k.len() <= 32 && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'))
+        .filter_map(|(k, x)| Some((k.clone(), text(Some(x))?)))
+        .collect();
+    (!map.is_empty()).then_some(Value::Object(map))
+}
+
+fn put(out: &mut Map<String, Value>, key: &str, value: Option<Value>) {
+    if let Some(v) = value {
+        out.insert(key.into(), v);
     }
 }
 
@@ -151,20 +212,29 @@ pub fn list() -> Value {
             "name": "den_find_people",
             "title": "Find people",
             "description": "People credited on the titles `sel` matches (e.g. [\"decade:2020\"] for 2020s titles), \
-                filtered by what Wikidata states about them, most matching credits first. Ages are from birth \
-                years, today. Resolve citizenship/occupation Q-ids with den_filter_values. People Wikidata has no \
-                record for on a trait are left out, so a list is never complete; say so.",
+                filtered by what Wikidata states about them. `sort`: prominence (how well known the matching \
+                titles they're credited on are; the default), credits (most matching titles), name, youngest, \
+                oldest; the answer's note says which order was used, since Den's index may not offer every one. \
+                Ages are from birth years, today. Resolve citizenship/occupation Q-ids with \
+                den_filter_values. People Wikidata has no record for on a trait are left out, so a list is never \
+                complete; say so.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "type": type_all,
                     "sel": sel_items,
+                    "sort": {
+                        "type": "string",
+                        "enum": ["prominence", "credits", "name", "youngest", "oldest"],
+                        "default": "prominence",
+                    },
                     "role": { "type": "string", "enum": ["cast", "director", "writer", "creator"] },
                     "gender": { "type": "string", "description": "male, female, non-binary, or a Wikidata Q-id" },
                     "age_min": { "type": "integer" },
                     "age_max": { "type": "integer" },
                     "born_min": { "type": "integer", "description": "Birth year, instead of an age" },
                     "born_max": { "type": "integer" },
+                    "living": { "type": "boolean", "description": "Leave out people who have died" },
                     "citizenship": { "type": "array", "items": { "type": "string" }, "description": "Q-ids, all held" },
                     "occupation": { "type": "array", "items": { "type": "string" }, "description": "Q-ids, all held" },
                     "page": page,
@@ -312,14 +382,19 @@ fn paging(args: &Value, default: usize) -> Result<(usize, usize), ToolError> {
 /// A title selection, refusing what a tool does not offer: the kinds that are TMDB's (ratings, characters), `like`,
 /// which is den_similar's, and the person traits, which are den_find_people's.
 fn selection(args: &Value, scope: Scope, tmdb_kinds: &[String]) -> Result<Vec<Item>, ToolError> {
-    let items = sel::items(&strings(args, "sel")?, scope).map_err(bad)?;
-    for item in &items {
-        let kind = item.kind.as_str();
-        if tmdb_kinds.iter().any(|k| k == kind) {
+    let raw = strings(args, "sel")?;
+    // A TMDB-backed kind is refused as such before anything else reads it, the ones only atlas's schema names too.
+    for item in &raw {
+        let kind = item.trim().trim_start_matches('-').split(':').next().unwrap_or("").trim().to_lowercase();
+        if tmdb_kinds.contains(&kind) {
             return Err(bad(format!(
                 "{kind} is not offered here; a title's url shows what Den Web has on it"
             )));
         }
+    }
+    let items = sel::items(&raw, scope).map_err(bad)?;
+    for item in &items {
+        let kind = item.kind.as_str();
         if kind == "like" {
             return Err(bad("use den_similar for titles like another"));
         }
@@ -382,14 +457,10 @@ fn title(cfg: &Config, card: &Value) -> Option<Value> {
     let mut out = Map::new();
     out.insert("type".into(), json!(kind));
     out.insert("id".into(), json!(id));
-    if let Some(name) = name {
-        out.insert("title".into(), json!(name));
-    }
-    for (from, to) in [("year", "year"), ("primaryGenre", "genre"), ("originalLanguage", "language")] {
-        if let Some(v) = card.get(from).filter(|v| !v.is_null() && v.as_str() != Some("")) {
-            out.insert(to.into(), v.clone());
-        }
-    }
+    put(&mut out, "title", text(card.get("title")));
+    put(&mut out, "year", integer_value(card.get("year")));
+    put(&mut out, "genre", text(card.get("primaryGenre")));
+    put(&mut out, "language", text(card.get("originalLanguage")));
     out.insert("url".into(), json!(title_url(cfg, kind, id, name)));
     Some(Value::Object(out))
 }
@@ -432,7 +503,7 @@ fn thousands(n: u64) -> String {
 }
 
 /// What atlas said it ignored or did not recognise, which a model should correct rather than silently lose.
-fn caveats(out: &mut Map<String, Value>, answer: &Value) {
+fn caveats(ctx: &Ctx<'_>, out: &mut Map<String, Value>, answer: &Value) {
     for (field, key) in [
         ("ignored", "ignored"),
         ("unknownValues", "unknown_values"),
@@ -441,17 +512,19 @@ fn caveats(out: &mut Map<String, Value>, answer: &Value) {
         ("unknownTraits", "unknown_traits"),
         ("traitsUnavailable", "traits_unavailable"),
     ] {
-        // A TMDB kind this tool never offers is nothing to tell a model about.
-        let listed: Vec<Value> = answer
-            .get(field)
-            .and_then(Value::as_array)
+        // A TMDB kind this tool never offers is nothing to tell a model about, however it is spelled there.
+        let kept: Vec<Value> = texts(answer.get(field), 16)
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()
             .into_iter()
-            .flatten()
-            .filter(|v| !v.as_str().is_some_and(|k| crate::atlas::TMDB_KINDS.contains(&k)))
-            .cloned()
+            .filter(|v| {
+                let named = v.as_str().unwrap_or("").trim_start_matches('-');
+                let kind = named.split(':').next().unwrap_or(named);
+                !ctx.tmdb_kinds.iter().any(|k| k == kind)
+            })
             .collect();
-        if !listed.is_empty() {
-            out.insert(key.into(), Value::Array(listed));
+        if !kept.is_empty() {
+            out.insert(key.into(), Value::Array(kept));
         }
     }
 }
@@ -496,53 +569,42 @@ async fn search(ctx: &Ctx<'_>, args: &Value) -> Answer {
             json!(format!("{} matches Den has no description of, only a TMDB name", tmdb.len())),
         );
     }
-    let not_applied: Vec<Value> = ["ignored", "unknownValues"]
-        .iter()
-        .filter_map(|k| answer.get(*k)?.as_array())
-        .flatten()
-        .cloned()
-        .collect();
+    let mut not_applied: Vec<Value> = Vec::new();
+    for key in ["ignored", "unknownValues"] {
+        if let Some(Value::Array(list)) = texts(answer.get(key), 16) {
+            not_applied.extend(list);
+        }
+    }
     if !not_applied.is_empty() {
         out.insert("not_applied".into(), Value::Array(not_applied));
         out.insert("note".into(), json!("Part of the question was not applied: see not_applied."));
     }
     let mut understood = Map::new();
-    if let Some(parse) = answer.get("parse").and_then(Value::as_object) {
-        for (from, to) in [
-            ("mediaType", "type"),
-            ("country", "country"),
-            ("decade", "decade"),
-            ("yearMin", "year_min"),
-            ("yearMax", "year_max"),
-            ("language", "language"),
-            ("runtimeMax", "runtime_max"),
-            ("labels", "labels"),
-            ("plotFacets", "plot_facets"),
-            ("basedOnKind", "based_on"),
-            ("leftover", "theme"),
-        ] {
-            let v = parse.get(from).filter(|v| match v {
-                Value::Null => false,
-                Value::Array(a) => !a.is_empty(),
-                Value::String(s) => !s.is_empty(),
-                _ => true,
-            });
-            if let Some(v) = v {
-                understood.insert(to.into(), v.clone());
-            }
+    if let Some(parse) = answer.get("parse") {
+        put(&mut understood, "type", text(parse.get("mediaType")));
+        put(&mut understood, "country", text(parse.get("country")));
+        put(&mut understood, "decade", integer_value(parse.get("decade")));
+        put(&mut understood, "year_min", integer_value(parse.get("yearMin")));
+        put(&mut understood, "year_max", integer_value(parse.get("yearMax")));
+        put(&mut understood, "language", text(parse.get("language")));
+        put(&mut understood, "runtime_max", count(parse.get("runtimeMax")));
+        put(&mut understood, "labels", texts(parse.get("labels"), 16));
+        put(&mut understood, "plot_facets", texts(parse.get("plotFacets"), 16));
+        put(&mut understood, "based_on", texts(parse.get("basedOnKind"), 16));
+        put(&mut understood, "theme", text(parse.get("leftover")));
+        let genres: Vec<Value> = parse
+            .get("genres")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_u64)
+            .filter_map(genre_name)
+            .map(|g| json!(g))
+            .collect();
+        if !genres.is_empty() {
+            understood.insert("genres".into(), Value::Array(genres));
         }
-        if let Some(genres) = parse.get("genres").and_then(Value::as_array).filter(|g| !g.is_empty()) {
-            let named: Vec<Value> = genres
-                .iter()
-                .filter_map(Value::as_u64)
-                .map(|g| json!(genre_name(g).unwrap_or("?")))
-                .collect();
-            understood.insert("genres".into(), Value::Array(named));
-        }
-        let phrases = answer.pointer("/parse/excluded/phrases");
-        if let Some(phrases) = phrases.filter(|p| p.as_array().is_some_and(|a| !a.is_empty())) {
-            understood.insert("excluded".into(), phrases.clone());
-        }
+        put(&mut understood, "excluded", texts(answer.pointer("/parse/excluded/phrases"), 16));
     }
     if !understood.is_empty() {
         out.insert("understood".into(), Value::Object(understood));
@@ -554,11 +616,16 @@ async fn search(ctx: &Ctx<'_>, args: &Value) -> Answer {
         .flatten()
         .filter_map(|p| {
             let name = p.get("name").and_then(Value::as_str);
-            let mut person = json!({ "id": p.get("qid")?, "name": name, "credits": p.get("credits") });
-            if let Some(url) = person_url(ctx.cfg, p.get("id").and_then(Value::as_u64), name) {
-                person["url"] = json!(url);
-            }
-            Some(person)
+            let mut person = Map::new();
+            person.insert("id".into(), qid(p.get("qid"))?);
+            put(&mut person, "name", text(p.get("name")));
+            put(&mut person, "credits", count(p.get("credits")));
+            put(
+                &mut person,
+                "url",
+                person_url(ctx.cfg, p.get("id").and_then(Value::as_u64), name).map(|u| json!(u)),
+            );
+            Some(Value::Object(person))
         })
         .collect();
     if !people.is_empty() {
@@ -612,7 +679,7 @@ async fn filter_titles(ctx: &Ctx<'_>, args: &Value) -> Answer {
     let results = titles(ctx.cfg, answer.get("titles"));
     let mut out = listing(results, answer.get("total").and_then(Value::as_u64), page, limit);
     out_of(&mut out, answer.get("denominator"));
-    caveats(&mut out, &answer);
+    caveats(ctx, &mut out, &answer);
     Ok(Value::Object(out))
 }
 
@@ -629,6 +696,7 @@ async fn filter_values(ctx: &Ctx<'_>, args: &Value) -> Answer {
     let Some(kind) = string(args, "kind")?.map(str::to_ascii_lowercase) else {
         return overview(ctx, scope, &sel).await;
     };
+    // Only a kind from the known list reaches a URL: it is a path segment there (`sel::values_url`).
     if ctx.tmdb_kinds.contains(&kind) {
         return Err(bad(format!("{kind} is not offered here")));
     }
@@ -641,30 +709,34 @@ async fn filter_values(ctx: &Ctx<'_>, args: &Value) -> Answer {
     if let Some(q) = q.filter(|q| sel::name_key(q).chars().count() < 2) {
         return Err(bad(format!("q {q:?}: at least 2 letters")));
     }
-    let (answer, _) = ctx.atlas.get(&sel::values_url(scope, &kind, &sel, q, limit), ctx.rid).await?;
+    let Some(url) = sel::values_url(scope, &kind, &sel, q, limit) else {
+        return Err(bad("kind is one of den_filter_titles' kinds, or a person trait"));
+    };
+    let (answer, _) = ctx.atlas.get(&url, ctx.rid).await?;
     let values: Vec<Value> = answer
         .get("values")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|v| {
-            let id = v.get("id")?.as_str()?;
-            let name = match (kind.as_str(), id.parse::<u64>().ok().and_then(genre_name)) {
-                ("genre", Some(name)) => name.to_owned(),
-                _ => v.get("name").and_then(Value::as_str).unwrap_or(id).to_owned(),
-            };
-            Some(json!({ "id": id, "name": name, "count": v.get("count") }))
+            let id = text(v.get("id"))?;
+            let name =
+                match (kind.as_str(), id.as_str().and_then(|i| i.parse::<u64>().ok()).and_then(genre_name)) {
+                    ("genre", Some(name)) => json!(name),
+                    _ => text(v.get("name")).unwrap_or_else(|| id.clone()),
+                };
+            let mut value = json!({ "id": id, "name": name });
+            put(value.as_object_mut()?, "count", count(v.get("count")));
+            Some(value)
         })
         .collect();
     let mut out = Map::new();
     out.insert("kind".into(), json!(kind));
     out.insert("use_as".into(), json!(format!("\"{kind}:<id>\" in sel")));
     out.insert("values".into(), Value::Array(values));
-    if let Some(complete) = answer.get("complete") {
-        out.insert("complete".into(), complete.clone());
-    }
+    put(&mut out, "complete", boolean(answer.get("complete")));
     out_of(&mut out, answer.get("denominator"));
-    caveats(&mut out, &answer);
+    caveats(ctx, &mut out, &answer);
     Ok(Value::Object(out))
 }
 
@@ -713,7 +785,7 @@ async fn overview(ctx: &Ctx<'_>, scope: Scope, sel: &[Item]) -> Answer {
     out_of(&mut out, answer.get("denominator"));
     out.insert("kinds".into(), Value::Object(kinds));
     out.insert("corpus".into(), json!(CORPUS));
-    caveats(&mut out, &answer);
+    caveats(ctx, &mut out, &answer);
     Ok(Value::Object(out))
 }
 
@@ -726,7 +798,7 @@ async fn trait_values(
     q: Option<&str>,
     limit: usize,
 ) -> Answer {
-    let (answer, _) = ctx.atlas.get(&sel::people_url(scope, sel, &[], None), ctx.rid).await?;
+    let (answer, _) = ctx.atlas.get(&sel::people_url(scope, sel, &[], sel::ORDERS[0], None), ctx.rid).await?;
     let about = answer.pointer(&format!("/traits/{kind}"));
     let labels = about.and_then(|a| a.get("labels"));
     let q = q.map(sel::name_key).filter(|q| !q.is_empty());
@@ -758,7 +830,7 @@ async fn trait_values(
     out.insert("use_as".into(), json!(format!("den_find_people's {kind}")));
     out.insert("values".into(), Value::Array(listed));
     out.insert("complete".into(), json!(total <= limit));
-    caveats(&mut out, &answer);
+    caveats(ctx, &mut out, &answer);
     Ok(Value::Object(out))
 }
 
@@ -822,29 +894,46 @@ async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
         traits.extend(strings(args, key)?.into_iter().map(|id| format!("{kind}:{id}")));
     }
     // An age is a birth year counted back from this year; a range of either is the decades it spans, one question
-    // each, and the people in them held to the exact years.
-    let born_min = match (integer(args, "born_min")?, integer(args, "age_max")?) {
+    // each, and the people in them held to the exact years. An open end is bounded: no one older than 100 is
+    // looked for by age, and no one born before 1900.
+    let (age_min, age_max) = (integer(args, "age_min")?, integer(args, "age_max")?);
+    let born_min = match (integer(args, "born_min")?, age_max) {
         (Some(year), _) => Some(year),
         (None, Some(age)) => Some(ctx.year - age - 1),
         _ => None,
     };
-    let born_max = match (integer(args, "born_max")?, integer(args, "age_min")?) {
+    let born_max = match (integer(args, "born_max")?, age_min) {
         (Some(year), _) => Some(year),
         (None, Some(age)) => Some(ctx.year - age),
         _ => None,
     };
+    let living = args.get("living").and_then(Value::as_bool).unwrap_or(false);
+    let sort = string(args, "sort")?.unwrap_or("prominence");
+    let order = match sort {
+        "prominence" => "prominence",
+        "credits" => "credits",
+        "name" => "name",
+        "youngest" => "born_desc",
+        "oldest" => "born_asc",
+        _ => return Err(bad("sort is prominence, credits, name, youngest or oldest")),
+    };
     let traits = sel::items(&traits, scope).map_err(bad)?;
     let labels_of = |answer: &Value| answer.get("labels").cloned().unwrap_or(Value::Null);
-    let (people, labels, total, answer) = match (born_min, born_max) {
+    // Whether atlas ordered as asked: it names the order it used. One that names none predates ordering, and
+    // ordered by credits.
+    let honoured = |answer: &Value| answer.get("order").and_then(Value::as_str) == Some(order);
+    let (mut people, labels, total, answer, sorted) = match (born_min, born_max) {
         (None, None) => {
             let (skip, limit) = sel::page(page, limit);
-            let (answer, _) =
-                ctx.atlas.get(&sel::people_url(scope, &sel, &traits, Some((skip, limit))), ctx.rid).await?;
+            let url = sel::people_url(scope, &sel, &traits, order, Some((skip, limit)));
+            let (answer, _) = ctx.atlas.get(&url, ctx.rid).await?;
             let people = answer.get("people").and_then(Value::as_array).cloned().unwrap_or_default();
-            (people, labels_of(&answer), answer.get("total").and_then(Value::as_u64), answer)
+            let sorted = honoured(&answer);
+            (people, labels_of(&answer), answer.get("total").and_then(Value::as_u64), answer, sorted)
         }
         (min, max) => {
-            let (min, max) = (min.unwrap_or(max.unwrap_or(0) - 120), max.unwrap_or(ctx.year));
+            let max = max.unwrap_or(ctx.year);
+            let min = min.unwrap_or(if age_min.is_some() { ctx.year - 101 } else { 1900 });
             if min > max {
                 return Err(bad("the birth-year range is empty"));
             }
@@ -852,39 +941,62 @@ async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
             if decades.len() as i64 > MAX_DECADES {
                 return Err(bad(format!("an age range spans at most {MAX_DECADES} decades")));
             }
-            // Every decade's first pages, merged by credits and cut to the page: a page further in than the first
-            // hundred of any decade is not offered.
+            // Every decade's first pages, merged in the asked order and cut to the page: a page further in than the
+            // first hundred of any decade is not offered.
             let want = (page + 1) * limit;
             if want > sel::MAX_PAGE {
                 return Err(bad("with an age range, page × limit stays within 100 people"));
             }
-            let mut merged: Vec<Value> = Vec::new();
+            let mut merged: Vec<(usize, Value)> = Vec::new();
             let mut labels = Map::new();
             let mut total = 0;
             let mut last = Value::Null;
+            let mut sorted = true;
             for decade in decades {
                 let mut with_born = traits.clone();
                 with_born.extend(sel::items(&[format!("born:{decade}")], scope).map_err(bad)?);
                 with_born.sort();
-                let url = sel::people_url(scope, &sel, &with_born, Some((0, want)));
+                let url = sel::people_url(scope, &sel, &with_born, order, Some((0, want)));
                 let (answer, _) = ctx.atlas.get(&url, ctx.rid).await?;
                 total += answer.get("total").and_then(Value::as_u64).unwrap_or(0);
                 if let Some(l) = answer.get("labels").and_then(Value::as_object) {
                     labels.extend(l.clone());
                 }
-                merged.extend(answer.get("people").and_then(Value::as_array).cloned().unwrap_or_default());
+                sorted &= honoured(&answer);
+                let list = answer.get("people").and_then(Value::as_array).cloned().unwrap_or_default();
+                merged.extend(list.into_iter().enumerate());
                 last = answer;
             }
-            merged.retain(|p| {
+            merged.retain(|(_, p)| {
                 p.get("born").and_then(exact_year).is_none_or(|year| (min..=max).contains(&year))
             });
-            merged.sort_by(|a, b| {
+            // Prominence has no number to compare across decades, so each decade's order is kept and the decades
+            // are interleaved by rank: the most prominent of each, then the next of each.
+            let effective = if sorted { order } else { "credits" };
+            merged.sort_by(|(ra, a), (rb, b)| {
                 let credits = |p: &Value| p.get("credits").and_then(Value::as_u64).unwrap_or(0);
-                credits(b).cmp(&credits(a)).then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+                let year = |p: &Value| p.get("born").and_then(|b| b.get("year")).and_then(Value::as_i64);
+                let name = |p: &Value| p.get("name").and_then(Value::as_str).unwrap_or("").to_lowercase();
+                let by = match effective {
+                    "prominence" => ra.cmp(rb),
+                    "name" => name(a).cmp(&name(b)),
+                    "born_desc" => year(b).cmp(&year(a)),
+                    "born_asc" => year(a).map_or(i64::MAX, |y| y).cmp(&year(b).map_or(i64::MAX, |y| y)),
+                    _ => credits(b).cmp(&credits(a)),
+                };
+                by.then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
             });
-            let people: Vec<Value> = merged.into_iter().skip(page * limit).take(limit).collect();
-            (people, Value::Object(labels), Some(total), last)
+            let people: Vec<Value> =
+                merged.into_iter().map(|(_, p)| p).skip(page * limit).take(limit).collect();
+            (people, Value::Object(labels), Some(total), last, sorted)
         }
+    };
+    let dropped_dead = if living {
+        let before = people.len();
+        people.retain(|p| p.get("died").is_none_or(Value::is_null));
+        before - people.len()
+    } else {
+        0
     };
     let label = |id: &Value| -> Value {
         id.as_str().and_then(|q| labels.get(q)).cloned().unwrap_or_else(|| id.clone())
@@ -894,16 +1006,22 @@ async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
         .filter_map(|p| {
             let name = p.get("name").and_then(Value::as_str);
             let mut out = Map::new();
-            out.insert("id".into(), p.get("id")?.clone());
-            out.insert("name".into(), json!(name));
-            for key in ["credits", "roles"] {
-                if let Some(v) = p.get(key) {
-                    out.insert(key.into(), v.clone());
-                }
-            }
+            out.insert("id".into(), qid(p.get("id"))?);
+            put(&mut out, "name", text(p.get("name")));
+            put(&mut out, "credits", count(p.get("credits")));
+            put(&mut out, "roles", texts(p.get("roles"), 8));
             for (key, cap) in [("gender", 4), ("citizenship", 4), ("occupation", 4)] {
-                if let Some(list) = p.get(key).and_then(Value::as_array).filter(|l| !l.is_empty()) {
-                    out.insert(key.into(), list.iter().take(cap).map(label).collect());
+                let ids: Vec<Value> = p
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|id| qid(Some(id)))
+                    .take(cap)
+                    .map(|id| text(Some(&label(&id))).unwrap_or(id))
+                    .collect();
+                if !ids.is_empty() {
+                    out.insert(key.into(), Value::Array(ids));
                 }
             }
             let born = p.get("born");
@@ -932,7 +1050,18 @@ async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
                     the decade overlaps. The total counts whole decades."
                 .to_owned(),
         );
+        if !living {
+            notes.push("People who have died match too; pass living: true to leave them out.".to_owned());
+        }
     }
+    if dropped_dead > 0 {
+        notes.push(format!("{dropped_dead} who have died were left out of this page, so it may be short."));
+    }
+    notes.push(if sorted {
+        format!("Sorted by {sort}.")
+    } else {
+        format!("Sorted by credits (most matching titles): this Den's index can't sort people by {sort} yet.")
+    });
     out.insert("notes".into(), json!(notes));
     // How many of the credited people each applied trait is on record for: what "not complete" amounts to.
     if let Some(coverage) = answer.get("traitCoverage").and_then(Value::as_object) {
@@ -948,7 +1077,7 @@ async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
             out.insert("on_record".into(), Value::Object(shares));
         }
     }
-    caveats(&mut out, &answer);
+    caveats(ctx, &mut out, &answer);
     Ok(Value::Object(out))
 }
 
@@ -978,29 +1107,15 @@ async fn title_facts(ctx: &Ctx<'_>, args: &Value) -> Answer {
     };
     out.insert("indexed".into(), json!(true));
     if let Some(labels) = answer.get("labels") {
-        for (from, to) in [("animated", "animated"), ("subgenres", "subgenres"), ("moods", "moods")] {
-            if let Some(v) = labels.get(from).filter(|v| v.as_array().is_none_or(|a| !a.is_empty())) {
-                out.insert(to.into(), v.clone());
-            }
-        }
+        put(&mut out, "animated", boolean(labels.get("animated")));
+        put(&mut out, "subgenres", texts(labels.get("subgenres"), 16));
+        put(&mut out, "moods", texts(labels.get("moods"), 16));
     }
-    for (from, to) in [
-        ("plotFacets", "plot_facets"),
-        ("countries", "countries"),
-        ("languages", "languages"),
-        ("runtimeMinutes", "runtime_minutes"),
-        ("basedOn", "based_on"),
-    ] {
-        let v = answer.get(from).filter(|v| match v {
-            Value::Null => false,
-            Value::Array(a) => !a.is_empty(),
-            Value::Object(o) => !o.is_empty(),
-            _ => true,
-        });
-        if let Some(v) = v {
-            out.insert(to.into(), v.clone());
-        }
-    }
+    put(&mut out, "plot_facets", text_map(answer.get("plotFacets")));
+    put(&mut out, "countries", texts(answer.get("countries"), 16));
+    put(&mut out, "languages", texts(answer.get("languages"), 16));
+    put(&mut out, "runtime_minutes", count(answer.get("runtimeMinutes")));
+    put(&mut out, "based_on", texts(answer.get("basedOn"), 8));
     // The makers with their Den Web pages; the cast — up to sixty, in no billing order — by name and id alone, to
     // keep the answer lean.
     let people = |key: &str, linked: bool| -> Vec<Value> {
@@ -1010,10 +1125,10 @@ async fn title_facts(ctx: &Ctx<'_>, args: &Value) -> Answer {
             .into_iter()
             .flatten()
             .filter_map(|p| {
-                let name = p.get("name").and_then(Value::as_str);
-                let mut person = json!({ "id": p.get("id")?, "name": name });
+                let name = text(p.get("name"));
+                let mut person = json!({ "id": qid(p.get("id"))?, "name": name });
                 let tmdb = p.get("tmdbId").and_then(Value::as_u64).filter(|_| linked);
-                if let Some(url) = person_url(ctx.cfg, tmdb, name) {
+                if let Some(url) = person_url(ctx.cfg, tmdb, name.as_ref().and_then(Value::as_str)) {
                     person["url"] = json!(url);
                 }
                 Some(person)
@@ -1022,9 +1137,7 @@ async fn title_facts(ctx: &Ctx<'_>, args: &Value) -> Answer {
     };
     out.insert("directors_writers".into(), Value::Array(people("makers", true)));
     out.insert("cast".into(), Value::Array(people("cast", false)));
-    if let Some(total) = answer.get("castTotal") {
-        out.insert("cast_total".into(), total.clone());
-    }
+    put(&mut out, "cast_total", count(answer.get("castTotal")));
     out.insert("attribution".into(), json!(ATTRIBUTION));
     Ok(Value::Object(out))
 }
@@ -1073,7 +1186,7 @@ async fn similar(ctx: &Ctx<'_>, args: &Value) -> Answer {
                        and moods: pass those with the same sel to den_filter_titles, or den_search in words."),
             );
         }
-        caveats(&mut out, &answer);
+        caveats(ctx, &mut out, &answer);
         return Ok(Value::Object(out));
     }
     if (page + 1) * limit > sel::MAX_PAGE {
