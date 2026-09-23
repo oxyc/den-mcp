@@ -286,6 +286,27 @@ async fn initialize_and_list_the_tools() {
 }
 
 #[tokio::test]
+async fn calls_past_the_cap_are_told_to_come_back_and_atlas_sees_no_more_than_its_share() {
+    let (atlas, asked) = stub_atlas().await;
+    let mut cfg = config(atlas);
+    cfg.atlas.timeout = std::time::Duration::from_millis(200);
+    let s = Server::with(cfg, asked);
+    // Every tool slot taken: the call is refused at once, as a result the model can act on, and atlas is not asked.
+    let held = s.state.tool_slots.try_acquire_many(crate::MAX_TOOL_CALLS as u32).unwrap();
+    let busy = s.tool("den_filter_titles", json!({ "sel": ["genre:80"] })).await.unwrap_err();
+    assert!(busy.contains("busy"), "{busy}");
+    assert!(s.asked.lock().unwrap().is_empty());
+    drop(held);
+    // Every request slot to atlas taken: a call waits within atlas's timeout and fails, never adding a request.
+    let held = s.state.atlas.in_flight().try_acquire_many(crate::atlas::MAX_IN_FLIGHT as u32).unwrap();
+    let waited = s.tool("den_filter_titles", json!({ "sel": ["genre:80"] })).await.unwrap_err();
+    assert!(waited.contains("unavailable"), "{waited}");
+    assert!(s.asked.lock().unwrap().is_empty());
+    drop(held);
+    assert!(s.tool("den_filter_titles", json!({ "sel": ["genre:80"] })).await.is_ok());
+}
+
+#[tokio::test]
 async fn protocol_errors_are_json_rpc_errors() {
     let s = Server::new().await;
     assert_eq!(s.rpc("resources/list", json!({})).await["error"]["code"], crate::mcp::METHOD_NOT_FOUND);

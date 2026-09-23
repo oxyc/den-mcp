@@ -29,7 +29,13 @@ pub struct Atlas {
     used: [AtomicU64; 3],
     /// The filter kinds atlas's schema names as TMDB's, and until when that reading stands.
     tmdb_kinds: Mutex<Option<(Vec<String>, Instant)>>,
+    /// Requests to atlas in flight at once. A tool call can ask several (an age range, several seeds), so this caps
+    /// what reaches atlas whatever the number of calls; a request waits for a slot within its own timeout.
+    in_flight: tokio::sync::Semaphore,
 }
+
+/// The most requests this server has at atlas at once.
+pub const MAX_IN_FLIGHT: usize = 16;
 
 /// The filter kinds whose values are TMDB's (den-atlas `tmdb.rs`): refused as filters and never listed. Atlas's
 /// `/index/schema.json` names them in `tmdb.filterKinds`, and that list is read and added to these; these stand
@@ -78,7 +84,24 @@ impl Atlas {
             cache: Mutex::default(),
             used: Default::default(),
             tmdb_kinds: Mutex::default(),
+            in_flight: tokio::sync::Semaphore::new(MAX_IN_FLIGHT),
         }
+    }
+
+    /// Send `req`, once a slot is free, all within the request timeout.
+    async fn send(&self, req: Request<Full<Bytes>>) -> Result<hyper::Response<hyper::body::Incoming>, Failed> {
+        tokio::time::timeout(self.timeout, async {
+            let _slot = self.in_flight.acquire().await.map_err(|_| failed(None, "shutting down".into()))?;
+            self.client.request(req).await.map_err(|e| failed(None, format!("atlas unreachable: {e}")))
+        })
+        .await
+        .map_err(|_| failed(None, "atlas did not answer in time".into()))?
+    }
+
+    /// Slots free for requests to atlas; the tests hold them.
+    #[cfg(test)]
+    pub fn in_flight(&self) -> &tokio::sync::Semaphore {
+        &self.in_flight
     }
 
     /// The filter kinds that are TMDB's: `TMDB_KINDS` and whatever atlas's schema adds, read at most hourly (a
@@ -111,10 +134,7 @@ impl Atlas {
             req = req.header("x-request-id", rid);
         }
         let req = req.body(Full::new(Bytes::new())).map_err(|e| failed(None, e.to_string()))?;
-        let resp = tokio::time::timeout(self.timeout, self.client.request(req))
-            .await
-            .map_err(|_| failed(None, "atlas did not answer in time".into()))?
-            .map_err(|e| failed(None, format!("atlas unreachable: {e}")))?;
+        let resp = self.send(req).await?;
         let status = resp.status().as_u16();
         let body = Limited::new(resp.into_body(), MAX_ANSWER)
             .collect()
@@ -163,10 +183,7 @@ impl Atlas {
             req = req.header(header::IF_NONE_MATCH, etag.as_str());
         }
         let req = req.body(Full::new(Bytes::new())).map_err(|e| failed(None, e.to_string()))?;
-        let resp = tokio::time::timeout(self.timeout, self.client.request(req))
-            .await
-            .map_err(|_| failed(None, "atlas did not answer in time".into()))?
-            .map_err(|e| failed(None, format!("atlas unreachable: {e}")))?;
+        let resp = self.send(req).await?;
         let status = resp.status();
         let (parts, body) = resp.into_parts();
         let fresh_for = freshness(parts.headers.get(header::CACHE_CONTROL).and_then(|v| v.to_str().ok()));

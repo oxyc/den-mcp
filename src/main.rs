@@ -39,13 +39,26 @@ pub struct AppState {
     pub atlas: atlas::Atlas,
     pub limit: auth::RateLimit,
     pub metrics: metrics::Metrics,
+    /// Tool calls running at once, across every session: past it a call is told to come back, so a burst queues at
+    /// the client rather than in this server's memory or at atlas.
+    pub tool_slots: tokio::sync::Semaphore,
 }
+
+/// The most tool calls run at once. A call takes a few milliseconds of atlas's time, so this is far above any one
+/// household's use and bounds what many sessions together can put on atlas.
+pub const MAX_TOOL_CALLS: usize = 32;
 
 impl AppState {
     pub fn new(cfg: config::Config) -> Self {
         let atlas = atlas::Atlas::new(cfg.atlas.base.clone(), cfg.atlas.timeout);
         let limit = auth::RateLimit::new(cfg.rate_per_minute, cfg.rate_burst);
-        AppState { cfg, atlas, limit, metrics: metrics::Metrics::default() }
+        AppState {
+            cfg,
+            atlas,
+            limit,
+            metrics: metrics::Metrics::default(),
+            tool_slots: tokio::sync::Semaphore::new(MAX_TOOL_CALLS),
+        }
     }
 }
 
@@ -330,6 +343,11 @@ async fn answer(
                 return (Some(mcp::error(id, mcp::INVALID_PARAMS, &format!("Unknown tool: {name}"))), None);
             };
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let Ok(_slot) = state.tool_slots.try_acquire() else {
+                state.metrics.count("mcp_busy_total", String::new());
+                let busy = Err(tools::ToolError("Den is busy; try again in a few seconds.".into()));
+                return (Some(mcp::result(id, mcp::tool_result(busy))), Some(tool));
+            };
             let started = Instant::now();
             let tmdb_kinds = state.atlas.tmdb_kinds(rid).await;
             let ctx = tools::Ctx {
