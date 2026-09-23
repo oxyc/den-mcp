@@ -306,6 +306,43 @@ async fn calls_past_the_cap_are_told_to_come_back_and_atlas_sees_no_more_than_it
     assert!(s.tool("den_filter_titles", json!({ "sel": ["genre:80"] })).await.is_ok());
 }
 
+/// Calls that find the TMDB kinds stale together read atlas's schema once, not once each.
+#[tokio::test]
+async fn a_stale_schema_is_read_once_however_many_calls_find_it() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let seen = reads.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let seen = seen.clone();
+            let service = hyper::service::service_fn(move |_req: Request<hyper::body::Incoming>| {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    // Slow enough that every call finds the reading stale before the first read ends.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    let body = json!({ "tmdb": { "filterKinds": ["rating", "character", "later"] } });
+                    Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(Bytes::from(body.to_string()))))
+                }
+            });
+            tokio::spawn(async move {
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+            });
+        }
+    });
+    let atlas = crate::atlas::Atlas::new(format!("http://{addr}"), std::time::Duration::from_secs(5));
+    let (a, b, c, d) =
+        tokio::join!(atlas.tmdb_kinds(None), atlas.tmdb_kinds(None), atlas.tmdb_kinds(None), atlas.tmdb_kinds(None));
+    for kinds in [a, b, c, d] {
+        assert!(kinds.contains(&"later".to_owned()), "{kinds:?}");
+    }
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn protocol_errors_are_json_rpc_errors() {
     let s = Server::new().await;

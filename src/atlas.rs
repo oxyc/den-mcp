@@ -29,6 +29,8 @@ pub struct Atlas {
     used: [AtomicU64; 3],
     /// The filter kinds atlas's schema names as TMDB's, and until when that reading stands.
     tmdb_kinds: Mutex<Option<(Vec<String>, Instant)>>,
+    /// Held while the schema is read, so calls that find the reading stale together read it once.
+    tmdb_refresh: tokio::sync::Mutex<()>,
     /// Requests to atlas in flight at once. A tool call can ask several (an age range, several seeds), so this caps
     /// what reaches atlas whatever the number of calls; a request waits for a slot within its own timeout.
     in_flight: tokio::sync::Semaphore,
@@ -84,6 +86,7 @@ impl Atlas {
             cache: Mutex::default(),
             used: Default::default(),
             tmdb_kinds: Mutex::default(),
+            tmdb_refresh: tokio::sync::Mutex::new(()),
             in_flight: tokio::sync::Semaphore::new(MAX_IN_FLIGHT),
         }
     }
@@ -107,12 +110,20 @@ impl Atlas {
     /// The filter kinds that are TMDB's: `TMDB_KINDS` and whatever atlas's schema adds, read at most hourly (a
     /// minute after a failed read).
     pub async fn tmdb_kinds(&self, rid: Option<&str>) -> Vec<String> {
-        let now = Instant::now();
-        if let Some((kinds, until)) = self.tmdb_kinds.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            if *until > now {
-                return kinds.clone();
-            }
+        let current = || {
+            let now = Instant::now();
+            let reading = self.tmdb_kinds.lock().unwrap_or_else(|e| e.into_inner());
+            reading.as_ref().filter(|(_, until)| *until > now).map(|(kinds, _)| kinds.clone())
+        };
+        if let Some(kinds) = current() {
+            return kinds;
         }
+        // One read at a time; whoever waited finds the reading the first one made.
+        let _reading = self.tmdb_refresh.lock().await;
+        if let Some(kinds) = current() {
+            return kinds;
+        }
+        let now = Instant::now();
         let mut kinds: Vec<String> = TMDB_KINDS.iter().map(|k| (*k).to_owned()).collect();
         let read = self.fetch_uncached("/index/schema.json", rid).await;
         let listed =
