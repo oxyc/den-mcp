@@ -105,6 +105,10 @@ fn canned(path: &str) -> Option<Value> {
         title["makers"] = json!([{ "id": "Q1", "name": "Michael Mann", "tmdbId": 638 }]);
         title["cast"] = json!([{ "id": "Q2", "name": "Al Pacino" }]);
         title["castTotal"] = json!(40);
+        // Its awards by ceremony (den-atlas#94), one planted with an id that is no Q-id.
+        title["awards"] = json!([{ "id": "Q19020", "name": "Academy Awards", "won": false },
+                                 { "id": "Q1011547", "name": "Golden Globe Awards", "won": true },
+                                 { "id": "x", "name": "x", "won": true }]);
         title
     } else if path == "/index/studios/movie/949.json" {
         json!({ "studios": [{ "id": "Q159846", "name": "Warner Bros." }, { "id": "not-a-qid", "name": "x" }] })
@@ -720,6 +724,37 @@ async fn people_by_traits_and_an_age_range() {
     let danes = s.tool("den_find_people", json!({ "citizenship": ["DK"], "type": "movie" })).await.unwrap();
     assert!(danes["read_as"][0].as_str().unwrap().contains("Q756617"));
     assert!(s.tool("den_find_people", json!({ "citizenship": ["Narnia"] })).await.is_err());
+    // Where they were born: a place by Q-id; a country by name, code or Q-id, sent as the code or item.
+    let nigerians = s
+        .tool("den_find_people", json!({ "birthcountry": ["Nigerian", "Q15180"], "birthplace": ["q1754"] }))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.asked.lock().unwrap().last().unwrap(),
+        "/index/filter/all/people.json?traits=birthcountry:NG|Q15180,birthplace:Q1754"
+    );
+    assert_eq!(nigerians["read_as"], json!(["birthcountry Nigerian as Nigeria (NG)"]));
+    assert!(s.tool("den_find_people", json!({ "birthcountry": ["Narnia"] })).await.is_err());
+    assert!(s.tool("den_find_people", json!({ "birthplace": ["Stockholm"] })).await.is_err(), "a Q-id");
+    // A birth trait is a person's, never a title filter.
+    assert!(s.tool("den_filter_titles", json!({ "sel": ["birthcountry:SE"] })).await.is_err());
+}
+
+/// Awards by ceremony and a source work's author are title kinds, spelled as atlas spells them.
+#[tokio::test]
+async fn awards_and_source_authors_filter_titles() {
+    let s = Server::new().await;
+    let last = |s: &Server| s.asked.lock().unwrap().last().unwrap().clone();
+    s.tool(
+        "den_filter_titles",
+        json!({ "type": "movie", "sel": ["won:q19020", "author:Q39829", "-award:Q42369"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(last(&s), "/index/filter/movie/titles.json?sel=author:Q39829,-award:Q42369,won:Q19020");
+    s.tool("den_filter_values", json!({ "kind": "award", "q": "Cannes" })).await.unwrap();
+    assert_eq!(last(&s), "/index/filter/all/values/award.json?q=cannes");
+    assert!(s.tool("den_filter_titles", json!({ "sel": ["won:Oscar"] })).await.is_err(), "a ceremony's Q-id");
 }
 
 /// Several values of one trait or kind in one list are either; separate items, or a list of lists, all hold. Each is
@@ -837,6 +872,11 @@ async fn a_title_is_its_facts_and_an_unindexed_one_says_so() {
     // Its studios from their own route, each a Q-id and a name; and the makers said to be one list.
     assert_eq!(heat["studios"], json!([{ "id": "Q159846", "name": "Warner Bros." }]));
     assert!(heat["makers_note"].as_str().unwrap().contains("one list"));
+    assert_eq!(
+        heat["awards"],
+        json!([{ "id": "Q19020", "name": "Academy Awards", "won": false },
+               { "id": "Q1011547", "name": "Golden Globe Awards", "won": true }])
+    );
     let unknown = s.tool("den_title", json!({ "type": "movie", "id": 1 })).await.unwrap();
     assert_eq!(unknown["indexed"], false);
     assert!(s.tool("den_title", json!({ "type": "tv", "id": 1 })).await.is_err(), "series, not tv");
@@ -862,6 +902,7 @@ async fn search_and_fetch_answer_in_the_research_shape() {
         "Subgenres: Heist.",
         "Plot: ending tragic.",
         "Directors and writers: Michael Mann.",
+        "Awards: nominated at Academy Awards, won at Golden Globe Awards.",
     ] {
         assert!(text.contains(line), "{line}: {text}");
     }

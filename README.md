@@ -23,8 +23,8 @@ Titles are always `{type: movie|series, id}`; every title carries its Den Web `u
 | `den_search` | `query`, `type?`, `year_min?`, `year_max?`, `language?`, `runtime_max?`, `broadcaster?`, `page?`, `limit?` (10, ≤100) | `/index/query.json`; its count is `candidates`, how many titles the words reached |
 | `den_filter_titles` | `type?` (all), `sel?` (`["kind:id", "-kind:id"]`), `order?` (popular; newest/oldest are noted as unavailable), `page?`, `limit?` (20, ≤100) | `/index/filter/<type>/titles.json`; each applied kind's coverage as `on_record` |
 | `den_filter_values` | `kind?`, `q?`, `kinds?`, `type?`, `sel?`, `limit?` (10, ≤10) | a short-list kind whole from `counts.json`; others `values/<kind>.json`; a person trait `people/values/<trait>.json` (den-atlas#80), else `people/counts.json`; no kind: `counts.json` |
-| `den_find_people` | `type?`, `sel?`, `sort?` (prominence, credits, name, youngest, oldest), `role?`, `gender?`, `age_min?`, `age_max?`, `born_min?`, `born_max?`, `living?`, `citizenship?` (names, codes or Q-ids), `occupation?`, `page?`, `limit?` | `/index/filter/<type>/people.json` with `order=`; an atlas that answers no `order` ordered by credits, and the answer's note says so |
-| `den_title` | `type`, `id` | `/index/title/<type>/<id>.json` and `/index/studios/<type>/<id>.json` |
+| `den_find_people` | `type?`, `sel?`, `sort?` (prominence, credits, name, youngest, oldest), `role?`, `gender?`, `age_min?`, `age_max?`, `born_min?`, `born_max?`, `living?`, `citizenship?` (names, codes or Q-ids), `occupation?`, `birthplace?` (Q-ids), `birthcountry?` (names, codes or Q-ids; the country of the birthplace, sent as the code or item), `page?`, `limit?` | `/index/filter/<type>/people.json` with `order=`; an atlas that answers no `order` ordered by credits, and the answer's note says so |
+| `den_title` | `type`, `id` | `/index/title/<type>/<id>.json` (with the ceremonies it won or was nominated at, `awards`) and `/index/studios/<type>/<id>.json` |
 | `den_similar` | `titles` (1–8), `sel?`, `mix_types?` (true), `page?`, `limit?` | `titles.json?sel=like:…` per title, interleaved |
 | `search` | `query` | `den_search`, as ChatGPT's research tools call it: `{results: [{id: "movie:949", title, url}]}` |
 | `fetch` | `id` | `den_title` as text: `{id, title, text, url, metadata}` |
@@ -47,6 +47,10 @@ A value is read the way a person writes it. Languages and countries may be named
 Den's own vocabulary — `counts.json` with no selection, kept for the hour atlas marks it fresh — whatever the case or
 separators (`mood:tense edge of seat` is `mood:Tense/Edge-of-seat`), and the answer's `read_as` says so; a value Den
 does not have is refused with the nearest three.
+
+Awards are title kinds by ceremony, as atlas holds them (Wikidata's P166/P1411, no categories): `award:<Q>` won or
+nominated there, `won:<Q>` won there, the ceremonies from `den_filter_values kind=award`. `author:<Q>` is a title
+adapted from that author's work. An atlas without these sections answers without them and names them in `ignored`.
 
 An age range becomes one birth-year range, atlas's `born:<from>-<to>` trait (den-atlas#85), with an open end left open
 (`born:1976-`, `born:-1996`), and pages like any other list. An atlas older than ranges answers that trait with a 400;
