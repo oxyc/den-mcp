@@ -28,10 +28,16 @@ const QID: &[&str] = &[
     "subject",
     "place",
     "format",
+    "author",
+    "award",
+    "won",
     "gender",
     "citizenship",
     "occupation",
+    "birthplace",
 ];
+/// A country by its ISO 3166-1 alpha-2 code or its Wikidata item: `SE` or `Q34`.
+const COUNTRY: &[&str] = &["birthcountry"];
 /// Every kind atlas knows besides those: its lower-case kinds, the plot-facet axes (den-store `FACET_AXES`) and
 /// the person trait `role`.
 const LOWER: &[&str] = &[
@@ -60,13 +66,14 @@ const LOWER: &[&str] = &[
 ];
 
 /// The person traits `people.json` takes as `traits`, rather than in `sel`.
-pub const TRAITS: &[&str] = &["gender", "citizenship", "occupation", "born", "role"];
+pub const TRAITS: &[&str] =
+    &["gender", "citizenship", "occupation", "birthplace", "birthcountry", "born", "role"];
 
 /// Whether atlas knows `kind`: a kind this server can spell canonically. Nothing else goes into a URL — a kind is a
 /// path segment in `values/<kind>.json` and a prefix in `sel`, and one built from anything a caller sends could
 /// reach another route (`../title/…`) or smuggle a parameter (`x&sel=…`).
 pub fn known_kind(kind: &str) -> bool {
-    [INTEGER, DECADE, UPPER, LABEL, QID, LOWER].iter().any(|list| list.contains(&kind))
+    [INTEGER, DECADE, UPPER, LABEL, QID, COUNTRY, LOWER].iter().any(|list| list.contains(&kind))
         || matches!(kind, "character" | "like")
 }
 
@@ -224,10 +231,14 @@ pub fn normalise(kind: &str, id: &str, scope: Scope) -> Result<(String, String),
     } else if LABEL.contains(&k) {
         id.to_owned()
     } else if QID.contains(&k) {
-        let digits = id.strip_prefix(['Q', 'q']).unwrap_or(id);
-        match digits.parse::<u32>() {
-            Ok(n) if digits.bytes().all(|b| b.is_ascii_digit()) => format!("Q{n}"),
-            _ => return Err(format!("{kind}: {id:?} is not a Wikidata Q-id")),
+        qid_of(id).ok_or_else(|| format!("{kind}: {id:?} is not a Wikidata Q-id"))?
+    } else if COUNTRY.contains(&k) {
+        // A Q-id first, as atlas reads it (`QA` is Qatar, `Q1` an item), then a code. A name is den_find_people's to
+        // read (`birthcountry_id`), as a citizenship's is.
+        match qid_of(id) {
+            Some(qid) => qid,
+            None if two_letters => id.to_ascii_uppercase(),
+            None => return Err(format!("{kind}: {id:?} is neither an ISO 3166-1 alpha-2 code nor a Q-id")),
         }
     } else if k == "character" {
         let name = name_key(id);
@@ -249,6 +260,15 @@ pub fn normalise(kind: &str, id: &str, scope: Scope) -> Result<(String, String),
         id.to_owned()
     };
     Ok((kind, id))
+}
+
+/// A Wikidata item in its canonical form, `Q` and digits (a bare number is one too), or `None`.
+fn qid_of(id: &str) -> Option<String> {
+    let digits = id.strip_prefix(['Q', 'q']).unwrap_or(id);
+    match digits.parse::<u32>() {
+        Ok(n) if digits.bytes().all(|b| b.is_ascii_digit()) => Some(format!("Q{n}")),
+        _ => None,
+    }
 }
 
 /// The earliest birth year a `born` range may name; the latest is next year.
@@ -403,7 +423,7 @@ pub fn people_values_url(
     q: Option<&str>,
     limit: usize,
 ) -> Option<String> {
-    if !matches!(kind, "gender" | "citizenship" | "occupation") {
+    if !matches!(kind, "gender" | "citizenship" | "occupation" | "birthplace" | "birthcountry") {
         return None;
     }
     let most = 10;
