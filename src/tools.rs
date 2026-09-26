@@ -146,8 +146,10 @@ pub fn list() -> Value {
             pacing:slow-burn, era:medieval, setting:rural, scope:global, chronology:nonlinear, continuity:episodic, \
             conflict:person-vs-self, ensemble:ensemble-led, timespan:single-day, archetype:rebirth, \
             technique:stop_motion, audience:made_for_children, critique:class, warning:graphic_violence, \
-            studio:Q16248298 (A24); Wikidata Q-ids for person, made (director/writer/creator), cast, company, \
-            network, subject, place, format. Case and separators are forgiven. den_filter_values lists any kind's \
+            studio:Q16248298 (A24), award:Q19020 (won or nominated at the Academy Awards), won:Q19020 (won \
+            one there), author:Q39829 (adapted from Stephen King's work); Wikidata Q-ids for person, made \
+            (director/writer/creator), cast, company, network, subject, place, format, author, award, won. Case \
+            and separators are forgiven. den_filter_values lists any kind's \
             values and turns names into ids.",
     });
     let type_all = json!({ "type": "string", "enum": ["movie", "series", "all"], "default": "all" });
@@ -200,7 +202,9 @@ pub fn list() -> Value {
                 Languages and countries may be named (language:Swedish); people, companies and places need their \
                 Q-id from den_filter_values (\"Christopher Nolan\" → made:Q25191). Either of several values is one \
                 item joined by | ([\"decade:1980|1990\"] for the 80s or 90s); separate items all hold. No year \
-                range: use decades.",
+                range: use decades. Awards are by ceremony, not category (Wikidata's): award:<ceremony> is won or \
+                nominated there, won:<ceremony> won there, ceremonies from den_filter_values kind=award; most titles \
+                have no award on record, so -won: keeps only titles recognised elsewhere.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -218,8 +222,8 @@ pub fn list() -> Value {
             "name": "den_filter_values",
             "title": "Look up filter values",
             "description": "Turn a name into the id a filter takes, with how many titles carry it under `sel`. \
-                `kind` is a den_filter_titles kind or a den_find_people trait (gender, citizenship, occupation, born, \
-                role). A short list (moods, subgenres, languages, countries, plot facets, …) comes whole; people, \
+                `kind` is a den_filter_titles kind or a den_find_people trait (gender, citizenship, occupation, \
+                birthplace, birthcountry, born, role). A short list (moods, subgenres, languages, countries, plot facets, …) comes whole; people, \
                 companies, places and the like come 10 at most, found by `q`, the start of a word (\"nol\" → \
                 Christopher Nolan). `complete: false` means more exist. Without `kind`: each kind's commonest \
                 values, or only `kinds`'.",
@@ -244,8 +248,8 @@ pub fn list() -> Value {
                 titles they're credited on are; the default), credits (most matching titles), name, youngest, \
                 oldest; the answer's note says which order was used, since Den's index may not offer every one. \
                 Ages are birth years counted back from this year, so ±1; either end of an age or birth-year range \
-                may be left open. Citizenship takes a country's name or code; occupation a Q-id \
-                from den_filter_values. A trait's list is either (citizenship [\"American\", \"British\"]); a \
+                may be left open. Countries take a name or code; occupation and birthplace a Q-id from \
+                den_filter_values. A trait's list is either (citizenship [\"American\", \"British\"]); a \
                 list of lists all ([[\"US\"], [\"GB\"]]: dual citizens). People Wikidata has no record for on a trait are left out, \
                 so a list is never complete; say so.",
             "inputSchema": {
@@ -276,6 +280,12 @@ pub fn list() -> Value {
                                                      ([\"US\", \"GB\"]); a list of lists all ([[\"US\"], [\"GB\"]])" },
                     "occupation": { "type": "array", "items": trait_value,
                                     "description": "Q-ids. A list is either; a list of lists all" },
+                    "birthplace": { "type": "array", "items": trait_value,
+                                    "description": "Places of birth as Q-ids (den_filter_values \
+                                                    kind=birthplace q=gothenburg). A list is either" },
+                    "birthcountry": { "type": "array", "items": trait_value,
+                                      "description": "Countries of birth (Nigeria, NG) or Q-ids: where the \
+                                                      birthplace is. A list is either; a list of lists all" },
                     "page": page,
                     "limit": limit24,
                 },
@@ -286,7 +296,8 @@ pub fn list() -> Value {
             "name": "den_title",
             "title": "A title's facts",
             "description": "One title as Den describes it: Den's genre, subgenres and moods, plot facets (ending, \
-                tone, pacing, …), countries, languages, runtime, what it adapts, its iconic studios, and \
+                tone, pacing, …), countries, languages, runtime, what it adapts, its iconic studios, the award \
+                ceremonies it won or was nominated at, and \
                 directors/writers (one list) and cast with their Wikidata ids. Techniques, warnings, subjects and \
                 places are filters only (den_filter_titles), not listed here. No plot summary, ratings or \
                 availability: share its url for those.",
@@ -498,6 +509,22 @@ async fn research_fetch(ctx: &Ctx<'_>, args: &Value) -> Answer {
     add("Runtime", facts["runtime_minutes"].as_u64().map(|m| format!("{m} minutes")));
     add("Based on", list("based_on"));
     add("Studios", list("studios"));
+    add(
+        "Awards",
+        facts["awards"].as_array().filter(|a| !a.is_empty()).map(|a| {
+            a.iter()
+                .filter_map(|x| {
+                    let name = x["name"].as_str()?;
+                    Some(if x["won"] == json!(true) {
+                        format!("won at {name}")
+                    } else {
+                        format!("nominated at {name}")
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        }),
+    );
     add("Directors and writers", list("directors_writers"));
     add("Cast", list("cast"));
     Ok(json!({
@@ -1503,6 +1530,21 @@ fn citizenship_id(given: &str, scope: Scope, read_as: &mut Vec<String>) -> Resul
     Ok(item.to_owned())
 }
 
+/// A birth country is a code or a Wikidata item, or a country as people name it: "Nigeria", "Nigerian" → NG, said
+/// back in `read_as`. Atlas matches a code against every country carrying it.
+fn birthcountry_id(given: &str, scope: Scope, read_as: &mut Vec<String>) -> Result<String, ToolError> {
+    if let Ok((_, id)) = sel::normalise("birthcountry", given, scope) {
+        return Ok(id);
+    }
+    let Some(code) = names::country(given) else {
+        return Err(bad(format!(
+            "birthcountry {given:?}: a country's name or ISO code, or a Q-id from den_filter_values kind=birthcountry"
+        )));
+    };
+    read_as.push(format!("birthcountry {given} as {} ({code})", names::country_name(code).unwrap_or(code)));
+    Ok(code.to_owned())
+}
+
 /// A trait argument as its groups of values. A string, or a list of strings, is one group: any of its values will
 /// do ("a|b" in a string is two). A list of lists is a group per inner list, every one held.
 fn trait_groups(args: &Value, key: &str) -> Result<Vec<Vec<String>>, ToolError> {
@@ -1646,13 +1688,14 @@ async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
     // Each trait argument is its OR groups, each one `trait:a|b` item: any of a group's values will do, and every
     // group must hold.
     let mut traits: Vec<String> = Vec::new();
-    for kind in ["role", "gender", "citizenship", "occupation"] {
+    for kind in ["role", "gender", "citizenship", "occupation", "birthplace", "birthcountry"] {
         for group in trait_groups(args, kind)? {
             let mut ids = Vec::with_capacity(group.len());
             for given in group {
                 ids.push(match kind {
                     "gender" => gender_id(&given)?,
                     "citizenship" => citizenship_id(&given, scope, &mut read_as)?,
+                    "birthcountry" => birthcountry_id(&given, scope, &mut read_as)?,
                     _ => given,
                 });
             }
@@ -1738,7 +1781,9 @@ async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
             put(&mut out, "name", text(p.get("name")));
             put(&mut out, "credits", count(p.get("credits")));
             put(&mut out, "roles", texts(p.get("roles"), 8));
-            for (key, cap) in [("gender", 4), ("citizenship", 4), ("occupation", 4)] {
+            for (key, cap) in
+                [("gender", 4), ("citizenship", 4), ("occupation", 4), ("birthplace", 2), ("birthcountry", 2)]
+            {
                 let ids: Vec<Value> = p
                     .get(key)
                     .and_then(Value::as_array)
@@ -1888,6 +1933,19 @@ async fn title_facts(ctx: &Ctx<'_>, args: &Value) -> Answer {
     );
     out.insert("cast".into(), Value::Array(people("cast", false)));
     put(&mut out, "cast_total", count(answer.get("castTotal")));
+    // The ceremonies it won or was nominated at, by name; an atlas without them, or a title with none, has no field.
+    let awards: Vec<Value> = answer
+        .get("awards")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|a| {
+            Some(json!({ "id": qid(a.get("id"))?, "name": text(a.get("name"))?, "won": boolean(a.get("won"))? }))
+        })
+        .collect();
+    if !awards.is_empty() {
+        out.insert("awards".into(), Value::Array(awards));
+    }
     // Its iconic studios, from their own route; one atlas without it, or a title with none, has no field.
     if let Ok((studios, _)) = ctx.atlas.get(&format!("/index/studios/{kind}/{id}.json"), ctx.rid).await {
         let listed: Vec<Value> = studios
