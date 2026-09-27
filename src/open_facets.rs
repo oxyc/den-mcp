@@ -17,8 +17,7 @@ use std::path::{Path, PathBuf};
 
 pub const RECORD_VERSION: u32 = 1;
 pub const NORMALIZATION_VERSION: &str = "question-normalization-v1";
-pub const QUESTION_SCHEMA: &str =
-    r#"{"version":1,"primitive":"choice","options":["yes","no","unknown"]}"#;
+pub const QUESTION_SCHEMA: &str = r#"{"version":1,"primitive":"choice","options":["yes","no","unknown"]}"#;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct TitleKey {
@@ -69,8 +68,12 @@ pub trait Provider {
 
     fn model(&self) -> &str;
     fn estimate_input_tokens(&self, question: &str, candidate: &Candidate) -> u64;
-    fn decide(&mut self, question: &str, schema: &str, candidate: &Candidate)
-        -> Result<ProviderAnswer, Self::Failure>;
+    fn decide(
+        &mut self,
+        question: &str,
+        schema: &str,
+        candidate: &Candidate,
+    ) -> Result<ProviderAnswer, Self::Failure>;
 }
 
 #[derive(Clone, Debug)]
@@ -174,7 +177,7 @@ pub struct Report {
 impl Report {
     /// MCP-facing shape: coverage always carries its denominator and incompleteness explicitly.
     pub fn as_json(&self) -> Value {
-        json!({
+        let mut answer = json!({
             "run_key": self.run_key,
             "corpus": self.corpus,
             "question": self.question,
@@ -182,8 +185,11 @@ impl Report {
             "schema_digest": self.schema_digest,
             "coverage": self.coverage,
             "usage": self.usage,
-            "stopped": self.stopped,
-        })
+        });
+        if let Some(stopped) = &self.stopped {
+            answer["stopped"] = json!(stopped);
+        }
+        answer
     }
 }
 
@@ -251,7 +257,10 @@ impl Store {
             return if existing == *record {
                 Ok(())
             } else {
-                Err(Error::Corrupt(format!("{} conflicts with the decision already persisted", path.display())))
+                Err(Error::Corrupt(format!(
+                    "{} conflicts with the decision already persisted",
+                    path.display()
+                )))
             };
         }
         let nonce = std::time::SystemTime::now()
@@ -290,9 +299,7 @@ impl Store {
 }
 
 fn sync_dir(path: &Path) -> Result<(), Error> {
-    fs::File::open(path)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| Error::Io(format!("{}: {e}", path.display())))
+    fs::File::open(path).and_then(|f| f.sync_all()).map_err(|e| Error::Io(format!("{}: {e}", path.display())))
 }
 
 pub fn normalize_question(question: &str) -> Result<String, Error> {
@@ -521,18 +528,13 @@ mod tests {
     fn decisions_persist_without_evidence_and_a_second_run_resumes() {
         let (path, store) = temp_store("resume");
         let mut first = provider();
-        let report = run(&store, "corpus-a", "Unreliable narrator?", &candidates(), &limits(3), &mut first)
-            .unwrap();
+        let report =
+            run(&store, "corpus-a", "Unreliable narrator?", &candidates(), &limits(3), &mut first).unwrap();
         assert_eq!(first.calls, 3);
-        assert_eq!(report.coverage, Coverage {
-            denominator: 3,
-            decided: 3,
-            yes: 1,
-            no: 1,
-            unknown: 1,
-            remaining: 0,
-            complete: true,
-        });
+        assert_eq!(
+            report.coverage,
+            Coverage { denominator: 3, decided: 3, yes: 1, no: 1, unknown: 1, remaining: 0, complete: true }
+        );
         assert_eq!(report.usage.calls, 3);
 
         let mut resumed = provider();
@@ -588,8 +590,8 @@ mod tests {
         assert!(partial.stopped.is_some());
         assert_eq!(first.calls, 2);
         let mut resumed = provider();
-        let report = run(&store, "corpus-a", "Unreliable narrator?", &candidates(), &limits(1), &mut resumed)
-            .unwrap();
+        let report =
+            run(&store, "corpus-a", "Unreliable narrator?", &candidates(), &limits(1), &mut resumed).unwrap();
         assert_eq!(resumed.calls, 1);
         assert!(report.coverage.complete);
         fs::remove_dir_all(path).unwrap();
@@ -599,14 +601,15 @@ mod tests {
     fn mcp_smoke_fixture_names_denominator_unknowns_and_usage() {
         let (path, store) = temp_store("mcp");
         let mut fake = provider();
-        let report = run(&store, "corpus-a", "Unreliable narrator?", &candidates(), &limits(3), &mut fake)
-            .unwrap();
+        let report =
+            run(&store, "corpus-a", "Unreliable narrator?", &candidates(), &limits(3), &mut fake).unwrap();
         let envelope = crate::mcp::tool_result(Ok(report.as_json()));
         let answer = &envelope["structuredContent"];
         assert_eq!(answer["coverage"]["denominator"], 3);
         assert_eq!(answer["coverage"]["unknown"], 1);
         assert_eq!(answer["coverage"]["complete"], true);
         assert_eq!(answer["usage"]["calls"], 3);
+        assert!(answer.get("stopped").is_none());
         assert_eq!(envelope["isError"], Value::Null);
         fs::remove_dir_all(path).unwrap();
     }
