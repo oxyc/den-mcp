@@ -115,10 +115,19 @@ arguments, which are what someone asked.
 See `.env.example`. `ATLAS_URL` (plain http on the LAN) and `PUBLIC_ORIGIN` are required; `TOKEN_PUBLIC_KEYS` is
 den-edge's public key (base64url, comma-separated during a rotation).
 
+`den_open_facet` is non-billing by default: it returns an explicit `den_search` fallback without contacting Atlas
+or a provider. A deployment must set `OPEN_FACETS_ENABLED=1` and every spend bound in `.env.example`, a pinned
+provider model, a dataset-specific corpus id, a writable decision directory, and `TYPESAFE_API_KEY` before the paid
+path exists. The tool embedding-preselects 50 Atlas cards by default and at most 100, sends only MCP-allowlisted
+card fields to Jev, reserves calls/tokens/cost before each request, persists only fixed yes/no/unknown decisions,
+and reports both preselection and classification denominators. Provider failure returns an incomplete result and the free
+fallback. Calls serialize at this boundary so simultaneous identical requests cannot double-spend before saving.
+
 ## Performance
 
-Hyper and tokio directly, one runtime thread, no MCP SDK (the protocol surface is four methods), no TLS stack, and
-a pooled keep-alive client to atlas with a 4 MB cache that honours atlas's `Cache-Control` and revalidates by ETag.
+Hyper and tokio directly, one runtime thread, no MCP SDK (the protocol surface is four methods), and a pooled
+keep-alive client to atlas with a 4 MB cache that honours atlas's `Cache-Control` and revalidates by ETag. The
+binary includes rustls solely for the disabled-by-default open-facet provider path.
 Measured with `cargo run --release --example load` (a stub atlas answering a 24-card page at once; macOS, M-series):
 
 | | |

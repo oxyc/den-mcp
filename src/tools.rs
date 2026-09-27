@@ -21,6 +21,7 @@
 use crate::atlas::{encode, Atlas, Failed};
 use crate::config::Config;
 use crate::names;
+use crate::open_facets::{self, Candidate, Decision, JevProvider, Limits, Store, TitleKey};
 use crate::sel::{self, Item, Scope};
 use futures_util::future::join_all;
 use serde_json::{json, Map, Value};
@@ -40,6 +41,7 @@ pub struct Ctx<'a> {
     pub year: i64,
     /// The filter kinds that are TMDB's (`Atlas::tmdb_kinds`).
     pub tmdb_kinds: &'a [String],
+    pub open_facet_slot: &'a tokio::sync::Semaphore,
 }
 
 /// A tool refused or failed: said to the model as a tool error it can act on.
@@ -325,6 +327,24 @@ pub fn list() -> Value {
             "annotations": read_only,
         },
         {
+            "name": "den_open_facet",
+            "title": "Try a new plot facet",
+            "description": "Experimental, bounded classification for a facet Den does not have yet. Den first \
+                embedding-ranks a small candidate set, then—only when the server operator explicitly enabled a \
+                paid pinned provider—classifies that set as yes, no, or unknown. Always reports both preselection \
+                and classification denominators. Prefer den_search and den_filter_titles for known facets.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "question": { "type": "string", "minLength": 3, "maxLength": 240,
+                                  "description": "One title property, e.g. unreliable narrator" },
+                    "type": { "type": "string", "enum": ["movie", "series"] }
+                },
+                "required": ["question"]
+            },
+            "annotations": { "readOnlyHint": false, "idempotentHint": false, "openWorldHint": true },
+        },
+        {
             "name": "search",
             "title": "Search Den (research)",
             "description": "Search Den's film and series index in plain words. Returns ids (e.g. movie:949) for \
@@ -384,6 +404,18 @@ pub(crate) fn output_schema(tool: &str) -> Value {
     };
     match tool {
         "den_search" | "den_filter_titles" | "den_similar" => listing(title),
+        "den_open_facet" => json!({
+            "type": "object",
+            "properties": {
+                "available": { "type": "boolean" },
+                "complete": { "type": "boolean" },
+                "results": { "type": "array" },
+                "preselection": { "type": "object" },
+                "coverage": { "type": "object" },
+                "fallback": { "type": "object" }
+            },
+            "required": ["available", "complete", "results", "preselection", "coverage", "fallback"]
+        }),
         "den_find_people" => listing(json!({
             "type": "object",
             "properties": { "id": { "type": "string" }, "name": { "type": "string" }, "url": { "type": "string" } },
@@ -438,11 +470,140 @@ pub async fn call(ctx: &Ctx<'_>, name: &str, args: &Value) -> Option<Answer> {
         "den_find_people" => find_people(ctx, args).await,
         "den_title" => title_facts(ctx, args).await,
         "den_similar" => similar(ctx, args).await,
+        "den_open_facet" => open_facet(ctx, args).await,
         "search" => research_search(ctx, args).await,
         "fetch" => research_fetch(ctx, args).await,
         _ => return None,
     };
     Some(answer.and_then(guard))
+}
+
+/// A bounded open facet. The ordinary, disabled answer is deliberately useful and costs nothing.
+async fn open_facet(ctx: &Ctx<'_>, args: &Value) -> Answer {
+    let question = string(args, "question")?.ok_or_else(|| bad("question: a title property to test"))?;
+    open_facets::normalize_question(question).map_err(|e| bad(e.to_string()))?;
+    let media_type = string(args, "type")?;
+    if media_type.is_some_and(|t| !matches!(t, "movie" | "series")) {
+        return Err(bad("type is movie or series"));
+    }
+    let fallback = json!({
+        "tool": "den_search",
+        "arguments": { "query": question },
+        "note": "Use Den's existing semantic search; it ranks candidates but does not prove this facet."
+    });
+    let Some(config) = &ctx.cfg.open_facets else {
+        return Ok(json!({
+            "available": false,
+            "complete": false,
+            "results": [],
+            "preselection": { "requested": 0, "returned": 0, "candidateDenominator": 0, "complete": false },
+            "coverage": { "denominator": 0, "decided": 0, "yes": 0, "no": 0, "unknown": 0,
+                          "remaining": 0, "complete": false },
+            "fallback": fallback,
+            "stopped": "Open-facet classification is not enabled by this Den deployment."
+        }));
+    };
+    let _paid_slot = ctx
+        .open_facet_slot
+        .acquire()
+        .await
+        .map_err(|_| bad("Open-facet classification is shutting down."))?;
+
+    let mut path = format!("/index/query.json?q={}&skip=0&limit={}", encode(question), config.max_candidates);
+    if let Some(kind) = media_type {
+        path.push_str(&format!("&type={kind}"));
+    }
+    let (preselected, _) = ctx.atlas.get(&path, ctx.rid).await?;
+    let total = preselected.get("total").and_then(Value::as_u64);
+    let safe_cards: Vec<Value> = preselected
+        .get("hits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|hit| hit.get("titleFrom").and_then(Value::as_str) != Some("tmdb"))
+        .filter_map(|hit| title(ctx.cfg, hit))
+        .take(config.max_candidates)
+        .collect();
+    let candidates: Vec<Candidate> = safe_cards
+        .iter()
+        .filter_map(|card| {
+            let key = TitleKey::new(card["type"].as_str()?, card["id"].as_u64()?).ok()?;
+            // Only the same field-by-field allowlisted card exposed by other MCP tools crosses the provider boundary.
+            Some(Candidate { title: key, state: card.to_string() })
+        })
+        .collect();
+    let requested = config.max_candidates;
+    let preselection = json!({
+        "requested": requested,
+        "returned": candidates.len(),
+        "candidateDenominator": total,
+        "complete": total.is_some_and(|n| n as usize <= candidates.len()),
+        "method": "den-atlas embedding query"
+    });
+    if candidates.is_empty() {
+        return Ok(json!({
+            "available": true, "complete": false, "results": [], "preselection": preselection,
+            "coverage": { "denominator": 0, "decided": 0, "yes": 0, "no": 0, "unknown": 0,
+                          "remaining": 0, "complete": false },
+            "fallback": fallback, "stopped": "Preselection produced no safely named candidates."
+        }));
+    }
+
+    let store = Store::open(&config.state_dir).map_err(|e| bad(e.to_string()))?;
+    let provider = JevProvider::new(
+        config.endpoint.clone(),
+        config.api_key.clone(),
+        config.model.clone(),
+        config.timeout,
+    )
+    .map_err(|e| bad(e.to_string()))?;
+    let limits = Limits {
+        max_candidates: config.max_candidates,
+        max_calls: config.max_calls,
+        max_input_tokens: config.max_input_tokens,
+        dollars_per_billion_input_tokens: config.dollars_per_billion_input_tokens,
+        max_cost_nano_usd: config.max_cost_nano_usd,
+    };
+    let report =
+        match open_facets::run(&store, &config.corpus, question, &candidates, &limits, &provider).await {
+            Ok(report) => report,
+            Err(error) => {
+                return Ok(json!({
+                    "available": true, "complete": false, "results": [], "preselection": preselection,
+                    "coverage": { "denominator": candidates.len(), "decided": 0, "yes": 0, "no": 0,
+                                  "unknown": 0, "remaining": candidates.len(), "complete": false },
+                    "fallback": fallback, "stopped": error.to_string()
+                }));
+            }
+        };
+    let mut classified = Vec::new();
+    let mut results = Vec::new();
+    for (candidate, card) in candidates.iter().zip(&safe_cards) {
+        if let Some(record) = store.load(&report.run_key, &candidate.title).map_err(|e| bad(e.to_string()))? {
+            let mut item = card.clone();
+            item["decision"] = json!(match record.decision {
+                Decision::Yes => "yes",
+                Decision::No => "no",
+                Decision::Unknown => "unknown",
+            });
+            classified.push(item.clone());
+            if record.decision == Decision::Yes {
+                results.push(item);
+            }
+        }
+    }
+    Ok(json!({
+        "available": true,
+        "complete": report.coverage.complete && preselection["complete"] == true,
+        "results": results,
+        "classified": classified,
+        "preselection": preselection,
+        "coverage": report.coverage,
+        "usage": report.usage,
+        "runKey": report.run_key,
+        "fallback": fallback,
+        "stopped": report.stopped
+    }))
 }
 
 // ---- search and fetch: the pair ChatGPT's deep research and company knowledge call by these names and shapes

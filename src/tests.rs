@@ -183,6 +183,47 @@ async fn stub_atlas() -> (String, Asked) {
     (format!("http://{addr}"), asked)
 }
 
+/// A deterministic local stand-in for Jev. It exercises the real HTTP adapter without any paid request.
+async fn stub_facet_provider() -> (String, Asked) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let asked: Asked = Arc::default();
+    let seen = asked.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let seen = seen.clone();
+            let service = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                let seen = seen.clone();
+                async move {
+                    assert_eq!(req.headers()["authorization"], "Bearer fake-key");
+                    let body = req.into_body().collect().await.unwrap().to_bytes();
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(request["model"], "jev-test-1");
+                    assert_eq!(request["questions"]["facet"]["type"], "choice");
+                    let state = request["state"].as_str().unwrap();
+                    assert!(!state.contains("overview") && !state.contains("TMDB text"));
+                    seen.lock().unwrap().push(state.to_owned());
+                    let choice = if state.contains("Heat") { "yes" } else { "unknown" };
+                    let response = json!({
+                        "answers": { "facet": { "type": "choice", "choice": choice } },
+                        "model": "jev-test-1",
+                        "usage": { "input_tokens": 20, "output_tokens": 0 }
+                    });
+                    Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(Bytes::from(
+                        response.to_string(),
+                    ))))
+                }
+            });
+            tokio::spawn(async move {
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+            });
+        }
+    });
+    (format!("http://{addr}"), asked)
+}
+
 fn config(atlas: String) -> crate::config::Config {
     crate::config::Config {
         port: 0,
@@ -196,6 +237,7 @@ fn config(atlas: String) -> crate::config::Config {
         metrics_token: Some("m".into()),
         log_requests: false,
         allowed_origins: Vec::new(),
+        open_facets: None,
     }
 }
 
@@ -353,6 +395,7 @@ async fn initialize_and_list_the_tools() {
             "den_find_people",
             "den_title",
             "den_similar",
+            "den_open_facet",
             "search",
             "fetch"
         ]
@@ -360,13 +403,61 @@ async fn initialize_and_list_the_tools() {
     for tool in tools["result"]["tools"].as_array().unwrap() {
         assert_eq!(tool["inputSchema"]["type"], "object", "{tool}");
         assert_eq!(tool["outputSchema"]["type"], "object", "{tool}");
-        assert_eq!(
-            (&tool["annotations"]["readOnlyHint"], &tool["annotations"]["idempotentHint"]),
-            (&json!(true), &json!(true))
-        );
+        let paid = tool["name"] == "den_open_facet";
+        assert_eq!(tool["annotations"]["readOnlyHint"], json!(!paid));
+        assert_eq!(tool["annotations"]["idempotentHint"], json!(!paid));
+        assert_eq!(tool["annotations"]["openWorldHint"], json!(paid));
         assert!(tool["description"].as_str().unwrap().len() < 800, "a lean description: {}", tool["name"]);
     }
     assert_eq!(s.rpc("ping", json!({})).await["result"], json!({}));
+}
+
+#[tokio::test]
+async fn open_facet_is_opt_in_and_real_adapter_runs_only_against_the_fake_provider() {
+    let disabled = Server::new().await;
+    let answer = disabled.tool("den_open_facet", json!({ "question": "unreliable narrator" })).await.unwrap();
+    assert_eq!(answer["available"], false);
+    assert_eq!(answer["complete"], false);
+    assert_eq!(answer["fallback"]["tool"], "den_search");
+    assert!(disabled.asked.lock().unwrap().is_empty(), "disabled means no preselection and no provider work");
+
+    let (atlas, atlas_asked) = stub_atlas().await;
+    let (endpoint, provider_asked) = stub_facet_provider().await;
+    let state_dir = std::env::temp_dir().join(format!(
+        "den-mcp-open-facet-e2e-{}-{}",
+        std::process::id(),
+        crate::unix_now()
+    ));
+    let mut cfg = config(atlas);
+    cfg.open_facets = Some(crate::config::OpenFacets {
+        endpoint,
+        api_key: "fake-key".into(),
+        model: "jev-test-1".into(),
+        corpus: "fixture-v1".into(),
+        state_dir: state_dir.clone(),
+        max_candidates: 2,
+        max_calls: 2,
+        max_input_tokens: 10_000,
+        dollars_per_billion_input_tokens: 42,
+        max_cost_nano_usd: 420_000,
+        timeout: std::time::Duration::from_secs(2),
+    });
+    let enabled = Server::with(cfg, atlas_asked);
+    let answer = enabled.tool("den_open_facet", json!({ "question": "unreliable narrator" })).await.unwrap();
+    assert_eq!(answer["available"], true);
+    assert_eq!(answer["preselection"]["requested"], 2);
+    assert_eq!(answer["coverage"]["denominator"], 2);
+    assert_eq!(answer["coverage"]["yes"], 1);
+    assert_eq!(answer["coverage"]["unknown"], 1);
+    assert_eq!(answer["results"][0]["title"], "Heat");
+    assert_eq!(provider_asked.lock().unwrap().len(), 2);
+
+    // Persisted decisions make the identical second call free and deterministic.
+    let again = enabled.tool("den_open_facet", json!({ "question": "unreliable narrator" })).await.unwrap();
+    assert_eq!(again["coverage"], answer["coverage"]);
+    assert_eq!(again["usage"]["calls"], 0);
+    assert_eq!(provider_asked.lock().unwrap().len(), 2);
+    std::fs::remove_dir_all(state_dir).unwrap();
 }
 
 #[tokio::test]

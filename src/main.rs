@@ -50,6 +50,8 @@ pub struct AppState {
     /// POSTs to /mcp being handled at once, taken before a body is read: past it the request is a 503, so a flood of
     /// connections cannot hold a body each in memory.
     pub request_slots: tokio::sync::Semaphore,
+    /// Open-facet calls serialize so two identical requests cannot both cross the paid boundary before one saves.
+    pub open_facet_slot: tokio::sync::Semaphore,
 }
 
 /// The most connections open at once (den-edge keeps a few alive; a flood waits in the listen backlog).
@@ -77,6 +79,7 @@ impl AppState {
             metrics: metrics::Metrics::default(),
             tool_slots: tokio::sync::Semaphore::new(MAX_TOOL_CALLS),
             request_slots: tokio::sync::Semaphore::new(MAX_REQUESTS),
+            open_facet_slot: tokio::sync::Semaphore::new(1),
         }
     }
 }
@@ -378,6 +381,7 @@ fn known_tool(name: &str) -> Option<&'static str> {
         "den_find_people",
         "den_title",
         "den_similar",
+        "den_open_facet",
         "search",
         "fetch",
     ]
@@ -416,6 +420,7 @@ async fn answer(
                 rid,
                 year: year_of(unix_now()),
                 tmdb_kinds: &tmdb_kinds[..],
+                open_facet_slot: &state.open_facet_slot,
             };
             // However many questions to atlas a call takes, it answers within TOOL_DEADLINE: under den-edge's own
             // relay timeout, so the person hears "too long" from Den rather than a broken connection.
