@@ -23,6 +23,10 @@ use std::path::{Path, PathBuf};
 
 pub const RECORD_VERSION: u32 = 1;
 pub const NORMALIZATION_VERSION: &str = "question-normalization-v1";
+/// What a candidate's `state` carries. A decision made on other evidence is a different run, never resumed.
+pub const EVIDENCE_VERSION: &str = "card-and-den-labels-v1";
+/// Times a question is asked before the queue offers it for the corpus-wide permanent facet pass.
+pub const QUEUE_THRESHOLD: u64 = 3;
 pub const QUESTION_SCHEMA: &str = r#"{"version":1,"primitive":"choice","options":["yes","no","unknown"]}"#;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -409,6 +413,70 @@ impl Store {
         sync_dir(parent)?;
         Ok(())
     }
+
+    /// Count one asking of a question, keyed by its normalized form, and return the new count. Callers serialize
+    /// (den-mcp's single open-facet slot), so the read-modify-write cannot lose a count.
+    pub fn note_question(&self, question: &str, now: u64) -> Result<u64, Error> {
+        let question = normalize_question(question)?;
+        let dir = self.root.join("queue");
+        fs::create_dir_all(&dir).map_err(|e| Error::Io(e.to_string()))?;
+        let path = dir.join(format!("{}.json", digest(question.as_bytes())));
+        let count = match fs::read(&path) {
+            Ok(bytes) => {
+                let asked: Asked = serde_json::from_slice(&bytes)
+                    .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
+                if asked.question != question {
+                    return Err(Error::Corrupt(format!("{} has the wrong identity", path.display())));
+                }
+                asked.count
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(Error::Io(format!("{}: {e}", path.display()))),
+        };
+        let asked = Asked { question, count: count + 1, last_asked: now };
+        let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+        let bytes = serde_json::to_vec(&asked).map_err(|e| Error::Io(e.to_string()))?;
+        fs::write(&tmp, bytes)
+            .and_then(|_| fs::File::open(&tmp)?.sync_all())
+            .and_then(|_| fs::rename(&tmp, &path))
+            .map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+        sync_dir(&dir)?;
+        Ok(asked.count)
+    }
+
+    /// Questions asked at least `threshold` times, most asked first: candidates for a permanent facet.
+    pub fn queue(&self, threshold: u64) -> Result<Vec<Asked>, Error> {
+        let dir = self.root.join("queue");
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(Error::Io(format!("{}: {e}", dir.display()))),
+        };
+        let mut queue = Vec::new();
+        for entry in entries {
+            let path = entry.map_err(|e| Error::Io(e.to_string()))?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = fs::read(&path).map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+            let asked: Asked = serde_json::from_slice(&bytes)
+                .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
+            if asked.count >= threshold {
+                queue.push(asked);
+            }
+        }
+        queue.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.question.cmp(&b.question)));
+        Ok(queue)
+    }
+}
+
+/// How often one normalized question has been asked. The question is already persisted in every decision record.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Asked {
+    pub question: String,
+    pub count: u64,
+    #[serde(rename = "lastAsked")]
+    pub last_asked: u64,
 }
 
 fn sync_dir(path: &Path) -> Result<(), Error> {
@@ -436,6 +504,7 @@ pub fn run_key(corpus: &str, question: &str, model: &str) -> Result<String, Erro
     let fields = [
         RECORD_VERSION.to_string(),
         NORMALIZATION_VERSION.to_owned(),
+        EVIDENCE_VERSION.to_owned(),
         corpus.trim().to_owned(),
         question,
         model.trim().to_owned(),
@@ -748,6 +817,20 @@ mod tests {
             Decision::Yes
         );
         assert!(store.load(&report.run_key, &candidates()[1].title).unwrap().is_none());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn repeated_questions_queue_by_normalized_form_past_the_threshold() {
+        let (path, store) = temp_store("queue");
+        for asked in ["Unreliable narrator?", "  unreliable NARRATOR? ", "unreliable narrator?"] {
+            store.note_question(asked, 7).unwrap();
+        }
+        assert_eq!(store.note_question("heist gone wrong", 8).unwrap(), 1);
+        let queue = store.queue(QUEUE_THRESHOLD).unwrap();
+        assert_eq!(queue, vec![Asked { question: "unreliable narrator?".into(), count: 3, last_asked: 7 }]);
+        assert_eq!(store.queue(1).unwrap().len(), 2);
+        assert!(store.note_question("x", 9).is_err(), "an invalid question is not counted");
         fs::remove_dir_all(path).unwrap();
     }
 

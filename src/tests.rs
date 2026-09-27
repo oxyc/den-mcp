@@ -451,12 +451,31 @@ async fn open_facet_is_opt_in_and_real_adapter_runs_only_against_the_fake_provid
     assert_eq!(answer["coverage"]["unknown"], 1);
     assert_eq!(answer["results"][0]["title"], "Heat");
     assert_eq!(provider_asked.lock().unwrap().len(), 2);
+    // Den's own labels reach the provider with the card; atlas's other title facts do not.
+    let heat = provider_asked.lock().unwrap().iter().find(|s| s.contains("Heat")).cloned().unwrap();
+    assert!(heat.contains("Heist") && heat.contains("tragic"), "{heat}");
+    assert!(!heat.contains("Michael Mann") && !heat.contains("Academy Awards"), "{heat}");
 
     // Persisted decisions make the identical second call free and deterministic.
     let again = enabled.tool("den_open_facet", json!({ "question": "unreliable narrator" })).await.unwrap();
     assert_eq!(again["coverage"], answer["coverage"]);
     assert_eq!(again["usage"]["calls"], 0);
     assert_eq!(provider_asked.lock().unwrap().len(), 2);
+
+    // Asked a third time, the question is queued for a permanent facet; the listing needs the metrics token.
+    let (status, _, body) =
+        enabled.send("GET", "/open-facets/queue", "", &[("authorization", "Bearer m")]).await;
+    assert_eq!(
+        (status, serde_json::from_str::<Value>(&body).unwrap()["questions"].clone()),
+        (StatusCode::OK, json!([]))
+    );
+    enabled.tool("den_open_facet", json!({ "question": "Unreliable  Narrator" })).await.unwrap();
+    let (_, _, body) = enabled.send("GET", "/open-facets/queue", "", &[("authorization", "Bearer m")]).await;
+    let queue: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(queue["questions"][0]["question"], "unreliable narrator");
+    assert_eq!(queue["questions"][0]["count"], 3);
+    let (status, _, _) = enabled.send("GET", "/open-facets/queue", "", &[]).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     std::fs::remove_dir_all(state_dir).unwrap();
 }
 
