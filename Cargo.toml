@@ -24,6 +24,7 @@ serde = { version = "1", features = ["derive"] }
 sha2 = "0.11"
 # join_all, to ask atlas for several things at once. Already built as hyper-util's own dependency.
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "webpki-roots", "ring"] }
 # Verifies den-edge's access tokens (EdDSA JWS). Pure Rust; `fast` keeps the precomputed tables that make a
 # verify ~50 µs.
 ed25519-dalek = { version = "3", default-features = false, features = ["fast"] }

@@ -1,11 +1,17 @@
-//! Durable, bounded decisions for a future open-vocabulary facet tool.
+//! Durable, bounded decisions and the deliberately opt-in Jev boundary for open-vocabulary facets.
 //!
-//! This module deliberately contains no network provider. It makes the paid boundary small and testable first:
-//! a caller supplies a bounded, already-preselected population and a `Provider`; the runner derives one stable
-//! run key, resumes decisions already on disk, reserves the worst-case call/tokens/cost before every provider
-//! invocation, and atomically persists only the bounded decision and accounting. Candidate evidence is never
-//! written. The production Jev adapter and Atlas preselection are follow-up work in den-mcp#6.
+//! The paid boundary stays small and testable: a caller supplies a bounded, already-preselected population and a
+//! `Provider`; the runner derives one stable run key, resumes decisions already on disk, reserves the worst-case
+//! call/tokens/cost before every provider invocation, and atomically persists only the bounded decision and
+//! accounting. Candidate evidence is never written. The production adapter implements the same trait exercised by
+//! deterministic fakes.
 
+use futures_util::future::BoxFuture;
+use http_body_util::{BodyExt, Full, Limited};
+use hyper::{header, Request, Uri};
+use hyper_rustls::HttpsConnector;
+use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -68,12 +74,119 @@ pub trait Provider {
 
     fn model(&self) -> &str;
     fn estimate_input_tokens(&self, question: &str, candidate: &Candidate) -> u64;
-    fn decide(
-        &mut self,
+    fn decide<'a>(
+        &'a self,
         question: &str,
         schema: &str,
-        candidate: &Candidate,
-    ) -> Result<ProviderAnswer, Self::Failure>;
+        candidate: &'a Candidate,
+    ) -> BoxFuture<'a, Result<ProviderAnswer, Self::Failure>>;
+}
+
+/// The production adapter. Constructing it is free; only `decide` crosses the paid boundary.
+pub struct JevProvider {
+    client: Client<HttpsConnector<HttpConnector>, Full<bytes::Bytes>>,
+    endpoint: Uri,
+    authorization: hyper::header::HeaderValue,
+    model: String,
+    timeout: std::time::Duration,
+}
+
+impl JevProvider {
+    pub fn new(
+        endpoint: String,
+        api_key: String,
+        model: String,
+        timeout: std::time::Duration,
+    ) -> Result<Self, Error> {
+        if model.ends_with("-latest") {
+            return Err(Error::Invalid("the provider model must be pinned, not a *-latest alias".into()));
+        }
+        let endpoint: Uri =
+            endpoint.parse().map_err(|_| Error::Invalid("provider endpoint is not a URL".into()))?;
+        let authorization = hyper::header::HeaderValue::from_str(&format!("Bearer {api_key}"))
+            .map_err(|_| Error::Invalid("provider API key is not a valid header value".into()))?;
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .build();
+        let client = Client::builder(TokioExecutor::new()).pool_idle_timeout(timeout).build(connector);
+        Ok(Self { client, endpoint, authorization, model, timeout })
+    }
+
+    fn body(&self, question: &str, candidate: &Candidate) -> Value {
+        json!({
+            "state": candidate.state,
+            "model": self.model,
+            "questions": { "facet": {
+                "type": "choice",
+                "instructions": "Using only the supplied state, decide whether the title has the requested facet. Choose unknown when the state is insufficient.",
+                "criteria": {
+                    "yes": format!("The title clearly has this facet: {question}"),
+                    "no": format!("The title clearly does not have this facet: {question}"),
+                    "unknown": "The supplied state does not establish either answer."
+                }
+            }}
+        })
+    }
+}
+
+impl Provider for JevProvider {
+    type Failure = String;
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn estimate_input_tokens(&self, question: &str, candidate: &Candidate) -> u64 {
+        // One UTF-8 byte per token plus framing is deliberately conservative for the provider's text model.
+        serde_json::to_vec(&self.body(question, candidate)).map_or(u64::MAX, |b| b.len() as u64 + 2_048)
+    }
+
+    fn decide<'a>(
+        &'a self,
+        question: &str,
+        _schema: &str,
+        candidate: &'a Candidate,
+    ) -> BoxFuture<'a, Result<ProviderAnswer, Self::Failure>> {
+        let body = self.body(question, candidate);
+        Box::pin(async move {
+            let request = Request::post(self.endpoint.clone())
+                .header(header::AUTHORIZATION, self.authorization.clone())
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::USER_AGENT, "den-mcp")
+                .body(Full::new(bytes::Bytes::from(body.to_string())))
+                .map_err(|_| "provider request could not be built".to_owned())?;
+            let response = tokio::time::timeout(self.timeout, self.client.request(request))
+                .await
+                .map_err(|_| "provider request timed out".to_owned())?
+                .map_err(|_| "provider request failed".to_owned())?;
+            if !response.status().is_success() {
+                return Err(format!("provider answered HTTP {}", response.status().as_u16()));
+            }
+            let answer =
+                tokio::time::timeout(self.timeout, Limited::new(response.into_body(), 128 * 1024).collect())
+                    .await
+                    .map_err(|_| "provider answer timed out".to_owned())?
+                    .map_err(|_| "provider answer could not be read".to_owned())?
+                    .to_bytes();
+            let answer: Value =
+                serde_json::from_slice(&answer).map_err(|_| "provider answer was not JSON".to_owned())?;
+            if answer["model"].as_str() != Some(self.model.as_str()) {
+                return Err("provider answered with a different model identity".into());
+            }
+            let decision = match answer["answers"]["facet"]["choice"].as_str() {
+                Some("yes") => Decision::Yes,
+                Some("no") => Decision::No,
+                Some("unknown") => Decision::Unknown,
+                _ => return Err("provider answer did not contain a valid fixed choice".into()),
+            };
+            let input_tokens = answer["usage"]["input_tokens"]
+                .as_u64()
+                .ok_or_else(|| "provider answer omitted input usage".to_owned())?;
+            Ok(ProviderAnswer { decision, input_tokens })
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -336,13 +449,13 @@ pub fn run_key(corpus: &str, question: &str, model: &str) -> Result<String, Erro
     Ok(digest(&framed))
 }
 
-pub fn run<P: Provider>(
+pub async fn run<P: Provider>(
     store: &Store,
     corpus: &str,
     question: &str,
     candidates: &[Candidate],
     limits: &Limits,
-    provider: &mut P,
+    provider: &P,
 ) -> Result<Report, Error> {
     if candidates.len() > limits.max_candidates {
         return Err(Error::Limit(format!("candidate ceiling {} would be crossed", limits.max_candidates)));
@@ -382,14 +495,19 @@ pub fn run<P: Provider>(
             }
             Err(other) => return Err(other),
         }
-        let answer = provider
-            .decide(&question, QUESTION_SCHEMA, candidate)
-            .map_err(|e| Error::Provider(e.to_string()))?;
+        let answer = match provider.decide(&question, QUESTION_SCHEMA, candidate).await {
+            Ok(answer) => answer,
+            Err(error) => {
+                stopped = Some(format!("provider failed: {error}"));
+                break;
+            }
+        };
         if answer.input_tokens > estimate {
-            return Err(Error::Provider(format!(
+            stopped = Some(format!(
                 "reported usage {} exceeded the reserved estimate {estimate}",
                 answer.input_tokens
-            )));
+            ));
+            break;
         }
         let record = Record {
             version: RECORD_VERSION,
@@ -438,12 +556,13 @@ fn digest(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct FakeProvider {
         model: String,
         estimate: u64,
-        calls: usize,
+        calls: AtomicUsize,
         answers: HashMap<TitleKey, Decision>,
     }
 
@@ -458,17 +577,19 @@ mod tests {
             self.estimate
         }
 
-        fn decide(
-            &mut self,
+        fn decide<'a>(
+            &'a self,
             _question: &str,
             schema: &str,
-            candidate: &Candidate,
-        ) -> Result<ProviderAnswer, Self::Failure> {
+            candidate: &'a Candidate,
+        ) -> BoxFuture<'a, Result<ProviderAnswer, Self::Failure>> {
             assert_eq!(schema, QUESTION_SCHEMA);
-            self.calls += 1;
-            Ok(ProviderAnswer {
-                decision: self.answers.get(&candidate.title).copied().unwrap_or(Decision::Unknown),
-                input_tokens: self.estimate - 1,
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                Ok(ProviderAnswer {
+                    decision: self.answers.get(&candidate.title).copied().unwrap_or(Decision::Unknown),
+                    input_tokens: self.estimate - 1,
+                })
             })
         }
     }
@@ -495,7 +616,7 @@ mod tests {
         FakeProvider {
             model: "fake-1".into(),
             estimate: 100,
-            calls: 0,
+            calls: AtomicUsize::new(0),
             answers: HashMap::from([
                 (TitleKey::new("movie", 1).unwrap(), Decision::Yes),
                 (TitleKey::new("series", 2).unwrap(), Decision::No),
@@ -524,23 +645,25 @@ mod tests {
         assert_eq!(schema_digest().len(), 64);
     }
 
-    #[test]
-    fn decisions_persist_without_evidence_and_a_second_run_resumes() {
+    #[tokio::test]
+    async fn decisions_persist_without_evidence_and_a_second_run_resumes() {
         let (path, store) = temp_store("resume");
-        let mut first = provider();
+        let first = provider();
         let report =
-            run(&store, "corpus-a", "Unreliable narrator?", &candidates(), &limits(3), &mut first).unwrap();
-        assert_eq!(first.calls, 3);
+            run(&store, "corpus-a", "Unreliable narrator?", &candidates(), &limits(3), &first).await.unwrap();
+        assert_eq!(first.calls.load(Ordering::Relaxed), 3);
         assert_eq!(
             report.coverage,
             Coverage { denominator: 3, decided: 3, yes: 1, no: 1, unknown: 1, remaining: 0, complete: true }
         );
         assert_eq!(report.usage.calls, 3);
 
-        let mut resumed = provider();
+        let resumed = provider();
         let resumed_report =
-            run(&store, "corpus-a", "unreliable narrator?", &candidates(), &limits(0), &mut resumed).unwrap();
-        assert_eq!(resumed.calls, 0);
+            run(&store, "corpus-a", "unreliable narrator?", &candidates(), &limits(0), &resumed)
+                .await
+                .unwrap();
+        assert_eq!(resumed.calls.load(Ordering::Relaxed), 0);
         assert_eq!(resumed_report.coverage, report.coverage);
         assert_eq!(resumed_report.usage, Usage::default());
 
@@ -552,57 +675,62 @@ mod tests {
         fs::remove_dir_all(path).unwrap();
     }
 
-    #[test]
-    fn every_ceiling_is_reserved_before_the_provider_is_called() {
+    #[tokio::test]
+    async fn every_ceiling_is_reserved_before_the_provider_is_called() {
         for (name, bounded) in [
             ("calls", Limits { max_calls: 1, ..limits(3) }),
             ("tokens", Limits { max_input_tokens: 199, ..limits(3) }),
             ("cost", Limits { max_cost_nano_usd: 8_399, ..limits(3) }),
         ] {
             let (path, store) = temp_store(name);
-            let mut fake = provider();
+            let fake = provider();
             let report = run(
                 &store,
                 &format!("corpus-{name}"),
                 "Unreliable narrator?",
                 &candidates(),
                 &bounded,
-                &mut fake,
+                &fake,
             )
+            .await
             .unwrap();
             assert!(!report.coverage.complete, "{name}");
             assert!(report.stopped.as_deref().is_some_and(|why| why.contains("ceiling")), "{name}");
-            assert!(fake.calls <= 1, "{name}: the refused call must not reach the provider");
+            assert!(
+                fake.calls.load(Ordering::Relaxed) <= 1,
+                "{name}: the refused call must not reach the provider"
+            );
             fs::remove_dir_all(path).unwrap();
         }
     }
 
-    #[test]
-    fn a_larger_budget_resumes_only_the_unfinished_tail() {
+    #[tokio::test]
+    async fn a_larger_budget_resumes_only_the_unfinished_tail() {
         let (path, store) = temp_store("partial");
-        let mut first = provider();
+        let first = provider();
         let partial =
-            run(&store, "corpus-a", "Unreliable narrator?", &candidates(), &limits(2), &mut first).unwrap();
+            run(&store, "corpus-a", "Unreliable narrator?", &candidates(), &limits(2), &first).await.unwrap();
         assert_eq!(partial.coverage.decided, 2);
         assert_eq!(partial.coverage.denominator, 3);
         assert_eq!(partial.coverage.remaining, 1);
         assert!(!partial.coverage.complete);
         assert!(partial.stopped.is_some());
-        assert_eq!(first.calls, 2);
-        let mut resumed = provider();
-        let report =
-            run(&store, "corpus-a", "Unreliable narrator?", &candidates(), &limits(1), &mut resumed).unwrap();
-        assert_eq!(resumed.calls, 1);
+        assert_eq!(first.calls.load(Ordering::Relaxed), 2);
+        let resumed = provider();
+        let report = run(&store, "corpus-a", "Unreliable narrator?", &candidates(), &limits(1), &resumed)
+            .await
+            .unwrap();
+        assert_eq!(resumed.calls.load(Ordering::Relaxed), 1);
         assert!(report.coverage.complete);
         fs::remove_dir_all(path).unwrap();
     }
 
-    #[test]
-    fn mcp_smoke_fixture_names_denominator_unknowns_and_usage() {
+    #[tokio::test]
+    async fn mcp_smoke_fixture_names_denominator_unknowns_and_usage() {
         let (path, store) = temp_store("mcp");
-        let mut fake = provider();
+        let fake = provider();
         let report =
-            run(&store, "corpus-a", "Unreliable narrator?", &candidates(), &limits(3), &mut fake).unwrap();
+            run(&store, "corpus-a", "Unreliable narrator?", &candidates(), &limits(3), &fake).await.unwrap();
         let envelope = crate::mcp::tool_result(Ok(report.as_json()));
         let answer = &envelope["structuredContent"];
         assert_eq!(answer["coverage"]["denominator"], 3);

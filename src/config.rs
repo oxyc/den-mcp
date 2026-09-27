@@ -23,6 +23,23 @@ pub struct Config {
     /// Extra `Origin`s a browser-based client may call from. A request with no `Origin` (a connector's server)
     /// is always let through; one naming another site is refused (the MCP spec's DNS-rebinding guard).
     pub allowed_origins: Vec<String>,
+    /// Paid open-facet classification. Absent unless a deployment deliberately opts in.
+    pub open_facets: Option<OpenFacets>,
+}
+
+pub struct OpenFacets {
+    pub endpoint: String,
+    pub api_key: String,
+    /// A resolved model id, never a moving `*-latest` alias, so persisted decisions retain their meaning.
+    pub model: String,
+    pub corpus: String,
+    pub state_dir: std::path::PathBuf,
+    pub max_candidates: usize,
+    pub max_calls: u64,
+    pub max_input_tokens: u64,
+    pub dollars_per_billion_input_tokens: u64,
+    pub max_cost_nano_usd: u64,
+    pub timeout: Duration,
 }
 
 pub struct Atlas {
@@ -72,6 +89,49 @@ impl Config {
             token_keys.push(public_key(key).ok_or("TOKEN_PUBLIC_KEYS: not a base64url Ed25519 public key")?);
         }
         let number = |name: &str, default: u32| env_opt(name).and_then(|v| v.parse().ok()).unwrap_or(default);
+        let open_facets = if env_opt("OPEN_FACETS_ENABLED").as_deref() == Some("1") {
+            let endpoint = env_opt("OPEN_FACETS_ENDPOINT")
+                .unwrap_or_else(|| "https://api.typesafe.ai/v1/systemone".into());
+            if !endpoint.starts_with("https://") || endpoint.contains(['?', '#', '@', ' ']) {
+                return Err(
+                    "OPEN_FACETS_ENDPOINT must be an https URL without credentials, query, or fragment"
+                        .into(),
+                );
+            }
+            let model = env_opt("OPEN_FACETS_MODEL").ok_or("OPEN_FACETS_MODEL is required when enabled")?;
+            if model.ends_with("-latest") {
+                return Err("OPEN_FACETS_MODEL must be a pinned provider model, not a *-latest alias".into());
+            }
+            let positive = |name: &str| -> Result<u64, String> {
+                env_opt(name)
+                    .ok_or_else(|| format!("{name} is required when open facets are enabled"))?
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| format!("{name} must be a positive integer"))
+            };
+            let max_candidates = positive("OPEN_FACETS_MAX_CANDIDATES")?;
+            if max_candidates > 20 {
+                return Err("OPEN_FACETS_MAX_CANDIDATES may not exceed 20".into());
+            }
+            Some(OpenFacets {
+                endpoint,
+                api_key: env_opt("TYPESAFE_API_KEY").ok_or("TYPESAFE_API_KEY is required when enabled")?,
+                model,
+                corpus: env_opt("OPEN_FACETS_CORPUS").ok_or("OPEN_FACETS_CORPUS is required when enabled")?,
+                state_dir: env_opt("OPEN_FACETS_STATE_DIR")
+                    .map(Into::into)
+                    .ok_or("OPEN_FACETS_STATE_DIR is required when enabled")?,
+                max_candidates: max_candidates as usize,
+                max_calls: positive("OPEN_FACETS_MAX_CALLS")?,
+                max_input_tokens: positive("OPEN_FACETS_MAX_INPUT_TOKENS")?,
+                dollars_per_billion_input_tokens: positive("OPEN_FACETS_DOLLARS_PER_BILLION_INPUT_TOKENS")?,
+                max_cost_nano_usd: positive("OPEN_FACETS_MAX_COST_NANO_USD")?,
+                timeout: Duration::from_secs(positive("OPEN_FACETS_TIMEOUT_SECONDS")?.min(30)),
+            })
+        } else {
+            None
+        };
         Ok(Config {
             port: env_opt("PORT").and_then(|p| p.parse().ok()).unwrap_or(8096),
             atlas: Atlas { base: atlas, timeout: Duration::from_secs(20) },
@@ -86,6 +146,7 @@ impl Config {
             allowed_origins: env_opt("ALLOWED_ORIGINS")
                 .map(|v| v.split(',').filter_map(origin).collect())
                 .unwrap_or_default(),
+            open_facets,
         })
     }
 
