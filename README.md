@@ -32,6 +32,18 @@ Titles are always `{type: movie|series, id}`; every title carries its Den Web `u
 Every tool declares an `outputSchema` and answers with `structuredContent` and the same JSON as text; all are
 `readOnlyHint` and `idempotentHint`.
 
+### Open-vocabulary facets (scaffold only)
+
+`src/open_facets.rs` contains the no-network execution boundary for
+[open-vocabulary facets](https://github.com/oxyc/den-mcp/issues/6): versioned normalized-question/schema digests,
+corpus/model-scoped run keys, atomic decision persistence and resume, conservative pre-call ceilings for calls,
+input tokens and cost, and coverage with an explicit denominator, unknown count and incomplete status. Its tests use
+a deterministic fake provider and assert that source evidence is never persisted.
+
+No MCP tool or paid provider is wired to that module yet. In particular, this scaffold cannot make Jev or Haiku
+calls. Atlas preselection, the production adapter, opt-in configuration and the queued permanent-facet path remain
+tracked in issue #6.
+
 Filter URLs are built in atlas's canonical spelling (`src/sel.rs`), held to atlas's own contract fixture
 (`testdata/facets-canonical.json`), so the same question is one cache entry here and in atlas.
 

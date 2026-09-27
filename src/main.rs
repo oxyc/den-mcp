@@ -15,6 +15,7 @@ mod mcp;
 mod metrics;
 mod names;
 mod names_table;
+pub mod open_facets;
 mod sel;
 mod tools;
 
