@@ -116,11 +116,11 @@ See `.env.example`. `ATLAS_URL` (plain http on the LAN) and `PUBLIC_ORIGIN` are 
 den-edge's public key (base64url, comma-separated during a rotation).
 
 `den_open_facet` is non-billing by default: it returns an explicit `den_search` fallback without contacting Atlas
-or a provider. A deployment must set `OPEN_FACETS_ENABLED=1` and every `OPEN_FACETS_*` bound in `.env.example`, a
-pinned provider model, a dataset-specific corpus id, a writable decision directory, and `TYPESAFE_API_KEY` before
-the paid path exists. The tool embedding-preselects at most 20 Atlas cards, sends only MCP-allowlisted card fields
-to Jev, reserves calls/tokens/cost before each request, persists only fixed yes/no/unknown decisions, and reports
-both preselection and classification denominators. Provider failure returns an incomplete result and the free
+or a provider. A deployment must set `OPEN_FACETS_ENABLED=1` and every spend bound in `.env.example`, a pinned
+provider model, a dataset-specific corpus id, a writable decision directory, and `TYPESAFE_API_KEY` before the paid
+path exists. The tool embedding-preselects 50 Atlas cards by default and at most 100, sends only MCP-allowlisted
+card fields to Jev, reserves calls/tokens/cost before each request, persists only fixed yes/no/unknown decisions,
+and reports both preselection and classification denominators. Provider failure returns an incomplete result and the free
 fallback. Calls serialize at this boundary so simultaneous identical requests cannot double-spend before saving.
 
 ## Performance

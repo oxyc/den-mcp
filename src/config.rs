@@ -110,9 +110,16 @@ impl Config {
                     .filter(|n| *n > 0)
                     .ok_or_else(|| format!("{name} must be a positive integer"))
             };
-            let max_candidates = positive("OPEN_FACETS_MAX_CANDIDATES")?;
-            if max_candidates > 20 {
-                return Err("OPEN_FACETS_MAX_CANDIDATES may not exceed 20".into());
+            let max_candidates = match env_opt("OPEN_FACETS_MAX_CANDIDATES") {
+                Some(value) => value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or("OPEN_FACETS_MAX_CANDIDATES must be a positive integer")?,
+                None => 50,
+            };
+            if max_candidates > 100 {
+                return Err("OPEN_FACETS_MAX_CANDIDATES may not exceed 100".into());
             }
             Some(OpenFacets {
                 endpoint,

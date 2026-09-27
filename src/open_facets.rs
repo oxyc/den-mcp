@@ -564,6 +564,7 @@ mod tests {
         estimate: u64,
         calls: AtomicUsize,
         answers: HashMap<TitleKey, Decision>,
+        fail_on: Option<TitleKey>,
     }
 
     impl Provider for FakeProvider {
@@ -586,6 +587,9 @@ mod tests {
             assert_eq!(schema, QUESTION_SCHEMA);
             self.calls.fetch_add(1, Ordering::Relaxed);
             Box::pin(async move {
+                if self.fail_on.as_ref() == Some(&candidate.title) {
+                    return Err("fixture unavailable".into());
+                }
                 Ok(ProviderAnswer {
                     decision: self.answers.get(&candidate.title).copied().unwrap_or(Decision::Unknown),
                     input_tokens: self.estimate - 1,
@@ -617,6 +621,7 @@ mod tests {
             model: "fake-1".into(),
             estimate: 100,
             calls: AtomicUsize::new(0),
+            fail_on: None,
             answers: HashMap::from([
                 (TitleKey::new("movie", 1).unwrap(), Decision::Yes),
                 (TitleKey::new("series", 2).unwrap(), Decision::No),
@@ -722,6 +727,27 @@ mod tests {
             .unwrap();
         assert_eq!(resumed.calls.load(Ordering::Relaxed), 1);
         assert!(report.coverage.complete);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_later_provider_failure_preserves_earlier_persisted_coverage() {
+        let (path, store) = temp_store("provider-failure");
+        let mut fake = provider();
+        fake.fail_on = Some(TitleKey::new("series", 2).unwrap());
+        let report =
+            run(&store, "corpus-a", "Unreliable narrator?", &candidates(), &limits(3), &fake).await.unwrap();
+        assert_eq!(fake.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            report.coverage,
+            Coverage { denominator: 3, decided: 1, yes: 1, no: 0, unknown: 0, remaining: 2, complete: false }
+        );
+        assert!(report.stopped.as_deref().is_some_and(|why| why.contains("provider failed")));
+        assert_eq!(
+            store.load(&report.run_key, &candidates()[0].title).unwrap().unwrap().decision,
+            Decision::Yes
+        );
+        assert!(store.load(&report.run_key, &candidates()[1].title).unwrap().is_none());
         fs::remove_dir_all(path).unwrap();
     }
 
