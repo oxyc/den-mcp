@@ -508,6 +508,8 @@ async fn open_facet(ctx: &Ctx<'_>, args: &Value) -> Answer {
         .acquire()
         .await
         .map_err(|_| bad("Open-facet classification is shutting down."))?;
+    let store = Store::open(&config.state_dir).map_err(|e| bad(e.to_string()))?;
+    store.note_question(question, crate::unix_now()).map_err(|e| bad(e.to_string()))?;
 
     let mut path = format!("/index/query.json?q={}&skip=0&limit={}", encode(question), config.max_candidates);
     if let Some(kind) = media_type {
@@ -524,14 +526,29 @@ async fn open_facet(ctx: &Ctx<'_>, args: &Value) -> Answer {
         .filter_map(|hit| title(ctx.cfg, hit))
         .take(config.max_candidates)
         .collect();
-    let candidates: Vec<Candidate> = safe_cards
-        .iter()
-        .filter_map(|card| {
-            let key = TitleKey::new(card["type"].as_str()?, card["id"].as_u64()?).ok()?;
-            // Only the same field-by-field allowlisted card exposed by other MCP tools crosses the provider boundary.
-            Some(Candidate { title: key, state: card.to_string() })
-        })
-        .collect();
+    // The evidence is the allowlisted card plus Den's own labels, as den_title serves them, and the premise tags
+    // (short structural phrases derived from the Wikipedia plot), and nothing else: it crosses the provider
+    // boundary, so it passes the same guard as any tool answer.
+    let facts = join_all(safe_cards.iter().map(|card| async move {
+        let path = format!("/index/title/{}/{}.json", card["type"].as_str()?, card["id"].as_u64()?);
+        Some(ctx.atlas.get(&path, ctx.rid).await.map(|(answer, _)| answer))
+    }))
+    .await;
+    let mut candidates = Vec::with_capacity(safe_cards.len());
+    let mut cards = Vec::with_capacity(safe_cards.len());
+    for (card, facts) in safe_cards.iter().zip(facts) {
+        let (Some(kind), Some(id), Some(facts)) = (card["type"].as_str(), card["id"].as_u64(), facts) else {
+            continue;
+        };
+        let Ok(key) = TitleKey::new(kind, id) else { continue };
+        let mut evidence = card.as_object().cloned().unwrap_or_default();
+        let facts = facts?;
+        put_labels(&mut evidence, &facts);
+        put(&mut evidence, "premise_tags", texts(facts.get("premiseTags"), 16));
+        let evidence = guard(Value::Object(evidence))?;
+        candidates.push(Candidate { title: key, state: evidence.to_string() });
+        cards.push(card);
+    }
     let requested = config.max_candidates;
     let preselection = json!({
         "requested": requested,
@@ -549,7 +566,6 @@ async fn open_facet(ctx: &Ctx<'_>, args: &Value) -> Answer {
         }));
     }
 
-    let store = Store::open(&config.state_dir).map_err(|e| bad(e.to_string()))?;
     let provider = JevProvider::new(
         config.endpoint.clone(),
         config.api_key.clone(),
@@ -578,7 +594,7 @@ async fn open_facet(ctx: &Ctx<'_>, args: &Value) -> Answer {
         };
     let mut classified = Vec::new();
     let mut results = Vec::new();
-    for (candidate, card) in candidates.iter().zip(&safe_cards) {
+    for (candidate, card) in candidates.iter().zip(cards) {
         if let Some(record) = store.load(&report.run_key, &candidate.title).map_err(|e| bad(e.to_string()))? {
             let mut item = card.clone();
             item["decision"] = json!(match record.decision {
@@ -2041,6 +2057,16 @@ fn title_key(v: &Value) -> Result<(&str, u64), ToolError> {
     }
 }
 
+/// Den's own labels for a title from atlas's `/index/title` answer: animated, subgenres, moods and plot facets.
+fn put_labels(out: &mut Map<String, Value>, answer: &Value) {
+    if let Some(labels) = answer.get("labels") {
+        put(out, "animated", boolean(labels.get("animated")));
+        put(out, "subgenres", texts(labels.get("subgenres"), 16));
+        put(out, "moods", texts(labels.get("moods"), 16));
+    }
+    put(out, "plot_facets", text_map(answer.get("plotFacets")));
+}
+
 async fn title_facts(ctx: &Ctx<'_>, args: &Value) -> Answer {
     let (kind, id) = title_key(args)?;
     let (answer, _) = ctx.atlas.get(&format!("/index/title/{kind}/{id}.json"), ctx.rid).await?;
@@ -2055,12 +2081,7 @@ async fn title_facts(ctx: &Ctx<'_>, args: &Value) -> Answer {
         _ => return Err(bad("Den's index answered without a title")),
     };
     out.insert("indexed".into(), json!(true));
-    if let Some(labels) = answer.get("labels") {
-        put(&mut out, "animated", boolean(labels.get("animated")));
-        put(&mut out, "subgenres", texts(labels.get("subgenres"), 16));
-        put(&mut out, "moods", texts(labels.get("moods"), 16));
-    }
-    put(&mut out, "plot_facets", text_map(answer.get("plotFacets")));
+    put_labels(&mut out, &answer);
     put(&mut out, "countries", texts(answer.get("countries"), 16));
     put(&mut out, "languages", texts(answer.get("languages"), 16));
     put(&mut out, "runtime_minutes", count(answer.get("runtimeMinutes")));

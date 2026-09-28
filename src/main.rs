@@ -4,6 +4,7 @@
 //!   POST /mcp                                     MCP (Streamable HTTP, JSON answers), bearer token required
 //!   GET  /.well-known/oauth-protected-resource[/mcp]  RFC 9728: which authorization server issues its tokens
 //!   GET  /health, /metrics
+//!   GET  /open-facets/queue                       repeated open-facet questions, behind the metrics token
 //!
 //! den-edge is the authorization server, relays `/mcp` here, and signs the access tokens this server checks with
 //! its public key alone. Discovery only: nothing here reads or writes a library.
@@ -148,7 +149,7 @@ where
     let rid = request_id(&parts.headers);
     let (resp, tool) = route(&state, &parts, body, rid.as_deref()).await;
     let route = match parts.uri.path() {
-        p @ ("/mcp" | "/health" | "/metrics") => p,
+        p @ ("/mcp" | "/health" | "/metrics" | "/open-facets/queue") => p,
         p if p.starts_with("/.well-known/") => "/.well-known",
         _ => "other",
     };
@@ -193,6 +194,7 @@ where
             .header(header::CACHE_CONTROL, "no-store")
             .body(full(state.metrics.render(state.atlas.cached(), state.atlas.used())))
             .unwrap(),
+        "/open-facets/queue" if get && metrics_authorized(state, &parts.headers) => open_facet_queue(state),
         "/.well-known/oauth-protected-resource" | "/.well-known/oauth-protected-resource/mcp" if get => {
             json_response(StatusCode::OK, &resource_metadata(state))
         }
@@ -208,6 +210,22 @@ where
         _ => json_response(StatusCode::NOT_FOUND, &json!({ "error": "not_found" })),
     };
     (resp, None)
+}
+
+/// Open-facet questions asked often enough to consider for the corpus-wide permanent facet pass. Behind the
+/// metrics token: these are what people asked.
+fn open_facet_queue(state: &AppState) -> Response<Full<Bytes>> {
+    let Some(config) = &state.cfg.open_facets else {
+        return json_response(StatusCode::NOT_FOUND, &json!({ "error": "open_facets_disabled" }));
+    };
+    let threshold = open_facets::QUEUE_THRESHOLD;
+    match open_facets::Store::open(&config.state_dir).and_then(|store| store.queue(threshold)) {
+        Ok(queue) => json_response(StatusCode::OK, &json!({ "threshold": threshold, "questions": queue })),
+        Err(e) => {
+            eprintln!("open-facet queue: {e}");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &json!({ "error": "queue_unreadable" }))
+        }
+    }
 }
 
 fn health(state: &AppState) -> Value {
