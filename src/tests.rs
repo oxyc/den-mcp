@@ -101,6 +101,7 @@ fn canned(path: &str) -> Option<Value> {
         title["labels"] =
             json!({ "primaryGenre": "Crime", "animated": false, "subgenres": ["Heist"], "moods": [] });
         title["plotFacets"] = json!({ "ending": "tragic" });
+        title["premiseTags"] = json!(["cop-and-robber-mirror-image"]);
         title["countries"] = json!(["US"]);
         title["makers"] = json!([{ "id": "Q1", "name": "Michael Mann", "tmdbId": 638 }]);
         title["cast"] = json!([{ "id": "Q2", "name": "Al Pacino" }]);
@@ -451,9 +452,10 @@ async fn open_facet_is_opt_in_and_real_adapter_runs_only_against_the_fake_provid
     assert_eq!(answer["coverage"]["unknown"], 1);
     assert_eq!(answer["results"][0]["title"], "Heat");
     assert_eq!(provider_asked.lock().unwrap().len(), 2);
-    // Den's own labels reach the provider with the card; atlas's other title facts do not.
+    // Den's own labels and premise tags reach the provider with the card; atlas's other title facts do not.
     let heat = provider_asked.lock().unwrap().iter().find(|s| s.contains("Heat")).cloned().unwrap();
     assert!(heat.contains("Heist") && heat.contains("tragic"), "{heat}");
+    assert!(heat.contains("cop-and-robber-mirror-image"), "{heat}");
     assert!(!heat.contains("Michael Mann") && !heat.contains("Academy Awards"), "{heat}");
 
     // Persisted decisions make the identical second call free and deterministic.

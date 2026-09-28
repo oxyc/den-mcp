@@ -25,7 +25,7 @@ pub const RECORD_VERSION: u32 = 1;
 pub const NORMALIZATION_VERSION: &str = "question-normalization-v1";
 /// What a candidate's `state` carries and the prompt that judges it. A decision made on other evidence or under
 /// other instructions is a different run, never resumed.
-pub const EVIDENCE_VERSION: &str = "card-and-den-labels-v1+absence-is-unknown";
+pub const EVIDENCE_VERSION: &str = "card-labels-premise-tags-v1+absence-is-unknown";
 /// Times a question is asked before the queue offers it for the corpus-wide permanent facet pass.
 pub const QUEUE_THRESHOLD: u64 = 3;
 pub const QUESTION_SCHEMA: &str = r#"{"version":1,"primitive":"choice","options":["yes","no","unknown"]}"#;

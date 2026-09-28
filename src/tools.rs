@@ -526,8 +526,9 @@ async fn open_facet(ctx: &Ctx<'_>, args: &Value) -> Answer {
         .filter_map(|hit| title(ctx.cfg, hit))
         .take(config.max_candidates)
         .collect();
-    // The evidence is the allowlisted card plus Den's own labels, as den_title serves them, and nothing else: it
-    // crosses the provider boundary, so it passes the same guard as any tool answer.
+    // The evidence is the allowlisted card plus Den's own labels, as den_title serves them, and the premise tags
+    // (short structural phrases derived from the Wikipedia plot), and nothing else: it crosses the provider
+    // boundary, so it passes the same guard as any tool answer.
     let facts = join_all(safe_cards.iter().map(|card| async move {
         let path = format!("/index/title/{}/{}.json", card["type"].as_str()?, card["id"].as_u64()?);
         Some(ctx.atlas.get(&path, ctx.rid).await.map(|(answer, _)| answer))
@@ -541,7 +542,9 @@ async fn open_facet(ctx: &Ctx<'_>, args: &Value) -> Answer {
         };
         let Ok(key) = TitleKey::new(kind, id) else { continue };
         let mut evidence = card.as_object().cloned().unwrap_or_default();
-        put_labels(&mut evidence, &*facts?);
+        let facts = facts?;
+        put_labels(&mut evidence, &facts);
+        put(&mut evidence, "premise_tags", texts(facts.get("premiseTags"), 16));
         let evidence = guard(Value::Object(evidence))?;
         candidates.push(Candidate { title: key, state: evidence.to_string() });
         cards.push(card);
