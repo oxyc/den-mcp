@@ -23,8 +23,9 @@ use std::path::{Path, PathBuf};
 
 pub const RECORD_VERSION: u32 = 1;
 pub const NORMALIZATION_VERSION: &str = "question-normalization-v1";
-/// What a candidate's `state` carries. A decision made on other evidence is a different run, never resumed.
-pub const EVIDENCE_VERSION: &str = "card-and-den-labels-v1";
+/// What a candidate's `state` carries and the prompt that judges it. A decision made on other evidence or under
+/// other instructions is a different run, never resumed.
+pub const EVIDENCE_VERSION: &str = "card-and-den-labels-v1+absence-is-unknown";
 /// Times a question is asked before the queue offers it for the corpus-wide permanent facet pass.
 pub const QUEUE_THRESHOLD: u64 = 3;
 pub const QUESTION_SCHEMA: &str = r#"{"version":1,"primitive":"choice","options":["yes","no","unknown"]}"#;
@@ -124,11 +125,11 @@ impl JevProvider {
             "model": self.model,
             "questions": { "facet": {
                 "type": "choice",
-                "instructions": "Using only the supplied state, decide whether the title has the requested facet. Choose unknown when the state is insufficient.",
+                "instructions": "Using only the supplied state, decide whether the title has the requested facet. The state is a few labels, not the whole film: a facet it does not mention is unknown, not absent. Choose no only when the state itself contradicts the facet.",
                 "criteria": {
-                    "yes": format!("The title clearly has this facet: {question}"),
-                    "no": format!("The title clearly does not have this facet: {question}"),
-                    "unknown": "The supplied state does not establish either answer."
+                    "yes": format!("The supplied state establishes that the title has this facet: {question}"),
+                    "no": format!("The supplied state contradicts this facet: {question}"),
+                    "unknown": "The supplied state neither establishes nor contradicts the facet, including when it simply does not mention it."
                 }
             }}
         })
