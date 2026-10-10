@@ -25,6 +25,16 @@ pub struct Config {
     pub allowed_origins: Vec<String>,
     /// Paid open-facet classification. Absent unless a deployment deliberately opts in.
     pub open_facets: Option<OpenFacets>,
+    /// Library writes (den-spec `wire/assistant-v1.md`). Absent unless `MCP_WRITE_KEY` is set: without it no write
+    /// tool is listed or callable.
+    pub write: Option<Write>,
+}
+
+pub struct Write {
+    /// den-mcp's X-Wing secret: the key that opens the grant key in an access token's `dw` claim.
+    pub key: [u8; 32],
+    /// den-edge, plain HTTP on den.network: `http://host:port`, no trailing slash.
+    pub edge: String,
 }
 
 pub struct OpenFacets {
@@ -139,6 +149,19 @@ impl Config {
         } else {
             None
         };
+        let write = match env_opt("MCP_WRITE_KEY") {
+            None => None,
+            Some(key) => {
+                let key = crate::auth::b64url_decode(&key)
+                    .and_then(|k| k.try_into().ok())
+                    .ok_or("MCP_WRITE_KEY must be the unpadded base64url of a 32-byte X-Wing secret")?;
+                let edge = env_opt("EDGE_URL").ok_or("EDGE_URL is required with MCP_WRITE_KEY (den-edge)")?;
+                let edge = origin(&edge)
+                    .filter(|o| o.starts_with("http://"))
+                    .ok_or("EDGE_URL must be a bare http:// origin on den.network")?;
+                Some(Write { key, edge })
+            }
+        };
         Ok(Config {
             port: env_opt("PORT").and_then(|p| p.parse().ok()).unwrap_or(8096),
             atlas: Atlas { base: atlas, timeout: Duration::from_secs(20) },
@@ -154,6 +177,7 @@ impl Config {
                 .map(|v| v.split(',').filter_map(origin).collect())
                 .unwrap_or_default(),
             open_facets,
+            write,
         })
     }
 

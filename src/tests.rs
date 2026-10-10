@@ -239,6 +239,7 @@ fn config(atlas: String) -> crate::config::Config {
         log_requests: false,
         allowed_origins: Vec::new(),
         open_facets: None,
+        write: None,
     }
 }
 
@@ -1082,6 +1083,328 @@ async fn health_is_ok_with_keys_and_degraded_without() {
     let (atlas, asked) = stub_atlas().await;
     let keyless = Server::with(crate::config::Config { token_keys: vec![], ..config(atlas) }, asked);
     assert!(keyless.send("GET", "/health", "", &[]).await.2.contains("no_token_keys"));
+}
+
+// ---- library writes (den-spec wire/assistant-v1.md)
+
+/// den-spec's `vectors/assistant-v1.json` `fixed`, the part den-mcp uses: its own token key, a token's `dw` claim and
+/// the `sub` it is bound to, the grant it holds, and the library's drop-box key.
+fn fixed() -> Value {
+    serde_json::from_str(include_str!("../testdata/assistant-v1.json")).unwrap()
+}
+
+fn seed(key: &Value) -> [u8; 32] {
+    let hex = key["seed"].as_str().unwrap();
+    (0..32)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap()
+}
+
+/// What each call den-edge received: method, path, `Authorization`, body.
+type EdgeLog = Arc<Mutex<Vec<(String, String, String, String)>>>;
+
+/// A stand-in for den-edge's `/assistant/dropbox` and `/assistant/append`, answering as told.
+async fn stub_edge(dropbox: (u16, Value), append: (u16, Value)) -> (String, EdgeLog) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let log: EdgeLog = Arc::default();
+    let seen = log.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (seen, dropbox, append) = (seen.clone(), dropbox.clone(), append.clone());
+            let service = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                let (seen, dropbox, append) = (seen.clone(), dropbox.clone(), append.clone());
+                async move {
+                    let (parts, body) = req.into_parts();
+                    let body = String::from_utf8(body.collect().await.unwrap().to_bytes().to_vec()).unwrap();
+                    let authorization = parts.headers["authorization"].to_str().unwrap().to_owned();
+                    let path = parts.uri.path().to_owned();
+                    seen.lock().unwrap().push((parts.method.to_string(), path.clone(), authorization, body));
+                    let (status, answer) = if path == "/assistant/dropbox" { dropbox } else { append };
+                    Ok::<_, std::convert::Infallible>(
+                        hyper::Response::builder()
+                            .status(status)
+                            .header("content-type", "application/json")
+                            .body(Full::new(Bytes::from(answer.to_string())))
+                            .unwrap(),
+                    )
+                }
+            });
+            tokio::spawn(async move {
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+            });
+        }
+    });
+    (format!("http://{addr}"), log)
+}
+
+fn dropbox_answer() -> (u16, Value) {
+    let f = fixed();
+    (200, json!({ "library": f["library"], "pk": f["dropbox"]["public"], "kid": f["dropbox"]["kid"] }))
+}
+
+fn queued() -> (u16, Value) {
+    (200, json!({ "seq": 1, "queued": 1 }))
+}
+
+/// A server holding den-mcp's token key from the vectors and calling `edge`; its bearer is a token for the vectors'
+/// session with `scope` and, when given, the vectors' `dw`.
+fn write_server(edge: &str, scope: &str, dw: Option<&str>) -> Server {
+    let f = fixed();
+    let cfg = crate::config::Config {
+        write: Some(crate::config::Write { key: seed(&f["mcp"]), edge: edge.to_owned() }),
+        ..config("http://127.0.0.1:1".into())
+    };
+    let mut s = Server::with(cfg, Asked::default());
+    let mut c = claims(unix_now());
+    c["sub"] = f["sub"].clone();
+    c["scope"] = scope.into();
+    if let Some(dw) = dw {
+        c["dw"] = dw.into();
+    }
+    s.bearer = format!("Bearer {}", token(&key(), &c));
+    s
+}
+
+fn granted(edge: &str) -> Server {
+    write_server(edge, "den:search den:library.write", fixed()["claim"].as_str())
+}
+
+/// A device's view of the queued request: it opens with the library's drop-box key and is checked against a grant
+/// that allows every op, at the time den-mcp stamped it.
+fn device_accepts(sealed: &str) -> den_assistant::Accepted {
+    let f = fixed();
+    let public: [u8; 32] =
+        den_assistant::b64url_decode(f["grant"]["public"].as_str().unwrap()).unwrap().try_into().unwrap();
+    let grants = std::collections::BTreeMap::from([(
+        f["grant"]["id"].as_str().unwrap().to_owned(),
+        den_assistant::Grant {
+            public,
+            ops: den_assistant::OPS.map(String::from).to_vec(),
+            cap: 100,
+            revoked: false,
+        },
+    )]);
+    let now = unix_now() * 1000;
+    den_assistant::check(
+        &[seed(&f["dropbox"])],
+        f["library"].as_str().unwrap(),
+        sealed,
+        &grants,
+        &std::collections::BTreeMap::new(),
+        now,
+    )
+    .unwrap()
+}
+
+fn sealed_of(log: &EdgeLog, nth: usize) -> String {
+    let body = log.lock().unwrap().iter().filter(|c| c.1 == "/assistant/append").nth(nth).unwrap().3.clone();
+    serde_json::from_str::<Value>(&body).unwrap()["sealed"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn the_vectors_token_claim_opens_for_its_own_session_only() {
+    let f = fixed();
+    let secret = seed(&f["mcp"]);
+    let grant =
+        den_assistant::open_claim(&secret, f["sub"].as_str().unwrap(), f["claim"].as_str().unwrap()).unwrap();
+    assert_eq!(grant.id(), f["grant"]["id"]);
+    assert_eq!(grant.secret(), &seed(&f["grant"]));
+    assert!(den_assistant::open_claim(
+        &secret,
+        "00000000000000000000000000000000",
+        f["claim"].as_str().unwrap()
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn a_change_is_sealed_to_the_library_and_a_device_accepts_it() {
+    let (edge, log) = stub_edge(dropbox_answer(), queued()).await;
+    let s = granted(&edge);
+    let listed = s.rpc("tools/list", json!({})).await;
+    let names: Vec<&str> =
+        listed["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        &names[9..],
+        ["den_watchlist_add", "den_watchlist_remove", "den_mark_seen", "den_rate"],
+        "the write tools follow the nine read ones"
+    );
+    for tool in &listed["result"]["tools"].as_array().unwrap()[9..] {
+        assert_eq!(tool["annotations"]["readOnlyHint"], false);
+        assert_eq!(tool["annotations"]["idempotentHint"], true);
+        assert_eq!(tool["annotations"]["destructiveHint"], tool["name"] == "den_watchlist_remove", "{tool}");
+        assert!(tool["description"].as_str().unwrap().len() < 800, "{}", tool["name"]);
+    }
+
+    let cases = [
+        (
+            "den_watchlist_add",
+            json!({ "type": "movie", "id": 550 }),
+            "watchlist_add",
+            json!({ "title": { "type": "movie", "id": 550 } }),
+        ),
+        (
+            "den_watchlist_remove",
+            json!({ "type": "series", "id": 1399 }),
+            "watchlist_remove",
+            json!({ "title": { "type": "tv", "id": 1399 } }),
+        ),
+        (
+            "den_mark_seen",
+            json!({ "type": "series", "id": 1399, "season": 1, "episode": 2 }),
+            "seen",
+            json!({ "title": { "type": "tv", "id": 1399 }, "season": 1, "episode": 2, "value": true }),
+        ),
+        (
+            "den_mark_seen",
+            json!({ "type": "movie", "id": 550, "value": false }),
+            "seen",
+            json!({ "title": { "type": "movie", "id": 550 }, "value": false }),
+        ),
+        (
+            "den_rate",
+            json!({ "type": "movie", "id": 550, "value": "love" }),
+            "rate",
+            json!({ "title": { "type": "movie", "id": 550 }, "value": "love" }),
+        ),
+        (
+            "den_rate",
+            json!({ "type": "movie", "id": 550, "value": null }),
+            "rate",
+            json!({ "title": { "type": "movie", "id": 550 }, "value": null }),
+        ),
+    ];
+    for (n, (tool, arguments, op, args)) in cases.into_iter().enumerate() {
+        let answer = s.tool(tool, arguments).await.unwrap();
+        assert_eq!(answer["queued"], true, "{tool}");
+        assert!(answer["note"].as_str().unwrap().contains("next time a TV or Den Web is open"));
+        let accepted = device_accepts(&sealed_of(&log, n));
+        assert_eq!((accepted.op.as_str(), &accepted.args), (op, &args), "{tool}");
+        assert_eq!(accepted.id, answer["id"].as_str().unwrap(), "the answer names the request");
+        assert_eq!(accepted.grant, fixed()["grant"]["id"].as_str().unwrap());
+    }
+
+    // Every call to den-edge carried the caller's own token, and the drop-box key was asked for once.
+    let calls = log.lock().unwrap().clone();
+    assert!(calls.iter().all(|c| c.2 == s.bearer), "den-edge is called as the caller");
+    assert_eq!(calls.iter().filter(|c| c.0 == "GET" && c.1 == "/assistant/dropbox").count(), 1);
+    assert_eq!(calls.iter().filter(|c| c.0 == "POST" && c.1 == "/assistant/append").count(), 6);
+    // Each request has an id of its own.
+    let mut ids: Vec<String> = (0..6).map(|n| device_accepts(&sealed_of(&log, n)).id).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 6);
+}
+
+#[tokio::test]
+async fn without_the_key_no_write_tool_exists() {
+    let s = Server::new().await;
+    let listed = s.rpc("tools/list", json!({})).await;
+    assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 9);
+    let called = s
+        .rpc(
+            "tools/call",
+            json!({ "name": "den_rate", "arguments": { "type": "movie", "id": 1, "value": "like" } }),
+        )
+        .await;
+    assert_eq!(called["error"]["code"], crate::mcp::INVALID_PARAMS);
+    let (_, _, metadata) = s.send("GET", "/.well-known/oauth-protected-resource", "", &[]).await;
+    assert!(metadata.contains(r#""scopes_supported":["den:search"]"#), "{metadata}");
+    // And with the key, the scope is offered.
+    let (edge, _) = stub_edge(dropbox_answer(), queued()).await;
+    let (_, _, metadata) = granted(&edge).send("GET", "/.well-known/oauth-protected-resource", "", &[]).await;
+    assert!(metadata.contains(r#""scopes_supported":["den:search","den:library.write"]"#), "{metadata}");
+}
+
+#[tokio::test]
+async fn a_connection_that_cannot_write_is_told_to_reconnect_and_den_edge_is_not_called() {
+    let f = fixed();
+    let claim = f["claim"].as_str().unwrap();
+    let (edge, log) = stub_edge(dropbox_answer(), queued()).await;
+    let search_only = write_server(&edge, "den:search", Some(claim));
+    let no_claim = write_server(&edge, "den:search den:library.write", None);
+    // A claim bound to another session, and one that is not a claim at all.
+    let mut other = write_server(&edge, "den:search den:library.write", Some(claim));
+    let mut c = claims(unix_now());
+    c["scope"] = "den:search den:library.write".into();
+    c["dw"] = claim.into();
+    c["sub"] = "someone-else".into();
+    other.bearer = format!("Bearer {}", token(&key(), &c));
+    let garbage = write_server(&edge, "den:search den:library.write", Some("AAAA"));
+    for s in [search_only, no_claim, other, garbage] {
+        let listed = s.rpc("tools/list", json!({})).await;
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 9, "no write tool is listed");
+        let error = s.tool("den_watchlist_add", json!({ "type": "movie", "id": 550 })).await.unwrap_err();
+        assert_eq!(error, "This connection can't change your library — reconnect and allow changes.");
+    }
+    assert!(log.lock().unwrap().is_empty(), "nothing was asked of den-edge");
+}
+
+#[tokio::test]
+async fn what_den_edge_refuses_is_said_in_plain_words() {
+    let refusals = [
+        (dropbox_answer(), (409, json!({ "error": "queue_full" })), "200 changes"),
+        (dropbox_answer(), (429, json!({ "error": "rate_limited" })), "Too many changes"),
+        (dropbox_answer(), (401, json!({ "error": "invalid_token" })), "reconnect Den"),
+        (dropbox_answer(), (403, json!({ "error": "insufficient_scope" })), "reconnect and allow changes"),
+        (dropbox_answer(), (500, json!({ "error": "oops" })), "try again later"),
+        ((404, json!({ "error": "no_dropbox" })), queued(), "open Den on the TV"),
+        ((401, json!({ "error": "invalid_token" })), queued(), "reconnect Den"),
+        // A drop-box key that is not the length it says, or not the id it names, is not used.
+        (
+            (200, json!({ "library": fixed()["library"], "pk": "AAAA", "kid": "x" })),
+            queued(),
+            "try again later",
+        ),
+        (
+            (
+                200,
+                json!({ "library": fixed()["library"], "pk": fixed()["dropbox"]["public"], "kid": "0".repeat(32) }),
+            ),
+            queued(),
+            "try again later",
+        ),
+    ];
+    for (dropbox, append, said) in refusals {
+        let (edge, _) = stub_edge(dropbox, append).await;
+        let error = granted(&edge)
+            .tool("den_watchlist_add", json!({ "type": "movie", "id": 550 }))
+            .await
+            .unwrap_err();
+        assert!(error.contains(said), "{error} should say {said}");
+    }
+    // An unreachable den-edge.
+    let error = granted("http://127.0.0.1:1")
+        .tool("den_watchlist_add", json!({ "type": "movie", "id": 550 }))
+        .await
+        .unwrap_err();
+    assert!(error.contains("could not reach"), "{error}");
+}
+
+#[tokio::test]
+async fn arguments_are_checked_before_anything_is_sealed() {
+    let (edge, log) = stub_edge(dropbox_answer(), queued()).await;
+    let s = granted(&edge);
+    let bad = [
+        ("den_mark_seen", json!({ "type": "movie", "id": 550, "season": 1 }), "for series"),
+        ("den_mark_seen", json!({ "type": "series", "id": 1399, "episode": 2 }), "needs its season"),
+        ("den_mark_seen", json!({ "type": "series", "id": 1399, "season": 1, "episode": 100000 }), "episode"),
+        ("den_mark_seen", json!({ "type": "series", "id": 1399, "value": "yes" }), "true (seen) or false"),
+        ("den_rate", json!({ "type": "movie", "id": 550 }), "dislike, like or love"),
+        ("den_rate", json!({ "type": "movie", "id": 550, "value": "meh" }), "dislike, like or love"),
+        ("den_watchlist_add", json!({ "type": "show", "id": 550 }), "{type: movie|series, id}"),
+        ("den_watchlist_add", json!({ "type": "movie" }), "{type: movie|series, id}"),
+    ];
+    for (tool, arguments, said) in bad {
+        let error = s.tool(tool, arguments).await.unwrap_err();
+        assert!(error.contains(said), "{tool}: {error}");
+    }
+    assert!(log.lock().unwrap().is_empty());
 }
 
 #[test]

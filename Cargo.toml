@@ -28,6 +28,11 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 # Verifies den-edge's access tokens (EdDSA JWS). Pure Rust; `fast` keeps the precomputed tables that make a
 # verify ~50 µs.
 ed25519-dalek = { version = "3", default-features = false, features = ["fast"] }
+# Library writes (den-spec wire/assistant-v1.md): opening the token's grant key, signing and sealing a request. The
+# fleet's one implementation; nothing here hand-rolls a primitive.
+den-assistant = { git = "https://github.com/oxyc/den-core.git", tag = "den-assistant-v1" }
+# The request id and the encapsulation randomness come from the platform's CSPRNG.
+getrandom = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "signal", "test-util", "io-util"] }

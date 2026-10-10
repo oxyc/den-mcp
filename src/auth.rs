@@ -15,6 +15,8 @@ use std::time::Instant;
 const LEEWAY_SECS: u64 = 30;
 /// The scope every token for this server carries.
 pub const SCOPE: &str = "den:search";
+/// The scope of a session whose person allowed assistant changes to the library (den-spec `wire/assistant-v1.md`).
+pub const WRITE_SCOPE: &str = "den:library.write";
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
@@ -72,6 +74,22 @@ pub struct Caller {
     pub session: String,
     /// `member` or `guest`, for the log and the metrics.
     pub kind: String,
+    /// What a write needs, when the token carries the write scope and a `dw` claim.
+    pub write: Option<WriteAccess>,
+}
+
+/// The token's write access: the sealed grant key (opened only for a write, with this server's key, and never
+/// kept) and the token itself, which is the bearer for the calls to den-edge made on its behalf.
+#[derive(Clone, PartialEq)]
+pub struct WriteAccess {
+    pub claim: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for WriteAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WriteAccess(..)")
+    }
 }
 
 /// Why a token was refused. Said in `WWW-Authenticate`'s `error_description`, which names no secret.
@@ -201,9 +219,9 @@ fn check(
     if claims.get("iat").and_then(Value::as_u64).is_some_and(|iat| iat > now + LEEWAY_SECS) {
         return Err(bad("issued in the future"));
     }
-    let scoped =
-        claims.get("scope").and_then(Value::as_str).is_some_and(|s| s.split(' ').any(|s| s == SCOPE));
-    if !scoped {
+    let scopes = claims.get("scope").and_then(Value::as_str).unwrap_or("");
+    let has = |scope: &str| scopes.split(' ').any(|s| s == scope);
+    if !has(SCOPE) {
         return Err(bad("missing scope"));
     }
     let session = claims
@@ -215,7 +233,12 @@ fn check(
         Some("guest") => "guest",
         _ => "member",
     };
-    Ok((Caller { session: session.to_owned(), kind: kind.to_owned() }, exp))
+    // The spec's `dw` is 1,579 characters; a longer one is not den-edge's.
+    let write = has(WRITE_SCOPE)
+        .then(|| claims.get("dw").and_then(Value::as_str).filter(|dw| dw.len() <= 2048))
+        .flatten()
+        .map(|dw| WriteAccess { claim: dw.to_owned(), token: token.to_owned() });
+    Ok((Caller { session: session.to_owned(), kind: kind.to_owned(), write }, exp))
 }
 
 /// A token bucket per session: `burst` calls at once, refilled at `per_minute`.
@@ -302,7 +325,7 @@ pub mod tests {
     fn a_token_den_edge_signed_is_the_session_it_names() {
         let now = 1_800_000_000;
         let caller = check(&token(&key(), &claims(now)), now).unwrap();
-        assert_eq!(caller, Caller { session: "s1".into(), kind: "guest".into() });
+        assert_eq!(caller, Caller { session: "s1".into(), kind: "guest".into(), write: None });
     }
 
     #[test]
@@ -383,7 +406,7 @@ pub mod tests {
         let caller = check(SIGNED, 1_800_000_100).unwrap();
         assert_eq!(
             caller,
-            Caller { session: "0123456789abcdef0123456789abcdef".into(), kind: "guest".into() }
+            Caller { session: "0123456789abcdef0123456789abcdef".into(), kind: "guest".into(), write: None }
         );
         assert_eq!(check(SIGNED, 1_800_000_900 + 31), Err(Refused::Invalid("expired")));
     }

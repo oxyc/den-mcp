@@ -5,7 +5,9 @@ things like *"a male actor, 30–50, in 2020s films"*, *"movies like Heat but Sc
 thrillers"* or *"who directed X, and what else did they make"*. It asks [den-atlas](https://github.com/oxyc/den-atlas)
 and answers with what a model may see, and a link to the title's page in Den Web.
 
-**Discovery only.** Nothing here reads or writes a library, and no library key comes near it.
+**Discovery, and queued changes.** Nothing here reads a library, and no library key comes near it. With
+`MCP_WRITE_KEY`, a connection the person allowed to make changes can also queue them (below): den-mcp only *seals* a
+request to the library; a TV or Den Web opens, checks and applies it.
 
 ```
 Claude / ChatGPT ──OAuth 2.1──► den-edge (authorization server, consent in Den Web)
@@ -29,8 +31,29 @@ Titles are always `{type: movie|series, id}`; every title carries its Den Web `u
 | `search` | `query` | `den_search`, as ChatGPT's research tools call it: `{results: [{id: "movie:949", title, url}]}` |
 | `fetch` | `id` | `den_title` as text: `{id, title, text, url, metadata}` |
 
-Every tool declares an `outputSchema` and answers with `structuredContent` and the same JSON as text; all are
-`readOnlyHint` and `idempotentHint`.
+Every tool declares an `outputSchema` and answers with `structuredContent` and the same JSON as text; the tools above
+are `readOnlyHint` and `idempotentHint`.
+
+### Library writes
+
+Listed only when `MCP_WRITE_KEY` is set **and** the token carries the `den:library.write` scope with a `dw` claim this
+server opens (den-spec `wire/assistant-v1.md`). Title arguments are `type` (`movie` or `series`; sent as the library's
+`tv`) and `id`, as the discovery tools return them. Each answers `{queued: true, id, note}`: nothing has happened yet.
+
+| Tool | Parameters | Op |
+|---|---|---|
+| `den_watchlist_add` | `type`, `id` | `watchlist_add` |
+| `den_watchlist_remove` | `type`, `id` (`destructiveHint`) | `watchlist_remove` |
+| `den_mark_seen` | `type`, `id`, `value?` (true), `season?`, `episode?` (series; episode needs season) | `seen` |
+| `den_rate` | `type`, `id`, `value` (`dislike`, `like`, `love` or null to clear) | `rate` |
+
+A call opens the grant key from `dw` (`MCP_WRITE_KEY`, bound to the token's `sub`), asks den-edge
+`GET /assistant/dropbox` for the library's drop-box key (kept a minute per session), signs and seals the request with
+`den-assistant` and `POST /assistant/append`s it, all with the caller's own token. The grant key lives for that call.
+den-edge's `queue_full`, rate limits and 401/403 are said to the model in plain words. The log line for a write is the
+tool and a status word, never an argument or key.
+
+`cargo run --example writekey` makes a key pair: `MCP_WRITE_KEY` for den-mcp, `MCP_WRITE_PUBLIC_KEY` for den-edge.
 
 ### Open-vocabulary facets (scaffold only)
 
@@ -113,7 +136,8 @@ arguments, which are what someone asked.
 ## Configuration
 
 See `.env.example`. `ATLAS_URL` (plain http on the LAN) and `PUBLIC_ORIGIN` are required; `TOKEN_PUBLIC_KEYS` is
-den-edge's public key (base64url, comma-separated during a rotation).
+den-edge's public key (base64url, comma-separated during a rotation). `MCP_WRITE_KEY` (optional, base64url of 32
+bytes) turns on the write tools and then needs `EDGE_URL`, den-edge's bare `http://` origin on den.network.
 
 `den_open_facet` is non-billing by default: it returns an explicit `den_search` fallback without contacting Atlas
 or a provider. A deployment must set `OPEN_FACETS_ENABLED=1` and every spend bound in `.env.example`, a pinned
