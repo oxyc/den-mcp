@@ -11,8 +11,8 @@ use crate::config::Write;
 use crate::tools::{bad, title_key, ToolError};
 use bytes::Bytes;
 use den_assistant::{
-    b64url_decode, hex, key_id, open_claim, seal_request, Request, ESEED_LEN, KEM_PUBLIC_LEN, MAX_EPISODE,
-    MAX_SAFE_INTEGER,
+    b64url_decode, key_id, open_claim, request_id_with_rng, seal_request_with_rng, Request, KEM_PUBLIC_LEN,
+    MAX_EPISODE, MAX_SAFE_INTEGER,
 };
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{header, Request as HttpRequest, StatusCode};
@@ -114,10 +114,11 @@ impl Writes {
         let grant = caller.write.as_ref().ok_or_else(denied)?;
         let key = open_claim(&self.secret, &caller.session, &grant.claim).map_err(|_| denied())?;
         let dropbox = self.dropbox(&caller.session, &grant.token).await?;
-        let id = hex(&random::<16>()?);
+        let mut rng = rng();
+        let id = request_id_with_rng(&mut rng);
         let at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
         let request = Request { library: &dropbox.library, grant: key.id(), id: &id, at, op, args: &args };
-        let sealed = seal_request(&dropbox.public, &key, &request, &random::<ESEED_LEN>()?)
+        let sealed = seal_request_with_rng(&dropbox.public, &key, &request, &mut rng)
             .map_err(|_| refuse("not_sealed", "Den could not prepare that change."))?;
         drop(key);
         let (status, answer) = self
@@ -245,14 +246,9 @@ fn parse_dropbox(answer: &Value) -> Option<Dropbox> {
         .then(|| Dropbox { library: library.to_owned(), public })
 }
 
-/// `N` bytes from the platform's CSPRNG.
-fn random<const N: usize>() -> Result<[u8; N], Refused> {
-    let mut bytes = [0u8; N];
-    getrandom::fill(&mut bytes).map_err(|e| {
-        eprintln!("randomness unavailable: {e}");
-        refuse("no_randomness", "Den could not prepare that change.")
-    })?;
-    Ok(bytes)
+/// The platform's CSPRNG. If it fails there is no safe way on, so the call fails rather than sealing without it.
+fn rng() -> rand_core::UnwrapErr<getrandom::SysRng> {
+    rand_core::UnwrapErr(getrandom::SysRng)
 }
 
 /// A tool's arguments as the op's `args`: the title as library rows key it (`series` is the library's `tv`) and the

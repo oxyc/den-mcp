@@ -1187,6 +1187,7 @@ fn device_accepts(sealed: &str) -> den_assistant::Accepted {
             ops: den_assistant::OPS.map(String::from).to_vec(),
             cap: 100,
             revoked: false,
+            expires: u64::MAX,
         },
     )]);
     let now = unix_now() * 1000;

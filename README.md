@@ -165,7 +165,7 @@ Measured with `cargo run --release --example load` (a stub atlas answering a 24-
 | a tool call answered from the cache | p50 0.14 ms, p99 0.29 ms |
 | 8 concurrent callers | ~8,000 calls/s, p50 0.97 ms, p99 1.4 ms |
 
-The binary is ~1.4 MB.
+The release binary is ~3.1 MB (2.85 MB before library writes; X-Wing, HPKE and AES-GCM from `den-assistant` add ~0.28 MB).
 
 ## Development
 

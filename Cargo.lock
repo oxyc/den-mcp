@@ -179,7 +179,7 @@ dependencies = [
 [[package]]
 name = "den-assistant"
 version = "0.1.0"
-source = "git+https://github.com/oxyc/den-core.git?tag=den-assistant-v1#4157bf5323447f6acd3f3d5c19c4b9db9dbf3df7"
+source = "git+https://github.com/oxyc/den-core.git?tag=den-assistant-v1.1#fd397557fbe1e17c994bf70f871692fee1a209a5"
 dependencies = [
  "aes-gcm",
  "ed25519-dalek",
@@ -204,6 +204,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "rand_core",
  "serde",
  "serde_json",
  "sha2",
@@ -320,6 +321,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi",
+ "rand_core",
 ]
 
 [[package]]
