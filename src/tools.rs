@@ -42,6 +42,10 @@ pub struct Ctx<'a> {
     /// The filter kinds that are TMDB's (`Atlas::tmdb_kinds`).
     pub tmdb_kinds: &'a [String],
     pub open_facet_slot: &'a tokio::sync::Semaphore,
+    /// Who is calling, for a write on their behalf.
+    pub caller: &'a crate::auth::Caller,
+    /// Library writes, when this server has the key for them.
+    pub writes: Option<&'a crate::writes::Writes>,
 }
 
 /// A tool refused or failed: said to the model as a tool error it can act on.
@@ -122,12 +126,12 @@ fn put(out: &mut Map<String, Value>, key: &str, value: Option<Value>) {
 
 type Answer = Result<Value, ToolError>;
 
-fn bad(message: impl Into<String>) -> ToolError {
+pub(crate) fn bad(message: impl Into<String>) -> ToolError {
     ToolError(message.into())
 }
 
-/// The tools, as `tools/list` names them.
-pub fn list() -> Value {
+/// The tools, as `tools/list` names them; the write tools only with `writes`.
+pub fn list(writes: bool) -> Value {
     let title_ref = json!({
         "type": "object",
         "properties": {
@@ -369,6 +373,12 @@ pub fn list() -> Value {
             "annotations": read_only,
         },
     ]);
+    if writes {
+        tools
+            .as_array_mut()
+            .expect("a list")
+            .extend(crate::writes::list().as_array().cloned().unwrap_or_default());
+    }
     for tool in tools.as_array_mut().into_iter().flatten() {
         let schema = output_schema(tool["name"].as_str().unwrap_or(""));
         tool["outputSchema"] = schema;
@@ -457,6 +467,7 @@ pub(crate) fn output_schema(tool: &str) -> Value {
             },
             "required": ["id", "title", "text", "url"],
         }),
+        t if crate::writes::TOOLS.iter().any(|(name, _)| *name == t) => crate::writes::output_schema(),
         _ => json!({ "type": "object" }),
     }
 }
@@ -473,6 +484,10 @@ pub async fn call(ctx: &Ctx<'_>, name: &str, args: &Value) -> Option<Answer> {
         "den_open_facet" => open_facet(ctx, args).await,
         "search" => research_search(ctx, args).await,
         "fetch" => research_fetch(ctx, args).await,
+        write if crate::writes::TOOLS.iter().any(|(name, _)| *name == write) => {
+            let writes = ctx.writes?;
+            writes.call(ctx.caller, write, args, ctx.cfg.log_requests).await
+        }
         _ => return None,
     };
     Some(answer.and_then(guard))
@@ -2048,7 +2063,7 @@ async fn find_people(ctx: &Ctx<'_>, args: &Value) -> Answer {
 
 // ---- den_title
 
-fn title_key(v: &Value) -> Result<(&str, u64), ToolError> {
+pub(crate) fn title_key(v: &Value) -> Result<(&str, u64), ToolError> {
     let kind = v.get("type").and_then(Value::as_str).filter(|t| matches!(*t, "movie" | "series"));
     let id = v.get("id").and_then(|i| i.as_u64().or_else(|| i.as_str()?.parse().ok()));
     match (kind, id) {

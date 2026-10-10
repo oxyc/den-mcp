@@ -7,7 +7,8 @@
 //!   GET  /open-facets/queue                       repeated open-facet questions, behind the metrics token
 //!
 //! den-edge is the authorization server, relays `/mcp` here, and signs the access tokens this server checks with
-//! its public key alone. Discovery only: nothing here reads or writes a library.
+//! its public key alone. Nothing here reads a library. With `MCP_WRITE_KEY` a connection the person allowed to make
+//! changes can queue them (watchlist, seen, rating): sealed to the library, applied by a TV or Den Web.
 
 mod atlas;
 mod auth;
@@ -19,6 +20,7 @@ mod names_table;
 pub mod open_facets;
 mod sel;
 mod tools;
+mod writes;
 
 #[cfg(test)]
 mod tests;
@@ -53,6 +55,8 @@ pub struct AppState {
     pub request_slots: tokio::sync::Semaphore,
     /// Open-facet calls serialize so two identical requests cannot both cross the paid boundary before one saves.
     pub open_facet_slot: tokio::sync::Semaphore,
+    /// Library writes; `None` without `MCP_WRITE_KEY`, and then no write tool exists.
+    pub writes: Option<writes::Writes>,
 }
 
 /// The most connections open at once (den-edge keeps a few alive; a flood waits in the listen backlog).
@@ -72,7 +76,9 @@ impl AppState {
     pub fn new(cfg: config::Config) -> Self {
         let atlas = atlas::Atlas::new(cfg.atlas.base.clone(), cfg.atlas.timeout);
         let limit = auth::RateLimit::new(cfg.rate_per_minute, cfg.rate_burst);
+        let writes = cfg.write.as_ref().map(writes::Writes::new);
         AppState {
+            writes,
             cfg,
             atlas,
             limit,
@@ -239,10 +245,12 @@ fn health(state: &AppState) -> Value {
 
 /// RFC 9728: this resource, and den-edge as the authorization server that issues its tokens.
 fn resource_metadata(state: &AppState) -> Value {
+    let scopes =
+        if state.writes.is_some() { json!([auth::SCOPE, auth::WRITE_SCOPE]) } else { json!([auth::SCOPE]) };
     json!({
         "resource": state.cfg.resource(),
         "authorization_servers": [state.cfg.issuer],
-        "scopes_supported": [auth::SCOPE],
+        "scopes_supported": scopes,
         "bearer_methods_supported": ["header"],
         "resource_name": "Den",
     })
@@ -391,7 +399,7 @@ async fn reply(
 }
 
 /// The tools' names as `&'static str`, for the log and the metrics labels: never a name a client made up.
-fn known_tool(name: &str) -> Option<&'static str> {
+fn known_tool(name: &str, writes: bool) -> Option<&'static str> {
     [
         "den_search",
         "den_filter_titles",
@@ -404,6 +412,7 @@ fn known_tool(name: &str) -> Option<&'static str> {
         "fetch",
     ]
     .into_iter()
+    .chain(writes.then(|| writes::TOOLS.map(|(tool, _)| tool)).into_iter().flatten())
     .find(|t| *t == name)
 }
 
@@ -418,10 +427,14 @@ async fn answer(
     let reply = match method {
         "initialize" => mcp::result(id, mcp::initialize(params)),
         "ping" => mcp::result(id, json!({})),
-        "tools/list" => mcp::result(id, json!({ "tools": tools::list() })),
+        // The write tools only for a token that carries the write scope and a grant claim this server opens.
+        "tools/list" => {
+            let writes = state.writes.as_ref().is_some_and(|w| w.can_write(caller));
+            mcp::result(id, json!({ "tools": tools::list(writes) }))
+        }
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-            let Some(tool) = known_tool(name) else {
+            let Some(tool) = known_tool(name, state.writes.is_some()) else {
                 return (Some(mcp::error(id, mcp::INVALID_PARAMS, &format!("Unknown tool: {name}"))), None);
             };
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
@@ -439,6 +452,8 @@ async fn answer(
                 year: year_of(unix_now()),
                 tmdb_kinds: &tmdb_kinds[..],
                 open_facet_slot: &state.open_facet_slot,
+                caller,
+                writes: state.writes.as_ref(),
             };
             // However many questions to atlas a call takes, it answers within TOOL_DEADLINE: under den-edge's own
             // relay timeout, so the person hears "too long" from Den rather than a broken connection.
@@ -576,7 +591,7 @@ async fn run(cfg: config::Config) -> std::io::Result<()> {
     let cfg = &state.cfg;
     eprintln!(
         "den-mcp {} listening on :{} — atlas={} origin={} issuer={} token_keys={} rate={}/min burst={} metrics={} \
-         log_requests={}",
+         log_requests={} writes={}",
         env!("CARGO_PKG_VERSION"),
         listener.local_addr().map_or(cfg.port, |a| a.port()),
         cfg.atlas.base,
@@ -587,6 +602,7 @@ async fn run(cfg: config::Config) -> std::io::Result<()> {
         cfg.rate_burst,
         if cfg.metrics_token.is_some() { "on" } else { "off" },
         if cfg.log_requests { "on" } else { "off" },
+        if cfg.write.is_some() { "on" } else { "off" },
     );
     if cfg.token_keys.is_empty() {
         eprintln!(
