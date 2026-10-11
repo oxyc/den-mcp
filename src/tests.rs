@@ -1718,6 +1718,41 @@ async fn what_den_edge_answers_instead_of_a_projection_is_said_in_plain_words() 
     assert!(error.contains("could not reach"), "{error}");
 }
 
+#[tokio::test]
+async fn calls_at_once_share_one_open_and_the_next_calls_reuse_it() {
+    let (edge, log) = stub_edge_with(dropbox_answer(), queued(), projection_answer()).await;
+    let s = reader(&edge).await;
+    let opens = || log.lock().unwrap().iter().filter(|c| c.1 == "/assistant/projection").count();
+    // The three tools called together, as an assistant does, ask den-edge once.
+    let (a, b, c) = tokio::join!(
+        s.tool("den_watchlist", json!({})),
+        s.tool("den_continue_watching", json!({})),
+        s.tool("den_history", json!({})),
+    );
+    let (a, b, c) = (a.unwrap(), b.unwrap(), c.unwrap());
+    assert_eq!((a["total"].clone(), b["total"].clone(), c["total"].clone()), (json!(1), json!(3), json!(4)));
+    assert_eq!(opens(), 1, "one open for calls at once");
+    // And a call a moment later shares it, with the same freshness.
+    let again = s.tool("den_history", json!({ "limit": 1 })).await.unwrap();
+    assert_eq!((opens(), again["as_of"].clone()), (1, a["as_of"].clone()));
+}
+
+#[test]
+fn the_packed_rows_are_small() {
+    // A watchlist of 5,000, Continue Watching of 500 and 50,000 plays take about a megabyte, not tens.
+    let rows =
+        |n: usize, per: &str| (0..n).map(|i| per.replace("{}", &i.to_string())).collect::<Vec<_>>().join(",");
+    let compact = format!(
+        r#"{{"at":1,"titles":[{}],"watchlist":[{}],"continue":[{}],"seen":[{}]}}"#,
+        rows(12_000, r#"["movie",100{}]"#),
+        rows(5_000, "[{},1]"),
+        rows(500, r#"[{},"resume",null,null,0.5,1]"#),
+        rows(50_000, "[1,null,null,{}]"),
+    );
+    let lists = crate::projection::Lists::parse(compact.as_bytes()).unwrap();
+    assert!(lists.bytes() < 2 * 1024 * 1024, "{} bytes", lists.bytes());
+}
+
 #[test]
 fn the_year_is_the_civil_year() {
     assert_eq!(crate::year_of(0), 1970);

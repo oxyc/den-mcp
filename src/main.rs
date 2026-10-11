@@ -18,6 +18,7 @@ mod metrics;
 mod names;
 mod names_table;
 pub mod open_facets;
+mod projection;
 mod reads;
 mod sel;
 mod tools;

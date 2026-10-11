@@ -3,13 +3,24 @@
 //! server hold; den-edge stores the latest. A call opens the read key from the token's `dr` claim (sealed to
 //! `MCP_WRITE_KEY`), fetches the projection with the caller's own token, opens it and names the titles through
 //! den-atlas, exactly as the discovery tools do. The read key lives for that call.
+//!
+//! The container this runs in has 32 MB, and a household's history is tens of thousands of rows, so nothing here
+//! builds a `serde_json::Value` of it: the opened compact form is read once into packed rows (`projection.rs`), the
+//! page asked for is picked out of those, and only that page is named through atlas. Calls from one session share
+//! one open (the three tools are often called together) and the packed rows are kept for a short while, wiped when
+//! they expire.
 
+use crate::projection::{Continue, Lists, Seen, Watch, NO_NUMBER, NO_TIME};
 use crate::tools::{bad, paging, string, title, title_url, Ctx, ToolError};
 use crate::writes::{error_code, refuse, Refused, Writes};
-use den_assistant::{open_claim, open_projection, open_read_claim, ReadKey};
+use den_assistant::{open_claim, open_projection_compact, open_read_claim, ReadKey};
 use futures_util::future::join_all;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// The read tools, as `tools/list` names them.
 pub const TOOLS: [&str; 3] = ["den_watchlist", "den_continue_watching", "den_history"];
@@ -17,8 +28,59 @@ pub const TOOLS: [&str; 3] = ["den_watchlist", "den_continue_watching", "den_his
 /// The largest projection answer read from den-edge: its parts come to at most 16 MiB of characters (§15).
 const MAX_PROJECTION_ANSWER: usize = 17 * 1024 * 1024;
 
+/// How long a session's opened lists are kept for its next call.
+const KEPT_FOR: Duration = Duration::from_secs(30);
+/// The most packed rows kept, across every session. A set past what is left is used by the calls in flight and then
+/// dropped, never kept.
+const KEPT_BYTES: usize = 4 * 1024 * 1024;
+/// The most sessions tracked at once.
+const SESSIONS: usize = 32;
+
 const DENIED: &str =
     "This connection can't read your lists — reconnect and allow reading your watchlist and history.";
+const UNREADABLE: &str = "Den could not read your lists right now; try again later.";
+
+/// A session's opened lists, and when and for which grant they were.
+struct Held {
+    at: Instant,
+    grant: String,
+    lists: Arc<Lists>,
+    bytes: usize,
+}
+
+type Slot = Arc<tokio::sync::Mutex<Option<Held>>>;
+
+/// The lists the read tools share between calls: one slot a session, held across an open so concurrent calls wait
+/// for it instead of each doing their own.
+#[derive(Default)]
+pub struct Shared {
+    slots: Mutex<HashMap<String, Slot>>,
+    kept: Arc<AtomicUsize>,
+}
+
+impl Shared {
+    fn slot(&self, session: &str) -> Slot {
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = slots.get(session) {
+            return slot.clone();
+        }
+        if slots.len() >= SESSIONS {
+            // Empty slots nobody is waiting on go first; a slot someone holds keeps working if it is dropped here.
+            slots.retain(|_, s| Arc::strong_count(s) > 1 || s.try_lock().map_or(true, |h| h.is_some()));
+            if slots.len() >= SESSIONS {
+                slots.clear();
+            }
+        }
+        slots.entry(session.to_owned()).or_default().clone()
+    }
+}
+
+/// Drop what a slot holds, and what it counted toward `kept`.
+fn release(held: &mut Option<Held>, kept: &AtomicUsize) {
+    if let Some(h) = held.take() {
+        kept.fetch_sub(h.bytes, Ordering::Relaxed);
+    }
+}
 
 impl Writes {
     /// The caller's read key, opened from `dr` for the token's session. When the token also carries a write grant,
@@ -42,12 +104,46 @@ impl Writes {
         self.read_key(caller).is_ok()
     }
 
-    /// The projection the caller's connection may read, opened.
-    async fn projection(&self, caller: &crate::auth::Caller) -> Result<Value, Refused> {
+    /// The lists the caller's connection may read: those this session opened a moment ago, or opened now. Calls that
+    /// arrive while one is opening wait for it and share it.
+    async fn lists(&self, caller: &crate::auth::Caller) -> Result<Arc<Lists>, Refused> {
         let key = self.read_key(caller)?;
+        let grant = key.grant().to_owned();
+        let started = Instant::now();
+        let slot = self.lists.slot(&caller.session);
+        let mut held = slot.lock().await;
+        if let Some(h) = held.as_ref() {
+            if h.grant == grant && (h.at >= started || h.at.elapsed() < KEPT_FOR) {
+                return Ok(h.lists.clone());
+            }
+        }
+        release(&mut held, &self.lists.kept);
+        let lists = Arc::new(self.open_lists(caller, &key).await?);
+        drop(key);
+        let bytes = lists.bytes();
+        // Kept for the calls that follow, and for those already waiting on this open.
+        if self.lists.kept.load(Ordering::Relaxed) + bytes <= KEPT_BYTES {
+            self.lists.kept.fetch_add(bytes, Ordering::Relaxed);
+            let at = Instant::now();
+            *held = Some(Held { at, grant, lists: lists.clone(), bytes });
+            let (slot, kept) = (slot.clone(), self.lists.kept.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(KEPT_FOR).await;
+                let mut held = slot.lock().await;
+                if held.as_ref().is_some_and(|h| h.at == at) {
+                    release(&mut held, &kept);
+                }
+            });
+        }
+        Ok(lists)
+    }
+
+    /// The projection from den-edge, opened and packed.
+    async fn open_lists(&self, caller: &crate::auth::Caller, key: &ReadKey) -> Result<Lists, Refused> {
+        let unreadable = || refuse("unreadable", UNREADABLE);
         let token = &caller.read.as_ref().expect("read_key checked it").token;
-        let (status, answer) =
-            self.edge_call("GET", "/assistant/projection", token, None, MAX_PROJECTION_ANSWER).await?;
+        let (status, body) =
+            self.edge_exchange("GET", "/assistant/projection", token, None, MAX_PROJECTION_ANSWER).await?;
         match status.as_u16() {
             200 => {}
             404 => {
@@ -64,44 +160,51 @@ impl Writes {
             }
             403 => return Err(refuse("no_read_grant", DENIED)),
             other => {
-                eprintln!("den-edge: projection answered {other} {}", error_code(&answer).unwrap_or("-"));
-                return Err(refuse(
-                    "edge_error",
-                    "Den could not read your lists right now; try again later.",
-                ));
+                // An error body is a few bytes; anything bigger is not one.
+                let answer =
+                    (body.len() < 4096).then(|| serde_json::from_slice::<Value>(&body).ok()).flatten();
+                eprintln!(
+                    "den-edge: projection answered {other} {}",
+                    answer.as_ref().and_then(error_code).unwrap_or("-")
+                );
+                return Err(refuse("edge_error", UNREADABLE));
             }
         }
-        let field = |name: &str| answer.get(name).and_then(Value::as_str);
-        let parts: Option<Vec<String>> = answer
-            .get("parts")
-            .and_then(Value::as_array)
-            .and_then(|parts| parts.iter().map(|p| p.as_str().map(str::to_owned)).collect());
-        let (Some(library), Some(grant), Some(set), Some(parts)) =
-            (field("library"), field("grant"), field("set"), parts)
-        else {
-            return Err(refuse("edge_error", "Den could not read your lists right now; try again later."));
-        };
+        /// The answer, its parts read once into the strings the opening takes and nothing else kept.
+        #[derive(Deserialize)]
+        struct Answer {
+            library: String,
+            grant: String,
+            set: String,
+            parts: Vec<String>,
+        }
+        let answer: Answer = serde_json::from_slice(&body).map_err(|_| refuse("edge_error", UNREADABLE))?;
+        // The answer's bytes are not needed again: free them before the parts are opened.
+        drop(body);
         // The projection is the connection's own: a grant other than the claim's is someone else's.
-        if grant != key.grant() {
+        if answer.grant != key.grant() {
             return Err(refuse("grant_mismatch", DENIED));
         }
-        open_projection(key.key(), library, grant, set, &parts)
-            .map_err(|_| refuse("unreadable", "Den could not read your lists right now; try again later."))
+        let compact =
+            open_projection_compact(key.key(), &answer.library, &answer.grant, &answer.set, &answer.parts)
+                .map_err(|_| unreadable())?;
+        drop(answer);
+        Lists::parse(&compact).ok_or_else(unreadable)
     }
 }
 
 /// One read tool call. The log line is the tool and a status word, never what was asked or a key.
 pub async fn call(ctx: &Ctx<'_>, writes: &Writes, tool: &str, args: &Value) -> Result<Value, ToolError> {
     let query = Query::parse(tool, args)?;
-    let outcome = writes.projection(ctx.caller).await;
+    let outcome = writes.lists(ctx.caller).await;
     if ctx.cfg.log_requests {
         eprintln!(
             "read tool={tool} status={}",
             outcome.as_ref().map_or_else(|Refused(code, _)| *code, |_| "ok")
         );
     }
-    let projection = outcome.map_err(|Refused(_, message)| ToolError(message))?;
-    Ok(answer(ctx, &projection, &query).await)
+    let lists = outcome.map_err(|Refused(_, message)| ToolError(message))?;
+    Ok(answer(ctx, &lists, &query).await)
 }
 
 /// What a read tool was asked.
@@ -142,98 +245,135 @@ impl Query {
     }
 }
 
-/// A projection entry whose title reads: its Den kind (`series` is the library's `tv`) and TMDB id.
-fn title_of(entry: &Value) -> Option<(&'static str, u64)> {
-    let title = entry.get("title")?;
-    let kind = match title.get("type")?.as_str()? {
-        "movie" => "movie",
-        "tv" => "series",
-        _ => return None,
-    };
-    Some((kind, title.get("id")?.as_u64().filter(|id| *id > 0)?))
+/// The rows of one list that the query keeps, counted, and the page of them asked for. One pass, nothing collected
+/// but the page.
+fn window<'a, T>(
+    rows: &'a [T],
+    lists: &Lists,
+    query: &Query,
+    title: impl Fn(&T) -> u32,
+    at: impl Fn(&T) -> u64,
+    untimed: &mut usize,
+) -> (usize, Vec<&'a T>) {
+    let timed = query.since.is_some() || query.until.is_some();
+    let from = query.page.saturating_mul(query.limit);
+    let to = from.saturating_add(query.limit);
+    let (mut total, mut page) = (0, Vec::new());
+    for row in rows {
+        if query.kind.is_some_and(|k| k != lists.title(title(row)).0) {
+            continue;
+        }
+        if timed {
+            let t = at(row);
+            if t == NO_TIME {
+                *untimed += 1;
+                continue;
+            }
+            if query.since.is_some_and(|s| t < s) || query.until.is_some_and(|u| t > u) {
+                continue;
+            }
+        }
+        if (from..to).contains(&total) {
+            page.push(row);
+        }
+        total += 1;
+    }
+    (total, page)
 }
 
-/// The page asked for, named and dated, with how fresh it is and what it leaves out.
-async fn answer(ctx: &Ctx<'_>, projection: &Value, query: &Query) -> Value {
-    let entries: Vec<(&'static str, u64, &Value)> = projection
-        .get(query.list)
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|e| title_of(e).map(|(kind, id)| (kind, id, e)))
-        .filter(|(kind, ..)| query.kind.is_none_or(|k| k == *kind))
-        .collect();
-    let at = |e: &Value| e.get("at").and_then(Value::as_u64);
-    let timed = query.since.is_some() || query.until.is_some();
-    let mut untimed = 0;
-    let entries: Vec<_> = entries
-        .into_iter()
-        .filter(|(.., e)| {
-            if !timed {
-                return true;
-            }
-            match at(e) {
-                Some(t) => query.since.is_none_or(|s| t >= s) && query.until.is_none_or(|u| t <= u),
-                None => {
-                    untimed += 1;
-                    false
-                }
-            }
-        })
-        .collect();
-    let total = entries.len();
-    let shown: Vec<_> = entries.into_iter().skip(query.page * query.limit).take(query.limit).collect();
+/// A time as RFC 3339, when the row has one.
+fn date(ms: u64) -> Option<String> {
+    (ms != NO_TIME).then(|| rfc3339(ms))
+}
 
-    let mut keys: Vec<(&'static str, u64)> = shown.iter().map(|(kind, id, _)| (*kind, *id)).collect();
+fn put(extra: &mut Map<String, Value>, key: &str, number: u32) {
+    if number != NO_NUMBER {
+        extra.insert(key.into(), json!(number));
+    }
+}
+
+/// A row of the page: its title (an index into the table) and the fields of its own.
+type Row = (u32, Map<String, Value>);
+
+/// The page asked for, named and dated, with how fresh it is.
+async fn answer(ctx: &Ctx<'_>, lists: &Lists, query: &Query) -> Value {
+    let mut untimed = 0;
+    // Each row of the page as its title and the fields of its own.
+    let (total, rows): (usize, Vec<Row>) = match query.list {
+        "watchlist" => {
+            let (total, page) =
+                window(&lists.watchlist, lists, query, |e: &Watch| e.title, |e| e.at, &mut untimed);
+            let rows = page
+                .iter()
+                .map(|e| {
+                    let mut extra = Map::new();
+                    if let Some(added) = date(e.at) {
+                        extra.insert("added".into(), json!(added));
+                    }
+                    (e.title, extra)
+                })
+                .collect();
+            (total, rows)
+        }
+        "continue" => {
+            let (total, page) =
+                window(&lists.continuing, lists, query, |e: &Continue| e.title, |e| e.at, &mut untimed);
+            let rows = page
+                .iter()
+                .map(|e| {
+                    let mut extra = Map::new();
+                    extra.insert("action".into(), json!(if e.resume { "resume" } else { "next" }));
+                    put(&mut extra, "season", e.season);
+                    put(&mut extra, "episode", e.episode);
+                    extra.insert("fraction".into(), json!((f64::from(e.fraction) * 1000.0).round() / 1000.0));
+                    if let Some(at) = date(e.at) {
+                        extra.insert("last_watched".into(), json!(at));
+                    }
+                    (e.title, extra)
+                })
+                .collect();
+            (total, rows)
+        }
+        _ => {
+            let (total, page) = window(&lists.seen, lists, query, |e: &Seen| e.title, |e| e.at, &mut untimed);
+            let rows = page
+                .iter()
+                .map(|e| {
+                    let mut extra = Map::new();
+                    put(&mut extra, "season", e.season);
+                    put(&mut extra, "episode", e.episode);
+                    if let Some(at) = date(e.at) {
+                        extra.insert("watched".into(), json!(at));
+                    }
+                    (e.title, extra)
+                })
+                .collect();
+            (total, rows)
+        }
+    };
+
+    let mut keys: Vec<(&'static str, u64)> = rows.iter().map(|(title, _)| lists.title(*title)).collect();
     keys.sort_unstable();
     keys.dedup();
     let (cards, unnamed) = cards(ctx, &keys).await;
 
-    let results: Vec<Value> = shown
-        .iter()
-        .map(|(kind, id, e)| {
-            let mut item = match cards.get(&(*kind, *id)) {
+    let results: Vec<Value> = rows
+        .into_iter()
+        .map(|(title, extra)| {
+            let mut item = match cards.get(&lists.title(title)) {
                 Some(Value::Object(card)) => card.clone(),
                 _ => Map::new(),
             };
-            let date = |key: &str| e.get(key).and_then(Value::as_u64).map(rfc3339);
-            match query.list {
-                "watchlist" => {
-                    if let Some(added) = date("addedAt") {
-                        item.insert("added".into(), json!(added));
-                    }
-                }
-                "continue" => {
-                    for key in ["action", "season", "episode", "fraction"] {
-                        if let Some(v) = e.get(key) {
-                            item.insert(key.into(), v.clone());
-                        }
-                    }
-                    if let Some(at) = date("at") {
-                        item.insert("last_watched".into(), json!(at));
-                    }
-                }
-                _ => {
-                    for key in ["season", "episode"] {
-                        if let Some(v) = e.get(key) {
-                            item.insert(key.into(), v.clone());
-                        }
-                    }
-                    if let Some(at) = date("at") {
-                        item.insert("watched".into(), json!(at));
-                    }
-                }
-            }
+            item.extend(extra);
             Value::Object(item)
         })
         .collect();
 
-    let shown_count = query.page * query.limit + results.len();
-    let as_of = projection.get("at").and_then(Value::as_u64).map(rfc3339);
+    let shown_count = query.page.saturating_mul(query.limit) + results.len();
+    let as_of = rfc3339(lists.at);
     let mut note = format!(
-        "As of {}: the last time a TV or Den Web published your lists, so it lags anything done since, and \
-         anything done while neither was open is not here.",
-        as_of.as_deref().unwrap_or("an unknown time")
+        "As of {as_of}: the last time a TV or Den Web published your lists, so it lags anything done since, and \
+         anything done while neither was open is not here."
     );
     if total > shown_count {
         note.push_str(&format!(" {} more on the next page.", total - shown_count));

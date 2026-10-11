@@ -55,6 +55,8 @@ pub struct Writes {
     edge: String,
     client: Client<HttpConnector, Full<Bytes>>,
     dropboxes: Mutex<HashMap<String, (Dropbox, Instant)>>,
+    /// The lists the read tools share between calls (`reads.rs`).
+    pub(crate) lists: crate::reads::Shared,
 }
 
 /// Why a change was not queued: a short code for the log and the words the model is told.
@@ -73,6 +75,7 @@ impl Writes {
             edge: config.edge.clone(),
             client: Client::builder(TokioExecutor::new()).build(connector),
             dropboxes: Mutex::default(),
+            lists: Default::default(),
         }
     }
 
@@ -198,7 +201,7 @@ impl Writes {
         Ok(dropbox)
     }
 
-    /// One JSON exchange with den-edge as the caller, the access token as its bearer.
+    /// One JSON exchange with den-edge as the caller, the access token as its bearer, its answer read as JSON.
     pub(crate) async fn edge_call(
         &self,
         method: &str,
@@ -207,6 +210,19 @@ impl Writes {
         body: Option<Value>,
         max_answer: usize,
     ) -> Result<(StatusCode, Value), Refused> {
+        let (status, body) = self.edge_exchange(method, path, token, body, max_answer).await?;
+        Ok((status, serde_json::from_slice(&body).unwrap_or(Value::Null)))
+    }
+
+    /// The same, with the answer's bytes as they came, for one the caller reads without building a `Value`.
+    pub(crate) async fn edge_exchange(
+        &self,
+        method: &str,
+        path: &str,
+        token: &str,
+        body: Option<Value>,
+        max_answer: usize,
+    ) -> Result<(StatusCode, Bytes), Refused> {
         let unreachable = |why: String| {
             eprintln!("den-edge: {why}");
             refuse("edge_unreachable", "Den could not reach its sync service; try again later.")
@@ -235,7 +251,7 @@ impl Writes {
             .await
             .map_err(|_| unreachable("no answer in time".into()))?
             .map_err(unreachable)?;
-        Ok((status, serde_json::from_slice(&body).unwrap_or(Value::Null)))
+        Ok((status, body))
     }
 }
 

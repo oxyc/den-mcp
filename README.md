@@ -74,8 +74,21 @@ Den Web `url`; no TMDB field), with their ids and dates (UTC, RFC 3339) kept.
 
 A call opens the read key from `dr`, checks it names the same grant as `dw` when the token has both, `GET`s
 `/assistant/projection` with the caller's own token (`{library, grant, set, parts}`), opens the sealed, compressed parts
-with `open_projection` (which checks the set whole and in order, its library and grant) and answers from it. A `404 no_projection` says to open Den on the TV or web once. The log line is the tool and a
-status word.
+with `open_projection_compact` (which checks the set whole and in order, its library and grant) and answers from it. A
+`404 no_projection` says to open Den on the TV or web once. The log line is the tool and a status word.
+
+The container has 32 MB, so a history of tens of thousands of plays is never built as JSON values: the opened compact
+form is read once into packed fixed-size rows (`src/projection.rs`, about 1 MB for 5,000 watchlist entries, 500 in
+Continue Watching and 50,000 plays), the page is picked out of those in one pass, and only that page is named through
+atlas. A session's calls share one open (an assistant often calls all three tools together) and the rows are kept for
+30 s, at most 4 MB across sessions, then wiped, so a list is as stale as that on top of the last publish. Measured with
+`cargo build --release --examples && target/release/examples/readload <real|large> <concurrent> [rounds]` (peak resident
+set, idle 3.3 MB):
+
+| | 1 call | 3 at once | 8 at once |
+|---|---|---|---|
+| real size, 62 KB sealed | 6.0 MB | 6.5 MB | 7.1 MB |
+| large, 535 KB sealed (5,000 / 500 / 50,000) | 11.3 MB | 11.8 MB | 12.4 MB |
 
 ### Open-vocabulary facets (scaffold only)
 
@@ -187,7 +200,7 @@ Measured with `cargo run --release --example load` (a stub atlas answering a 24-
 | a tool call answered from the cache | p50 0.14 ms, p99 0.29 ms |
 | 8 concurrent callers | ~8,000 calls/s, p50 0.97 ms, p99 1.4 ms |
 
-The release binary is ~3.2 MB (2.85 MB before library writes and reads; `den-assistant`'s X-Wing, HPKE, AES-GCM and DEFLATE add ~0.38 MB).
+The release binary is ~3.3 MB (2.85 MB before library writes and reads; `den-assistant`'s X-Wing, HPKE, AES-GCM and DEFLATE add ~0.38 MB).
 
 ## Development
 

@@ -24,7 +24,11 @@ fn fixture() -> Value {
 }
 
 fn unhex32(text: &str) -> [u8; 32] {
-    (0..32).map(|i| u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).unwrap()).collect::<Vec<_>>().try_into().unwrap()
+    (0..32)
+        .map(|i| u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).unwrap())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap()
 }
 
 /// The sealed answer of `GET /assistant/projection` for lists of these lengths, and its size in characters.
@@ -37,9 +41,8 @@ fn projection(watchlist: usize, continuing: usize, seen: usize, pool: usize) -> 
         x ^= x << 17;
         x
     };
-    let titles: Vec<(&str, u64)> = (0..pool)
-        .map(|_| (if next() % 10 < 6 { "movie" } else { "tv" }, 1 + next() % 1_000_000))
-        .collect();
+    let titles: Vec<(&str, u64)> =
+        (0..pool).map(|_| (if next() % 10 < 6 { "movie" } else { "tv" }, 1 + next() % 1_000_000)).collect();
     let title = |n: u64| json!({ "type": titles[n as usize % pool].0, "id": titles[n as usize % pool].1 });
     let is_tv = |n: u64| titles[n as usize % pool].0 == "tv";
     let at = |n: u64| 1_789_000_000_000u64 - n * 3_600_000;
