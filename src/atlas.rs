@@ -126,6 +126,29 @@ impl Atlas {
             req = req.header(header::IF_NONE_MATCH, etag);
         }
         let req = req.body(Full::new(Bytes::new())).map_err(|e| failed(None, e.to_string()))?;
+        self.send(req).await
+    }
+
+    /// `POST <path>` with a JSON body, answered with the bytes of a 2xx. Never kept: a question about one household.
+    pub async fn post(&self, path: &str, body: Bytes, rid: Option<&str>) -> Result<Bytes, Failed> {
+        let mut req = Request::post(format!("{}{path}", self.base))
+            .header(header::ACCEPT, "application/json")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(rid) = rid {
+            req = req.header("x-request-id", rid);
+        }
+        let req = req.body(Full::new(body)).map_err(|e| failed(None, e.to_string()))?;
+        let read = self.send(req).await?;
+        if !read.status.is_success() {
+            let detail = detail_of(&read.body)
+                .unwrap_or_else(|| format!("atlas answered HTTP {}", read.status.as_u16()));
+            return Err(failed(Some(read.status.as_u16()), detail));
+        }
+        Ok(read.body)
+    }
+
+    /// One request, with the head and the whole body inside one deadline.
+    async fn send(&self, req: Request<Full<Bytes>>) -> Result<Exchanged, Failed> {
         tokio::time::timeout(self.timeout, async {
             let _slot = self.in_flight.acquire().await.map_err(|_| failed(None, "shutting down".into()))?;
             let resp = self

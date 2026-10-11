@@ -143,6 +143,37 @@ async fn stub_atlas() -> (String, Asked) {
                 let seen = seen.clone();
                 async move {
                     let path = req.uri().path_and_query().unwrap().to_string();
+                    // `POST /recommend`: the body is kept as asked (after a `BODY ` marker) and answered with as many
+                    // slides as it asks for, the first two Den's own titles, carrying atlas's scoring terms.
+                    if req.method() == hyper::Method::POST && path == "/recommend" {
+                        let body = req.into_body().collect().await.unwrap().to_bytes();
+                        let body = String::from_utf8(body.to_vec()).unwrap();
+                        seen.lock().unwrap().push(format!("BODY {body}"));
+                        let asked: Value = serde_json::from_str(&body).unwrap();
+                        let count = asked["limit"].as_u64().unwrap().min(40);
+                        let slides: Vec<Value> = (0..count)
+                            .map(|i| {
+                                let (kind, id) = match i {
+                                    0 => ("movie", 550),
+                                    1 => ("series", 1399),
+                                    _ => (if i % 2 == 0 { "movie" } else { "series" }, 5000 + i),
+                                };
+                                let reason = match i {
+                                    0 => "similar",
+                                    1 => "quality",
+                                    _ => "buzz",
+                                };
+                                json!({ "type": kind, "id": id, "imdbId": "tt0137523", "posterPath": "/p.jpg",
+                                        "why": { "score": 0.9, "fit": 0.8, "quality": 0.7, "buzz": 0.1,
+                                                 "reason": reason } })
+                            })
+                            .collect();
+                        let answer = json!({ "slides": slides, "unjudged": [], "scorer": "fit-3" });
+                        return Ok(hyper::Response::builder()
+                            .header("content-type", "application/json")
+                            .body(Full::new(Bytes::from(answer.to_string())))
+                            .unwrap());
+                    }
                     // The schema is read once an hour for the TMDB kinds; the tests count the questions.
                     if path != "/index/schema.json" {
                         seen.lock().unwrap().push(path.clone());
@@ -1547,7 +1578,11 @@ async fn the_lists_are_named_through_atlas_dated_and_say_how_fresh_they_are() {
     let listed = s.rpc("tools/list", json!({})).await;
     let names: Vec<&str> =
         listed["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(&names[9..], ["den_watchlist", "den_continue_watching", "den_history"], "reads only");
+    assert_eq!(
+        &names[9..],
+        ["den_watchlist", "den_continue_watching", "den_history", "den_recommend"],
+        "reads only"
+    );
     for tool in &listed["result"]["tools"].as_array().unwrap()[9..] {
         assert_eq!(tool["annotations"]["readOnlyHint"], true);
         assert_eq!(tool["annotations"]["idempotentHint"], true);
@@ -1735,6 +1770,172 @@ async fn calls_at_once_share_one_open_and_the_next_calls_reuse_it() {
     // And a call a moment later shares it, with the same freshness.
     let again = s.tool("den_history", json!({ "limit": 1 })).await.unwrap();
     assert_eq!((opens(), again["as_of"].clone()), (1, a["as_of"].clone()));
+}
+
+/// The bodies atlas was sent `POST /recommend`, in order.
+fn recommend_bodies(s: &Server) -> Vec<Value> {
+    s.asked
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|a| a.strip_prefix("BODY "))
+        .map(|b| serde_json::from_str(b).unwrap())
+        .collect()
+}
+
+/// A recommendation body's titles as `type:id`, sorted, and its library weights by `type:id`.
+fn refs(list: &Value) -> Vec<String> {
+    let mut refs: Vec<String> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| format!("{}:{}", t["type"].as_str().unwrap(), t["id"]))
+        .collect();
+    refs.sort();
+    refs
+}
+
+#[tokio::test]
+async fn what_to_watch_is_ranked_by_atlas_against_the_lists_and_names_the_page() {
+    let (edge, _) = stub_edge_with(dropbox_answer(), queued(), projection_answer()).await;
+    let s = reader(&edge).await;
+    let answer = s.tool("den_recommend", json!({ "limit": 2 })).await.unwrap();
+    let results = answer["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    let film = &results[0];
+    assert_eq!(
+        (film["type"].clone(), film["id"].clone(), film["title"].clone()),
+        (json!("movie"), json!(550), json!("Fight Club"))
+    );
+    assert_eq!(film["url"], "https://den.example/movie/550-fight-club");
+    assert_eq!(film["why"], "Similar to what you've watched", "Den's own words for atlas's reason");
+    assert_eq!(results[1]["title"], "Game of Thrones");
+    assert!(results[1].get("why").is_none(), "a reason that weighs ratings or popularity is not given");
+    // None of atlas's scoring terms, nor an id or image from outside Den, reaches the model.
+    let text = answer.to_string();
+    for leaked in ["score", "fit\"", "imdbId", "tt0137523", "posterPath", "quality", "buzz", "/p.jpg"] {
+        assert!(!text.contains(leaked), "{leaked} reached the answer: {text}");
+    }
+    assert_eq!(
+        (answer["more"].clone(), answer["page"].clone(), answer["as_of"].clone()),
+        (json!(true), json!(0), json!("2026-09-21T14:13:20Z"))
+    );
+    let note = answer["note"].as_str().unwrap();
+    assert!(note.contains("As of") || note.contains("as of 2026-09-21T14:13:20Z"), "{note}");
+    assert!(note.contains("Not for me"), "{note}");
+
+    // The request is Den Web's: weights from what was watched (1) and watchlisted (0.6), every title held as owned.
+    let bodies = recommend_bodies(&s);
+    assert_eq!(bodies.len(), 1);
+    let body = &bodies[0];
+    assert_eq!(
+        (body["version"].clone(), body["surface"].clone(), body["limit"].clone()),
+        (json!(1), json!("home"), json!(3))
+    );
+    assert!(body["now"].as_str().unwrap().ends_with('Z'));
+    assert!(body.get("hide").is_none() && body.get("fresh").is_none() && body.get("candidates").is_none());
+    let held = ["movie:550", "movie:603", "movie:680", "movie:27205", "series:1396", "series:1399"];
+    assert_eq!(refs(&body["owned"]), {
+        let mut h = held.map(String::from).to_vec();
+        h.sort();
+        h
+    });
+    let weight = |key: &str| {
+        body["library"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| format!("{}:{}", t["type"].as_str().unwrap(), t["id"]) == key)
+            .and_then(|t| t["weight"].as_f64())
+    };
+    assert_eq!(weight("movie:550"), Some(0.6), "watchlisted");
+    assert_eq!(weight("series:1399"), Some(1.0), "watched");
+    assert_eq!(weight("movie:680"), Some(1.0), "part-watched");
+    assert!(body["library"].as_array().unwrap().iter().all(|t| t["at"].as_u64().is_some()));
+    // Taste is the recent library (180 days, as Den Web has it): a play with no date is held but says nothing now.
+    let dated = ["movie:550", "movie:603", "movie:680", "series:1396", "series:1399"];
+    let still_recent = unix_now() * 1000 <= 1_789_982_000_000 + 180 * 86_400_000;
+    assert_eq!(refs(&body["library"]).len(), if still_recent { dated.len() } else { 6 });
+    assert!(dated.iter().all(|d| refs(&body["library"]).contains(&d.to_string())));
+}
+
+#[tokio::test]
+async fn the_watchlist_is_left_out_unless_asked_for_and_the_type_picks_the_surface() {
+    let (edge, _) = stub_edge_with(dropbox_answer(), queued(), projection_answer()).await;
+    let s = reader(&edge).await;
+    let answer = s
+        .tool("den_recommend", json!({ "include_watchlist": true, "type": "series", "limit": 1 }))
+        .await
+        .unwrap();
+    assert_eq!(answer["results"][0]["on_watchlist"], true, "{answer}");
+    let body = &recommend_bodies(&s)[0];
+    assert_eq!(body["surface"], "series");
+    assert_eq!(
+        refs(&body["owned"]),
+        ["movie:27205", "movie:603", "movie:680", "series:1396", "series:1399"],
+        "the watchlist may be shown"
+    );
+    assert!(refs(&body["library"]).len() >= 5, "but it still says what the household likes");
+
+    s.tool("den_recommend", json!({ "type": "movie" })).await.unwrap();
+    assert_eq!(recommend_bodies(&s)[1]["surface"], "movies");
+    assert_eq!(recommend_bodies(&s)[1]["owned"].as_array().unwrap().len(), 6);
+    let error = s.tool("den_recommend", json!({ "include_watchlist": "yes" })).await.unwrap_err();
+    assert!(error.contains("include_watchlist"), "{error}");
+    let error = s.tool("den_recommend", json!({ "type": "show" })).await.unwrap_err();
+    assert!(error.contains("movie, series or all"), "{error}");
+}
+
+#[tokio::test]
+async fn recommendations_page_over_atlas_s_ranking() {
+    let (edge, _) = stub_edge_with(dropbox_answer(), queued(), projection_answer()).await;
+    let s = reader(&edge).await;
+    let ids = |v: &Value| -> Vec<u64> {
+        v["results"].as_array().unwrap().iter().map(|r| r["id"].as_u64().unwrap()).collect()
+    };
+    // Page 1 of 2: atlas is asked for the page and one more, so a next page is known.
+    let page = s.tool("den_recommend", json!({ "page": 1, "limit": 2 })).await.unwrap();
+    assert_eq!(recommend_bodies(&s)[0]["limit"], 5);
+    assert_eq!(
+        (ids(&page), page["more"].clone(), page["page"].clone()),
+        (vec![5002, 5003], json!(true), json!(1))
+    );
+    // A page that takes the whole ranking has no more.
+    let all = s.tool("den_recommend", json!({ "limit": 100 })).await.unwrap();
+    assert_eq!(all["results"].as_array().unwrap().len(), 40);
+    assert_eq!(all["more"], false);
+    assert_eq!(recommend_bodies(&s)[1]["limit"], 101);
+    // Atlas ranks at most 300: past them there is nothing to ask.
+    let beyond = s.tool("den_recommend", json!({ "page": 150, "limit": 2 })).await.unwrap();
+    assert_eq!((beyond["results"].as_array().unwrap().len(), beyond["more"].clone()), (0, json!(false)));
+    assert!(beyond["note"].as_str().unwrap().contains("300"));
+    assert_eq!(recommend_bodies(&s).len(), 2, "no question was asked");
+    // Only the page's titles were named.
+    let asked = s.asked.lock().unwrap().iter().filter(|a| a.starts_with("/index/title/")).count();
+    assert!(asked <= 2 + 40, "{asked}");
+}
+
+#[tokio::test]
+async fn rating_is_described_in_the_words_the_ui_uses() {
+    let (edge, _) = stub_edge_with(dropbox_answer(), queued(), projection_answer()).await;
+    let s = granted(&edge);
+    let listed = s.rpc("tools/list", json!({})).await;
+    let rate = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "den_rate")
+        .unwrap()
+        .clone();
+    let description = rate["description"].as_str().unwrap();
+    for said in ["Not for me", "not interested", "stop suggesting", "dislike"] {
+        assert!(description.contains(said), "{said}: {description}");
+    }
+    assert!(rate["inputSchema"]["properties"]["value"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("Not for me"));
+    assert!(description.len() < 800);
 }
 
 #[test]
