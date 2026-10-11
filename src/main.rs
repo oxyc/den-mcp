@@ -42,6 +42,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 
+/// The release carried by the runtime image (`DEN_VERSION`, set from the VERSION file at image build). Keeping it out
+/// of Cargo.toml means a release does not invalidate the cached dependency build merely to change its tag.
+/// Developer builds and tests have no image metadata, so they report the package version.
+pub(crate) fn release_version() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            std::env::var("DEN_VERSION")
+                .ok()
+                .filter(|version| !version.is_empty())
+                .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
+        })
+        .as_str()
+}
+
 pub struct AppState {
     pub cfg: config::Config,
     pub atlas: atlas::Atlas,
@@ -599,7 +614,7 @@ async fn run(cfg: config::Config) -> std::io::Result<()> {
     eprintln!(
         "den-mcp {} listening on :{} — atlas={} origin={} issuer={} token_keys={} rate={}/min burst={} metrics={} \
          log_requests={} writes={}",
-        env!("CARGO_PKG_VERSION"),
+        release_version(),
         listener.local_addr().map_or(cfg.port, |a| a.port()),
         cfg.atlas.base,
         cfg.public_origin,

@@ -98,7 +98,7 @@ pub fn initialize(params: &Value) -> Value {
     json!({
         "protocolVersion": version,
         "capabilities": { "tools": { "listChanged": false } },
-        "serverInfo": { "name": "den-mcp", "title": "Den", "version": env!("CARGO_PKG_VERSION") },
+        "serverInfo": { "name": "den-mcp", "title": "Den", "version": crate::release_version() },
         "instructions": INSTRUCTIONS,
     })
 }

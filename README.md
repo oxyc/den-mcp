@@ -250,4 +250,12 @@ cargo run --example mint -- http://localhost:8096   # a dev key and a 15-minute 
 ATLAS_URL=http://<atlas> PUBLIC_ORIGIN=http://localhost:8096 TOKEN_PUBLIC_KEYS=<key> cargo run
 ```
 
-Releases: `scripts/release.sh X.Y.Z` — the fleet's script, which checks, bumps, tags, and waits for the signed image.
+Releases: `scripts/release.sh X.Y.Z`. It changes only `VERSION`, pushes that commit, waits for its exact main CI, then
+creates `vX.Y.Z` and waits for the signed image. Do not bump `Cargo.toml`: the image supplies `DEN_VERSION` at run
+time (startup line, `initialize`'s `serverInfo`, `mcp_build_info`), so a release reuses the cached Rust build.
+
+Main CI is the release gate and artifact producer: it tests, builds, probes (`scripts/probe-image.sh` starts the image
+and reads its version from `/metrics`), scans, and records an immutable `candidate-<sha>` digest. A tag only verifies
+and promotes that digest (sign, version tags, `:latest`) in `docker-publish`; it never rebuilds. A failed main run
+creates no tag and cannot move `:latest`. The Monday/manual run still rebuilds the newest tag with no cache, scans it
+(OS packages gate), signs it and moves `:latest`.
