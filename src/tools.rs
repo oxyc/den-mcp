@@ -130,8 +130,8 @@ pub(crate) fn bad(message: impl Into<String>) -> ToolError {
     ToolError(message.into())
 }
 
-/// The tools, as `tools/list` names them; the write tools only with `writes`.
-pub fn list(writes: bool) -> Value {
+/// The tools, as `tools/list` names them; the write tools only with `writes`, the read tools only with `reads`.
+pub fn list(writes: bool, reads: bool) -> Value {
     let title_ref = json!({
         "type": "object",
         "properties": {
@@ -379,6 +379,12 @@ pub fn list(writes: bool) -> Value {
             .expect("a list")
             .extend(crate::writes::list().as_array().cloned().unwrap_or_default());
     }
+    if reads {
+        tools
+            .as_array_mut()
+            .expect("a list")
+            .extend(crate::reads::list().as_array().cloned().unwrap_or_default());
+    }
     for tool in tools.as_array_mut().into_iter().flatten() {
         let schema = output_schema(tool["name"].as_str().unwrap_or(""));
         tool["outputSchema"] = schema;
@@ -468,6 +474,7 @@ pub(crate) fn output_schema(tool: &str) -> Value {
             "required": ["id", "title", "text", "url"],
         }),
         t if crate::writes::TOOLS.iter().any(|(name, _)| *name == t) => crate::writes::output_schema(),
+        t if crate::reads::TOOLS.contains(&t) => crate::reads::output_schema(),
         _ => json!({ "type": "object" }),
     }
 }
@@ -487,6 +494,10 @@ pub async fn call(ctx: &Ctx<'_>, name: &str, args: &Value) -> Option<Answer> {
         write if crate::writes::TOOLS.iter().any(|(name, _)| *name == write) => {
             let writes = ctx.writes?;
             writes.call(ctx.caller, write, args, ctx.cfg.log_requests).await
+        }
+        read if crate::reads::TOOLS.contains(&read) => {
+            let writes = ctx.writes?;
+            crate::reads::call(ctx, writes, read, args).await
         }
         _ => return None,
     };
@@ -774,7 +785,7 @@ fn guard(answer: Value) -> Answer {
 
 // ---- arguments
 
-fn string<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, ToolError> {
+pub(crate) fn string<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, ToolError> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.trim()).filter(|s| !s.is_empty())),
@@ -809,7 +820,7 @@ fn scope(args: &Value) -> Result<Scope, ToolError> {
 }
 
 /// The page and its size, as atlas takes them.
-fn paging(args: &Value, default: usize) -> Result<(usize, usize), ToolError> {
+pub(crate) fn paging(args: &Value, default: usize) -> Result<(usize, usize), ToolError> {
     let page = integer(args, "page")?.unwrap_or(0);
     let limit = integer(args, "limit")?.unwrap_or(default as i64);
     if page < 0 || limit < 1 {
@@ -1029,7 +1040,7 @@ pub fn slug(name: &str) -> String {
     cut.rfind('-').map_or(cut, |i| &cut[..i]).trim_end_matches('-').to_owned()
 }
 
-fn title_url(cfg: &Config, kind: &str, id: u64, name: Option<&str>) -> String {
+pub(crate) fn title_url(cfg: &Config, kind: &str, id: u64, name: Option<&str>) -> String {
     let path = if kind == "series" { "tv" } else { "movie" };
     match name.map(slug).filter(|s| !s.is_empty()) {
         Some(s) => format!("{}/{path}/{id}-{s}", cfg.web_origin),
@@ -1047,7 +1058,7 @@ fn person_url(cfg: &Config, tmdb: Option<u64>, name: Option<&str>) -> Option<Str
 }
 
 /// A card as a result: its type, id, name, year, Den's primary genre, original language and Den Web link.
-fn title(cfg: &Config, card: &Value) -> Option<Value> {
+pub(crate) fn title(cfg: &Config, card: &Value) -> Option<Value> {
     let kind = card.get("type")?.as_str().filter(|t| matches!(*t, "movie" | "series"))?;
     let id = card.get("id")?.as_u64()?;
     let name = card.get("title").and_then(Value::as_str);

@@ -18,6 +18,7 @@ mod metrics;
 mod names;
 mod names_table;
 pub mod open_facets;
+mod reads;
 mod sel;
 mod tools;
 mod writes;
@@ -245,8 +246,11 @@ fn health(state: &AppState) -> Value {
 
 /// RFC 9728: this resource, and den-edge as the authorization server that issues its tokens.
 fn resource_metadata(state: &AppState) -> Value {
-    let scopes =
-        if state.writes.is_some() { json!([auth::SCOPE, auth::WRITE_SCOPE]) } else { json!([auth::SCOPE]) };
+    let scopes = if state.writes.is_some() {
+        json!([auth::SCOPE, auth::WRITE_SCOPE, auth::READ_SCOPE])
+    } else {
+        json!([auth::SCOPE])
+    };
     json!({
         "resource": state.cfg.resource(),
         "authorization_servers": [state.cfg.issuer],
@@ -413,6 +417,7 @@ fn known_tool(name: &str, writes: bool) -> Option<&'static str> {
     ]
     .into_iter()
     .chain(writes.then(|| writes::TOOLS.map(|(tool, _)| tool)).into_iter().flatten())
+    .chain(writes.then_some(reads::TOOLS).into_iter().flatten())
     .find(|t| *t == name)
 }
 
@@ -427,10 +432,11 @@ async fn answer(
     let reply = match method {
         "initialize" => mcp::result(id, mcp::initialize(params)),
         "ping" => mcp::result(id, json!({})),
-        // The write tools only for a token that carries the write scope and a grant claim this server opens.
+        // The write and read tools only for a token that carries the scope and a claim this server opens.
         "tools/list" => {
             let writes = state.writes.as_ref().is_some_and(|w| w.can_write(caller));
-            mcp::result(id, json!({ "tools": tools::list(writes) }))
+            let reads = state.writes.as_ref().is_some_and(|w| w.can_read(caller));
+            mcp::result(id, json!({ "tools": tools::list(writes, reads) }))
         }
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");

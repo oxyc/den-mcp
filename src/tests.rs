@@ -95,6 +95,16 @@ fn canned(path: &str) -> Option<Value> {
                         "labels": { "scandinavian": "Scandinavian", "nordic": "Nordic" }, "complete": true },
             "language": { "values": { "sv": 3, "en": 30 }, "complete": true },
             "person": { "values": { "Q1": 3 }, "labels": { "Q1": "Ann Actor" }, "complete": false } } })
+    } else if path == "/index/title/movie/550.json" || path == "/index/title/series/1399.json" {
+        let (kind, id, name, year) = if path.contains("movie") {
+            ("movie", 550, "Fight Club", 1999)
+        } else {
+            ("series", 1399, "Game of Thrones", 2011)
+        };
+        let mut title = card(kind, id, name, year);
+        title["indexed"] = json!(true);
+        title["posterPath"] = json!("/p.jpg");
+        title
     } else if path == "/index/title/movie/949.json" {
         let mut title = card("movie", 949, "Heat", 1995);
         title["indexed"] = json!(true);
@@ -1107,6 +1117,15 @@ type EdgeLog = Arc<Mutex<Vec<(String, String, String, String)>>>;
 
 /// A stand-in for den-edge's `/assistant/dropbox` and `/assistant/append`, answering as told.
 async fn stub_edge(dropbox: (u16, Value), append: (u16, Value)) -> (String, EdgeLog) {
+    stub_edge_with(dropbox, append, (404, json!({ "error": "no_projection" }))).await
+}
+
+/// The same, also answering `GET /assistant/projection`.
+async fn stub_edge_with(
+    dropbox: (u16, Value),
+    append: (u16, Value),
+    projection: (u16, Value),
+) -> (String, EdgeLog) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let log: EdgeLog = Arc::default();
@@ -1114,16 +1133,22 @@ async fn stub_edge(dropbox: (u16, Value), append: (u16, Value)) -> (String, Edge
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
-            let (seen, dropbox, append) = (seen.clone(), dropbox.clone(), append.clone());
+            let (seen, dropbox, append, projection) =
+                (seen.clone(), dropbox.clone(), append.clone(), projection.clone());
             let service = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
-                let (seen, dropbox, append) = (seen.clone(), dropbox.clone(), append.clone());
+                let (seen, dropbox, append, projection) =
+                    (seen.clone(), dropbox.clone(), append.clone(), projection.clone());
                 async move {
                     let (parts, body) = req.into_parts();
                     let body = String::from_utf8(body.collect().await.unwrap().to_bytes().to_vec()).unwrap();
                     let authorization = parts.headers["authorization"].to_str().unwrap().to_owned();
                     let path = parts.uri.path().to_owned();
                     seen.lock().unwrap().push((parts.method.to_string(), path.clone(), authorization, body));
-                    let (status, answer) = if path == "/assistant/dropbox" { dropbox } else { append };
+                    let (status, answer) = match path.as_str() {
+                        "/assistant/dropbox" => dropbox,
+                        "/assistant/projection" => projection,
+                        _ => append,
+                    };
                     Ok::<_, std::convert::Infallible>(
                         hyper::Response::builder()
                             .status(status)
@@ -1319,7 +1344,10 @@ async fn without_the_key_no_write_tool_exists() {
     // And with the key, the scope is offered.
     let (edge, _) = stub_edge(dropbox_answer(), queued()).await;
     let (_, _, metadata) = granted(&edge).send("GET", "/.well-known/oauth-protected-resource", "", &[]).await;
-    assert!(metadata.contains(r#""scopes_supported":["den:search","den:library.write"]"#), "{metadata}");
+    assert!(
+        metadata.contains(r#""scopes_supported":["den:search","den:library.write","den:library.read"]"#),
+        "{metadata}"
+    );
 }
 
 #[tokio::test]
@@ -1406,6 +1434,235 @@ async fn arguments_are_checked_before_anything_is_sealed() {
         assert!(error.contains(said), "{tool}: {error}");
     }
     assert!(log.lock().unwrap().is_empty());
+}
+
+// ---- library reads (den-spec wire/assistant-v1.md §15)
+
+fn projection_answer() -> (u16, Value) {
+    let f = fixed();
+    (
+        200,
+        json!({ "library": f["library"], "grant": f["grant"]["id"], "sealed": f["read"]["projection"]["sealed"],
+                "storedAt": 1_790_000_001_000u64 }),
+    )
+}
+
+/// A server with den-mcp's token key, calling `edge` and the stub atlas; its bearer is a token for the vectors'
+/// session with `scope` and, when given, the vectors' `dr`.
+async fn read_server(edge: &str, scope: &str, dr: Option<&str>) -> Server {
+    let (atlas, asked) = stub_atlas().await;
+    let f = fixed();
+    let cfg = crate::config::Config {
+        write: Some(crate::config::Write { key: seed(&f["mcp"]), edge: edge.to_owned() }),
+        ..config(atlas)
+    };
+    let mut s = Server::with(cfg, asked);
+    assert!(s.state.atlas.refresh_tmdb_kinds(None).await);
+    let mut c = claims(unix_now());
+    c["sub"] = f["sub"].clone();
+    c["scope"] = scope.into();
+    if let Some(dr) = dr {
+        c["dr"] = dr.into();
+    }
+    s.bearer = format!("Bearer {}", token(&key(), &c));
+    s
+}
+
+async fn reader(edge: &str) -> Server {
+    read_server(edge, "den:search den:library.read", fixed()["read"]["claim"].as_str()).await
+}
+
+#[test]
+fn the_vectors_read_claim_and_projection_open_only_for_their_own() {
+    let f = fixed();
+    let secret = seed(&f["mcp"]);
+    let (sub, claim) = (f["sub"].as_str().unwrap(), f["read"]["claim"].as_str().unwrap());
+    let read = den_assistant::open_read_claim(&secret, sub, claim).unwrap();
+    assert_eq!(read.grant(), f["grant"]["id"]);
+    assert_eq!(
+        read.key().to_vec(),
+        den_assistant::b64url_decode(f["read"]["readKey"].as_str().unwrap()).unwrap()
+    );
+    assert!(den_assistant::open_read_claim(&secret, "00000000000000000000000000000000", claim).is_err());
+    assert!(
+        den_assistant::open_read_claim(&secret, sub, f["claim"].as_str().unwrap()).is_err(),
+        "dw is not dr"
+    );
+
+    let (library, grant) = (f["library"].as_str().unwrap(), f["grant"]["id"].as_str().unwrap());
+    let sealed = f["read"]["projection"]["sealed"].as_str().unwrap();
+    let opened = den_assistant::open_projection(read.key(), library, grant, sealed).unwrap();
+    assert_eq!(opened, f["read"]["projection"]["plaintext"]);
+    assert!(den_assistant::open_projection(read.key(), "0".repeat(32).as_str(), grant, sealed).is_err());
+    assert!(den_assistant::open_projection(read.key(), library, "0".repeat(32).as_str(), sealed).is_err());
+    assert!(den_assistant::open_projection(&[0; 32], library, grant, sealed).is_err());
+}
+
+#[tokio::test]
+async fn the_lists_are_named_through_atlas_dated_and_say_how_fresh_they_are() {
+    let (edge, log) = stub_edge_with(dropbox_answer(), queued(), projection_answer()).await;
+    let s = reader(&edge).await;
+    let listed = s.rpc("tools/list", json!({})).await;
+    let names: Vec<&str> =
+        listed["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(&names[9..], ["den_watchlist", "den_continue_watching", "den_history"], "reads only");
+    for tool in &listed["result"]["tools"].as_array().unwrap()[9..] {
+        assert_eq!(tool["annotations"]["readOnlyHint"], true);
+        assert_eq!(tool["annotations"]["idempotentHint"], true);
+    }
+
+    let watchlist = s.tool("den_watchlist", json!({})).await.unwrap();
+    assert_eq!(watchlist["as_of"], "2026-09-21T14:13:20Z");
+    assert_eq!((watchlist["total"].clone(), watchlist["more"].clone()), (json!(1), json!(false)));
+    let film = &watchlist["results"][0];
+    assert_eq!(
+        (film["type"].clone(), film["id"].clone(), film["title"].clone()),
+        (json!("movie"), json!(550), json!("Fight Club"))
+    );
+    assert_eq!(film["year"], 1999);
+    assert_eq!(film["url"], "https://den.example/movie/550-fight-club");
+    assert_eq!(film["added"], "2026-09-21T04:13:20Z");
+    let note = watchlist["note"].as_str().unwrap();
+    assert!(note.contains("As of 2026-09-21T14:13:20Z") && note.contains("TV or Den Web"), "{note}");
+
+    let next = s.tool("den_continue_watching", json!({})).await.unwrap();
+    let results = next["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3);
+    let show = &results[0];
+    assert_eq!(
+        (show["type"].clone(), show["id"].clone(), show["title"].clone()),
+        (json!("series"), json!(1399), json!("Game of Thrones"))
+    );
+    assert_eq!(
+        (show["action"].clone(), show["season"].clone(), show["episode"].clone(), show["fraction"].clone()),
+        (json!("resume"), json!(1), json!(2), json!(0.5))
+    );
+    assert_eq!(results[1]["action"], "next");
+    assert!(results[1].get("last_watched").is_none(), "no date, none given");
+    assert_eq!(results[1]["indexed"], false, "a title atlas does not index says so");
+    assert_eq!(results[2]["type"], "movie");
+
+    let history = s.tool("den_history", json!({})).await.unwrap();
+    let seen = history["results"].as_array().unwrap();
+    assert_eq!(seen.len(), 4);
+    assert_eq!((seen[0]["season"].clone(), seen[0]["episode"].clone()), (json!(1), json!(1)));
+    assert!(seen[0]["watched"].as_str().unwrap().starts_with("2026-09-21T"));
+    assert!(seen[3].get("watched").is_none(), "untimed last");
+
+    // Titles are asked of atlas once each however many lists name them, and the projection is the caller's own.
+    let asked = s.asked.lock().unwrap().clone();
+    let by_title = |p: &str| asked.iter().filter(|a| a.as_str() == p).count();
+    assert_eq!(by_title("/index/title/series/1399.json"), 1, "cached by the atlas client");
+    assert!(log
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|c| c.0 == "GET" && c.1 == "/assistant/projection" && c.2 == s.bearer));
+}
+
+#[tokio::test]
+async fn history_is_filtered_and_paged_and_says_when_there_is_more() {
+    let (edge, _) = stub_edge_with(dropbox_answer(), queued(), projection_answer()).await;
+    let s = reader(&edge).await;
+    let ids = |v: &Value| -> Vec<u64> {
+        v["results"].as_array().unwrap().iter().map(|r| r["id"].as_u64().unwrap()).collect()
+    };
+
+    let first = s.tool("den_history", json!({ "limit": 1 })).await.unwrap();
+    assert_eq!(
+        (first["total"].clone(), first["more"].clone(), first["page"].clone()),
+        (json!(4), json!(true), json!(0))
+    );
+    assert_eq!(ids(&first), [1396]);
+    let last = s.tool("den_history", json!({ "limit": 1, "page": 3 })).await.unwrap();
+    assert_eq!((ids(&last), last["more"].clone()), (vec![27205], json!(false)));
+
+    let series = s.tool("den_history", json!({ "type": "series" })).await.unwrap();
+    assert_eq!(ids(&series), [1396, 1399]);
+    let films = s.tool("den_history", json!({ "type": "movie" })).await.unwrap();
+    assert_eq!(ids(&films), [603, 27205]);
+
+    // 1789982000, 1789974800, 1789967600 s are 09:13, 07:13 and 05:13 UTC on 2026-09-21.
+    let later = s.tool("den_history", json!({ "since": "2026-09-21T08:00:00Z" })).await.unwrap();
+    assert_eq!(ids(&later), [1396]);
+    assert!(later["note"].as_str().unwrap().contains("no date were left out"), "{}", later["note"]);
+    let earlier = s.tool("den_history", json!({ "until": "2026-09-21T06:00:00Z" })).await.unwrap();
+    assert_eq!(ids(&earlier), [603]);
+    let day = s
+        .tool("den_history", json!({ "since": "2026-09-21", "until": "2026-09-21T23:59:59Z" }))
+        .await
+        .unwrap();
+    assert_eq!(ids(&day), [1396, 1399, 603]);
+    assert_eq!(day["total"], 3);
+}
+
+#[tokio::test]
+async fn bad_read_arguments_are_refused_before_den_edge_is_asked() {
+    let (edge, log) = stub_edge_with(dropbox_answer(), queued(), projection_answer()).await;
+    let s = reader(&edge).await;
+    for (arguments, said) in [
+        (json!({ "type": "show" }), "movie, series or all"),
+        (json!({ "since": "yesterday" }), "UTC date"),
+        (json!({ "since": "2026-09-22", "until": "2026-09-21" }), "since is after until"),
+        (json!({ "page": -1 }), "page is 0 or more"),
+        (json!({ "limit": 0 }), "limit 1 or more"),
+    ] {
+        let error = s.tool("den_history", arguments).await.unwrap_err();
+        assert!(error.contains(said), "{error}");
+    }
+    assert!(log.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_connection_that_cannot_read_is_told_so_and_den_edge_is_not_called() {
+    let f = fixed();
+    let (edge, log) = stub_edge_with(dropbox_answer(), queued(), projection_answer()).await;
+    let claim = f["read"]["claim"].as_str().unwrap();
+    let no_scope = read_server(&edge, "den:search", Some(claim)).await;
+    let no_claim = read_server(&edge, "den:search den:library.read", None).await;
+    let garbage = read_server(&edge, "den:search den:library.read", Some("AAAA")).await;
+    // A write claim is not a read claim, and a read claim is bound to its own session.
+    let wrong_kind = read_server(&edge, "den:search den:library.read", f["claim"].as_str()).await;
+    let mut other = read_server(&edge, "den:search den:library.read", Some(claim)).await;
+    let mut c = claims(unix_now());
+    c["scope"] = "den:search den:library.read".into();
+    c["dr"] = claim.into();
+    c["sub"] = "someone-else".into();
+    other.bearer = format!("Bearer {}", token(&key(), &c));
+    for s in [no_scope, no_claim, garbage, wrong_kind, other] {
+        let listed = s.rpc("tools/list", json!({})).await;
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 9, "no read tool is listed");
+        let error = s.tool("den_watchlist", json!({})).await.unwrap_err();
+        assert!(error.contains("can't read your lists") && error.contains("allow reading"), "{error}");
+    }
+    assert!(log.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn what_den_edge_answers_instead_of_a_projection_is_said_in_plain_words() {
+    let f = fixed();
+    let (library, grant, sealed) = (&f["library"], &f["grant"]["id"], &f["read"]["projection"]["sealed"]);
+    let answers = [
+        ((404, json!({ "error": "no_projection" })), "hasn't shared your lists yet"),
+        ((401, json!({ "error": "invalid_token" })), "reconnect Den"),
+        ((403, json!({ "error": "insufficient_scope" })), "allow reading"),
+        ((500, json!({ "error": "oops" })), "try again later"),
+        // Someone else's grant, another library's projection, and bytes that do not open.
+        ((200, json!({ "library": library, "grant": "0".repeat(32), "sealed": sealed })), "allow reading"),
+        (
+            (200, json!({ "library": "f".repeat(32), "grant": grant, "sealed": sealed })),
+            "could not read your lists",
+        ),
+        ((200, json!({ "library": library, "grant": grant, "sealed": "AAAA" })), "could not read your lists"),
+        ((200, json!({ "library": library })), "try again later"),
+    ];
+    for (projection, said) in answers {
+        let (edge, _) = stub_edge_with(dropbox_answer(), queued(), projection).await;
+        let error = reader(&edge).await.tool("den_continue_watching", json!({})).await.unwrap_err();
+        assert!(error.contains(said), "{error} should say {said}");
+    }
+    let error = reader("http://127.0.0.1:1").await.tool("den_watchlist", json!({})).await.unwrap_err();
+    assert!(error.contains("could not reach"), "{error}");
 }
 
 #[test]

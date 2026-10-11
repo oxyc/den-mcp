@@ -17,6 +17,8 @@ const LEEWAY_SECS: u64 = 30;
 pub const SCOPE: &str = "den:search";
 /// The scope of a session whose person allowed assistant changes to the library (den-spec `wire/assistant-v1.md`).
 pub const WRITE_SCOPE: &str = "den:library.write";
+/// The scope of a session whose person allowed an assistant to read the watchlist and history (§15).
+pub const READ_SCOPE: &str = "den:library.read";
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
@@ -75,20 +77,22 @@ pub struct Caller {
     /// `member` or `guest`, for the log and the metrics.
     pub kind: String,
     /// What a write needs, when the token carries the write scope and a `dw` claim.
-    pub write: Option<WriteAccess>,
+    pub write: Option<Access>,
+    /// What a read needs, when the token carries the read scope and a `dr` claim.
+    pub read: Option<Access>,
 }
 
-/// The token's write access: the sealed grant key (opened only for a write, with this server's key, and never
+/// The token's write or read access: the sealed key (opened only for a call, with this server's key, and never
 /// kept) and the token itself, which is the bearer for the calls to den-edge made on its behalf.
 #[derive(Clone, PartialEq)]
-pub struct WriteAccess {
+pub struct Access {
     pub claim: String,
     pub token: String,
 }
 
-impl std::fmt::Debug for WriteAccess {
+impl std::fmt::Debug for Access {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("WriteAccess(..)")
+        f.write_str("Access(..)")
     }
 }
 
@@ -233,12 +237,15 @@ fn check(
         Some("guest") => "guest",
         _ => "member",
     };
-    // The spec's `dw` is 1,579 characters; a longer one is not den-edge's.
-    let write = has(WRITE_SCOPE)
-        .then(|| claims.get("dw").and_then(Value::as_str).filter(|dw| dw.len() <= 2048))
-        .flatten()
-        .map(|dw| WriteAccess { claim: dw.to_owned(), token: token.to_owned() });
-    Ok((Caller { session: session.to_owned(), kind: kind.to_owned(), write }, exp))
+    // The spec's `dw` and `dr` are 1,579 characters each; a longer one is not den-edge's.
+    let access = |scope: &str, claim: &str| {
+        has(scope)
+            .then(|| claims.get(claim).and_then(Value::as_str).filter(|c| c.len() <= 2048))
+            .flatten()
+            .map(|c| Access { claim: c.to_owned(), token: token.to_owned() })
+    };
+    let (write, read) = (access(WRITE_SCOPE, "dw"), access(READ_SCOPE, "dr"));
+    Ok((Caller { session: session.to_owned(), kind: kind.to_owned(), write, read }, exp))
 }
 
 /// A token bucket per session: `burst` calls at once, refilled at `per_minute`.
@@ -325,7 +332,7 @@ pub mod tests {
     fn a_token_den_edge_signed_is_the_session_it_names() {
         let now = 1_800_000_000;
         let caller = check(&token(&key(), &claims(now)), now).unwrap();
-        assert_eq!(caller, Caller { session: "s1".into(), kind: "guest".into(), write: None });
+        assert_eq!(caller, Caller { session: "s1".into(), kind: "guest".into(), write: None, read: None });
     }
 
     #[test]
@@ -406,7 +413,12 @@ pub mod tests {
         let caller = check(SIGNED, 1_800_000_100).unwrap();
         assert_eq!(
             caller,
-            Caller { session: "0123456789abcdef0123456789abcdef".into(), kind: "guest".into(), write: None }
+            Caller {
+                session: "0123456789abcdef0123456789abcdef".into(),
+                kind: "guest".into(),
+                write: None,
+                read: None
+            }
         );
         assert_eq!(check(SIGNED, 1_800_000_900 + 31), Err(Refused::Invalid("expired")));
     }

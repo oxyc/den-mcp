@@ -51,16 +51,16 @@ struct Dropbox {
 }
 
 pub struct Writes {
-    secret: [u8; 32],
+    pub(crate) secret: [u8; 32],
     edge: String,
     client: Client<HttpConnector, Full<Bytes>>,
     dropboxes: Mutex<HashMap<String, (Dropbox, Instant)>>,
 }
 
 /// Why a change was not queued: a short code for the log and the words the model is told.
-struct Refused(&'static str, String);
+pub(crate) struct Refused(pub &'static str, pub String);
 
-fn refuse(code: &'static str, message: &str) -> Refused {
+pub(crate) fn refuse(code: &'static str, message: &str) -> Refused {
     Refused(code, message.to_owned())
 }
 
@@ -122,7 +122,13 @@ impl Writes {
             .map_err(|_| refuse("not_sealed", "Den could not prepare that change."))?;
         drop(key);
         let (status, answer) = self
-            .edge_call("POST", "/assistant/append", &grant.token, Some(json!({ "sealed": sealed })))
+            .edge_call(
+                "POST",
+                "/assistant/append",
+                &grant.token,
+                Some(json!({ "sealed": sealed })),
+                MAX_ANSWER,
+            )
             .await?;
         match (status.as_u16(), error_code(&answer)) {
             (200, _) => Ok(json!({ "queued": true, "id": id, "note": QUEUED_NOTE })),
@@ -151,7 +157,7 @@ impl Writes {
                 return Ok(dropbox.clone());
             }
         }
-        let (status, answer) = self.edge_call("GET", "/assistant/dropbox", token, None).await?;
+        let (status, answer) = self.edge_call("GET", "/assistant/dropbox", token, None, MAX_ANSWER).await?;
         let dropbox = match status.as_u16() {
             200 => parse_dropbox(&answer).ok_or_else(|| {
                 refuse("edge_error", "Den could not queue that change right now; try again later.")
@@ -193,12 +199,13 @@ impl Writes {
     }
 
     /// One JSON exchange with den-edge as the caller, the access token as its bearer.
-    async fn edge_call(
+    pub(crate) async fn edge_call(
         &self,
         method: &str,
         path: &str,
         token: &str,
         body: Option<Value>,
+        max_answer: usize,
     ) -> Result<(StatusCode, Value), Refused> {
         let unreachable = |why: String| {
             eprintln!("den-edge: {why}");
@@ -221,7 +228,7 @@ impl Writes {
             let resp = self.client.request(req).await.map_err(|e| format!("unreachable: {e}"))?;
             let (parts, body) = resp.into_parts();
             let body =
-                Limited::new(body, MAX_ANSWER).collect().await.map_err(|e| format!("unreadable: {e}"))?;
+                Limited::new(body, max_answer).collect().await.map_err(|e| format!("unreadable: {e}"))?;
             Ok::<_, String>((parts.status, body.to_bytes()))
         };
         let (status, body) = tokio::time::timeout(EDGE_TIMEOUT, exchange)
@@ -233,7 +240,7 @@ impl Writes {
 }
 
 /// den-edge's `{"error": "<code>"}`.
-fn error_code(answer: &Value) -> Option<&str> {
+pub(crate) fn error_code(answer: &Value) -> Option<&str> {
     answer.get("error").and_then(Value::as_str)
 }
 

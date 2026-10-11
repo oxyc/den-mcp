@@ -179,7 +179,7 @@ dependencies = [
 [[package]]
 name = "den-assistant"
 version = "0.1.0"
-source = "git+https://github.com/oxyc/den-core.git?tag=den-assistant-v1.1#fd397557fbe1e17c994bf70f871692fee1a209a5"
+source = "git+https://github.com/oxyc/den-core.git?tag=den-assistant-v1.2#7c17954a2b17d0f6b011d229768a7c6edf11d3c1"
 dependencies = [
  "aes-gcm",
  "ed25519-dalek",
