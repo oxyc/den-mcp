@@ -35,6 +35,8 @@ pub struct Write {
     pub key: [u8; 32],
     /// den-edge, plain HTTP on den.network: `http://host:port`, no trailing slash.
     pub edge: String,
+    /// How long a play request waits to see whether the TV took it (den-spec §16).
+    pub tv_wait: Duration,
 }
 
 pub struct OpenFacets {
@@ -159,7 +161,7 @@ impl Config {
                 let edge = origin(&edge)
                     .filter(|o| o.starts_with("http://"))
                     .ok_or("EDGE_URL must be a bare http:// origin on den.network")?;
-                Some(Write { key, edge })
+                Some(Write { key, edge, tv_wait: Duration::from_secs(8) })
             }
         };
         Ok(Config {

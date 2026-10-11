@@ -1157,28 +1157,55 @@ async fn stub_edge_with(
     append: (u16, Value),
     projection: (u16, Value),
 ) -> (String, EdgeLog) {
+    stub_edge_all(EdgeAnswers {
+        dropbox,
+        append,
+        projection,
+        tv: (200, json!({ "online": true, "lastSeenAt": 1_790_000_000_000u64 })),
+        requests: vec![(200, json!({ "state": "taken" }))],
+    })
+    .await
+}
+
+/// Everything the stand-in den-edge answers. `requests` is `GET /assistant/request/{seq}`'s answers in turn, the
+/// last repeating.
+#[derive(Clone)]
+struct EdgeAnswers {
+    dropbox: (u16, Value),
+    append: (u16, Value),
+    projection: (u16, Value),
+    tv: (u16, Value),
+    requests: Vec<(u16, Value)>,
+}
+
+async fn stub_edge_all(answers: EdgeAnswers) -> (String, EdgeLog) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let log: EdgeLog = Arc::default();
     let seen = log.clone();
+    let polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
-            let (seen, dropbox, append, projection) =
-                (seen.clone(), dropbox.clone(), append.clone(), projection.clone());
+            let (seen, answers, polled) = (seen.clone(), answers.clone(), polled.clone());
             let service = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
-                let (seen, dropbox, append, projection) =
-                    (seen.clone(), dropbox.clone(), append.clone(), projection.clone());
+                let (seen, answers, polled) = (seen.clone(), answers.clone(), polled.clone());
                 async move {
                     let (parts, body) = req.into_parts();
                     let body = String::from_utf8(body.collect().await.unwrap().to_bytes().to_vec()).unwrap();
                     let authorization = parts.headers["authorization"].to_str().unwrap().to_owned();
                     let path = parts.uri.path().to_owned();
-                    seen.lock().unwrap().push((parts.method.to_string(), path.clone(), authorization, body));
+                    let with_query = parts.uri.path_and_query().unwrap().to_string();
+                    seen.lock().unwrap().push((parts.method.to_string(), with_query, authorization, body));
                     let (status, answer) = match path.as_str() {
-                        "/assistant/dropbox" => dropbox,
-                        "/assistant/projection" => projection,
-                        _ => append,
+                        "/assistant/dropbox" => answers.dropbox,
+                        "/assistant/projection" => answers.projection,
+                        "/assistant/tv" => answers.tv,
+                        p if p.starts_with("/assistant/request/") => {
+                            let n = polled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            answers.requests[n.min(answers.requests.len() - 1)].clone()
+                        }
+                        _ => answers.append,
                     };
                     Ok::<_, std::convert::Infallible>(
                         hyper::Response::builder()
@@ -1212,7 +1239,11 @@ fn queued() -> (u16, Value) {
 fn write_server(edge: &str, scope: &str, dw: Option<&str>) -> Server {
     let f = fixed();
     let cfg = crate::config::Config {
-        write: Some(crate::config::Write { key: seed(&f["mcp"]), edge: edge.to_owned() }),
+        write: Some(crate::config::Write {
+            key: seed(&f["mcp"]),
+            edge: edge.to_owned(),
+            tv_wait: std::time::Duration::from_millis(1500),
+        }),
         ..config("http://127.0.0.1:1".into())
     };
     let mut s = Server::with(cfg, Asked::default());
@@ -1233,6 +1264,11 @@ fn granted(edge: &str) -> Server {
 /// A device's view of the queued request: it opens with the library's drop-box key and is checked against a grant
 /// that allows every op, at the time den-mcp stamped it.
 fn device_accepts(sealed: &str) -> den_assistant::Accepted {
+    device_accepts_from(sealed, den_assistant::Queue::Library)
+}
+
+/// The same for a request drained from `queue`, with the TV awake since a minute ago.
+fn device_accepts_from(sealed: &str, queue: den_assistant::Queue) -> den_assistant::Accepted {
     let f = fixed();
     let public: [u8; 32] =
         den_assistant::b64url_decode(f["grant"]["public"].as_str().unwrap()).unwrap().try_into().unwrap();
@@ -1240,20 +1276,23 @@ fn device_accepts(sealed: &str) -> den_assistant::Accepted {
         f["grant"]["id"].as_str().unwrap().to_owned(),
         den_assistant::Grant {
             public,
-            ops: den_assistant::OPS.map(String::from).to_vec(),
+            ops: den_assistant::GRANT_OPS.map(String::from).to_vec(),
             cap: 100,
             revoked: false,
             expires: u64::MAX,
+            play: true,
         },
     )]);
     let now = unix_now() * 1000;
-    den_assistant::check(
+    den_assistant::check_queue(
         &[seed(&f["dropbox"])],
         f["library"].as_str().unwrap(),
         sealed,
         &grants,
         &std::collections::BTreeMap::new(),
         now,
+        queue,
+        Some(now - 60_000),
     )
     .unwrap()
 }
@@ -1288,10 +1327,18 @@ async fn a_change_is_sealed_to_the_library_and_a_device_accepts_it() {
         listed["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(
         &names[9..],
-        ["den_watchlist_add", "den_watchlist_remove", "den_mark_seen", "den_rate"],
+        [
+            "den_watchlist_add",
+            "den_watchlist_remove",
+            "den_mark_seen",
+            "den_rate",
+            "den_play_on_tv",
+            "den_play_trailer",
+            "den_tv_status"
+        ],
         "the write tools follow the nine read ones"
     );
-    for tool in &listed["result"]["tools"].as_array().unwrap()[9..] {
+    for tool in &listed["result"]["tools"].as_array().unwrap()[9..13] {
         assert_eq!(tool["annotations"]["readOnlyHint"], false);
         assert_eq!(tool["annotations"]["idempotentHint"], true);
         assert_eq!(tool["annotations"]["destructiveHint"], tool["name"] == "den_watchlist_remove", "{tool}");
@@ -1484,7 +1531,11 @@ async fn read_server(edge: &str, scope: &str, dr: Option<&str>) -> Server {
     let (atlas, asked) = stub_atlas().await;
     let f = fixed();
     let cfg = crate::config::Config {
-        write: Some(crate::config::Write { key: seed(&f["mcp"]), edge: edge.to_owned() }),
+        write: Some(crate::config::Write {
+            key: seed(&f["mcp"]),
+            edge: edge.to_owned(),
+            tv_wait: std::time::Duration::from_millis(1500),
+        }),
         ..config(atlas)
     };
     let mut s = Server::with(cfg, asked);
@@ -1580,7 +1631,7 @@ async fn the_lists_are_named_through_atlas_dated_and_say_how_fresh_they_are() {
         listed["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(
         &names[9..],
-        ["den_watchlist", "den_continue_watching", "den_history", "den_recommend"],
+        ["den_watchlist", "den_continue_watching", "den_history", "den_ratings", "den_recommend"],
         "reads only"
     );
     for tool in &listed["result"]["tools"].as_array().unwrap()[9..] {
@@ -1833,7 +1884,12 @@ async fn what_to_watch_is_ranked_by_atlas_against_the_lists_and_names_the_page()
         (json!(1), json!("home"), json!(3))
     );
     assert!(body["now"].as_str().unwrap().ends_with('Z'));
-    assert!(body.get("hide").is_none() && body.get("fresh").is_none() && body.get("candidates").is_none());
+    assert!(body.get("fresh").is_none() && body.get("candidates").is_none());
+    // The household's own hide rules, as Den Web sends them.
+    assert_eq!(
+        body["hide"],
+        json!({ "minYear": 1970, "genres": [27, 16], "languages": ["tr"], "anime": true })
+    );
     let held = ["movie:550", "movie:603", "movie:680", "movie:27205", "series:1396", "series:1399"];
     assert_eq!(refs(&body["owned"]), {
         let mut h = held.map(String::from).to_vec();
@@ -1849,8 +1905,10 @@ async fn what_to_watch_is_ranked_by_atlas_against_the_lists_and_names_the_page()
             .and_then(|t| t["weight"].as_f64())
     };
     assert_eq!(weight("movie:550"), Some(0.6), "watchlisted");
-    assert_eq!(weight("series:1399"), Some(1.0), "watched");
+    assert_eq!(weight("series:1396"), Some(1.0), "watched");
     assert_eq!(weight("movie:680"), Some(1.0), "part-watched");
+    assert_eq!(weight("movie:603"), Some(2.0), "watched and loved: 1 + 1");
+    assert_eq!(weight("series:1399"), Some(-1.5), "watched but Not for me counts against, outright");
     assert!(body["library"].as_array().unwrap().iter().all(|t| t["at"].as_u64().is_some()));
     // Taste is the recent library (180 days, as Den Web has it): a play with no date is held but says nothing now.
     let dated = ["movie:550", "movie:603", "movie:680", "series:1396", "series:1399"];
@@ -1936,6 +1994,259 @@ async fn rating_is_described_in_the_words_the_ui_uses() {
         .unwrap()
         .contains("Not for me"));
     assert!(description.len() < 800);
+}
+
+#[tokio::test]
+async fn ratings_are_listed_by_rating_and_say_not_for_me() {
+    let (edge, _) = stub_edge_with(dropbox_answer(), queued(), projection_answer()).await;
+    let s = reader(&edge).await;
+    let ids = |v: &Value| -> Vec<u64> {
+        v["results"].as_array().unwrap().iter().map(|r| r["id"].as_u64().unwrap()).collect()
+    };
+    let all = s.tool("den_ratings", json!({})).await.unwrap();
+    assert_eq!(
+        (ids(&all), all["total"].clone(), all["as_of"].clone()),
+        (vec![1399, 603, 27205], json!(3), json!("2026-09-21T14:13:20Z"))
+    );
+    let first = &all["results"][0];
+    assert_eq!(
+        (first["reaction"].clone(), first["not_for_me"].clone(), first["title"].clone()),
+        (json!("dislike"), json!(true), json!("Game of Thrones"))
+    );
+    assert_eq!(first["rated_at"], "2026-09-21T10:13:20Z");
+    assert!(all["results"][2].get("rated_at").is_none(), "an import's rating has no time");
+    assert!(all["results"][1].get("not_for_me").is_none());
+
+    let loved = s.tool("den_ratings", json!({ "value": "love" })).await.unwrap();
+    assert_eq!((ids(&loved), loved["results"][0]["reaction"].clone()), (vec![603], json!("love")));
+    for alias in ["dislike", "not_for_me"] {
+        let disliked = s.tool("den_ratings", json!({ "value": alias })).await.unwrap();
+        assert_eq!(ids(&disliked), [1399], "{alias}");
+    }
+    assert_eq!(ids(&s.tool("den_ratings", json!({ "type": "movie" })).await.unwrap()), [603, 27205]);
+    let paged = s.tool("den_ratings", json!({ "limit": 1, "page": 1 })).await.unwrap();
+    assert_eq!((ids(&paged), paged["more"].clone()), (vec![603], json!(true)));
+    let error = s.tool("den_ratings", json!({ "value": "meh" })).await.unwrap_err();
+    assert!(error.contains("Not for me"), "{error}");
+}
+
+/// A server whose projection is this view's, sealed as a device would.
+async fn reader_of(view: Value) -> (Server, EdgeLog) {
+    let f = fixed();
+    let read = den_assistant::open_read_claim(
+        &seed(&f["mcp"]),
+        f["sub"].as_str().unwrap(),
+        f["read"]["claim"].as_str().unwrap(),
+    )
+    .unwrap();
+    let mut view = view;
+    view["v"] = json!(1);
+    view["library"] = f["library"].clone();
+    view["grant"] = f["grant"]["id"].clone();
+    view["at"] = json!(1_790_000_000_000u64);
+    view["head"] = json!(1);
+    let sealed = den_assistant::seal_projection(read.key(), &view, &[3; 32]).unwrap();
+    let answer = (
+        200,
+        json!({ "library": f["library"], "grant": f["grant"]["id"], "set": sealed.set, "parts": sealed.parts,
+                "storedAt": 1u64 }),
+    );
+    let (edge, log) = stub_edge_with(dropbox_answer(), queued(), answer).await;
+    (reader(&edge).await, log)
+}
+
+#[tokio::test]
+async fn a_rating_alone_shapes_the_ranking_and_a_dislike_is_never_shown() {
+    let (s, _) = reader_of(json!({
+        "watchlist": [], "continue": [], "seen": [],
+        "rated": [
+            { "title": { "type": "tv", "id": 5 }, "value": "dislike", "at": 1_789_900_000_000u64 },
+            { "title": { "type": "movie", "id": 6 }, "value": "like", "at": 1_789_900_000_000u64 },
+            { "title": { "type": "movie", "id": 7 }, "value": "love", "at": null },
+        ],
+        "hide": { "minYear": null, "genres": [], "languages": [], "anime": false },
+    }))
+    .await;
+    s.tool("den_recommend", json!({})).await.unwrap();
+    s.tool("den_recommend", json!({ "include_watchlist": true })).await.unwrap();
+    let bodies = recommend_bodies(&s);
+    for body in &bodies {
+        // A rated title is a verdict: held, even with the watchlist allowed.
+        assert_eq!(refs(&body["owned"]), ["movie:6", "movie:7", "series:5"]);
+        assert_eq!(body["hide"], json!({ "minYear": null, "genres": [], "languages": [], "anime": false }));
+    }
+    let weight = |key: &str| {
+        bodies[0]["library"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| format!("{}:{}", t["type"].as_str().unwrap(), t["id"]) == key)
+            .and_then(|t| t["weight"].as_f64())
+    };
+    assert_eq!(weight("series:5"), Some(-1.5), "Not for me");
+    assert_eq!(weight("movie:6"), Some(0.5), "liked, never watched");
+    // An untimed love says nothing of now while there is anything recent.
+    assert_eq!(weight("movie:7"), None);
+}
+
+/// A server whose token may write, calling an edge with these answers.
+async fn tv_server(answers: EdgeAnswers) -> (Server, EdgeLog) {
+    let (edge, log) = stub_edge_all(answers).await;
+    (granted(&edge), log)
+}
+
+fn tv_answers() -> EdgeAnswers {
+    EdgeAnswers {
+        dropbox: dropbox_answer(),
+        append: (200, json!({ "seq": 7, "queued": 1 })),
+        projection: (404, json!({ "error": "no_projection" })),
+        tv: (200, json!({ "online": true, "lastSeenAt": 1_790_000_000_000u64 })),
+        requests: vec![(200, json!({ "state": "queued" })), (200, json!({ "state": "taken" }))],
+    }
+}
+
+fn append_bodies(log: &EdgeLog) -> Vec<Value> {
+    log.lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.1 == "/assistant/append")
+        .map(|c| serde_json::from_str(&c.3).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_play_goes_to_the_tv_queue_and_says_when_the_tv_took_it() {
+    use den_assistant::Queue;
+    let (s, log) = tv_server(tv_answers()).await;
+    let answer = s
+        .tool("den_play_on_tv", json!({ "type": "series", "id": 1399, "season": 1, "episode": 2 }))
+        .await
+        .unwrap();
+    assert_eq!((answer["queued"].clone(), answer["state"].clone()), (json!(true), json!("taken")));
+    let note = answer["note"].as_str().unwrap();
+    assert!(note.contains("The TV picked it up") && note.contains("playing on my TV"), "{note}");
+
+    // The TV is asked first; then the request goes to the TV queue and is watched until taken.
+    let calls: Vec<String> = log.lock().unwrap().iter().map(|c| format!("{} {}", c.0, c.1)).collect();
+    assert_eq!(
+        calls,
+        [
+            "GET /assistant/tv",
+            "GET /assistant/dropbox",
+            "POST /assistant/append",
+            "GET /assistant/request/7?queue=tv",
+            "GET /assistant/request/7?queue=tv"
+        ]
+    );
+    let body = &append_bodies(&log)[0];
+    assert_eq!(body["queue"], "tv");
+    // What a device drains from the TV queue is a play of that episode; from the library queue it is refused.
+    let sealed = body["sealed"].as_str().unwrap();
+    let accepted = device_accepts_from(sealed, Queue::Tv);
+    assert_eq!(accepted.op, "play");
+    assert_eq!(accepted.args, json!({ "title": { "type": "tv", "id": 1399 }, "season": 1, "episode": 2 }));
+    assert_eq!(accepted.id, answer["id"].as_str().unwrap());
+    let f = fixed();
+    let public: [u8; 32] =
+        den_assistant::b64url_decode(f["grant"]["public"].as_str().unwrap()).unwrap().try_into().unwrap();
+    let grants = std::collections::BTreeMap::from([(
+        f["grant"]["id"].as_str().unwrap().to_owned(),
+        den_assistant::Grant { public, ops: vec![], cap: 100, revoked: false, expires: u64::MAX, play: true },
+    )]);
+    let now = unix_now() * 1000;
+    assert_eq!(
+        den_assistant::check_queue(
+            &[seed(&f["dropbox"])],
+            f["library"].as_str().unwrap(),
+            sealed,
+            &grants,
+            &Default::default(),
+            now,
+            Queue::Library,
+            None
+        ),
+        Err(den_assistant::Reject::WrongQueue)
+    );
+
+    // A trailer: only the title, the same queue.
+    let trailer =
+        s.tool("den_play_trailer", json!({ "type": "movie", "id": 550, "season": 3 })).await.unwrap();
+    assert_eq!(trailer["queued"], true);
+    let body = &append_bodies(&log)[1];
+    assert_eq!(body["queue"], "tv");
+    let accepted = device_accepts_from(body["sealed"].as_str().unwrap(), Queue::Tv);
+    assert_eq!(
+        (accepted.op.as_str(), accepted.args),
+        ("play_trailer", json!({ "title": { "type": "movie", "id": 550 } }))
+    );
+}
+
+#[tokio::test]
+async fn a_play_with_the_tv_off_queues_nothing_and_one_not_yet_taken_says_so() {
+    let mut off = tv_answers();
+    off.tv = (200, json!({ "online": false, "lastSeenAt": null }));
+    let (s, log) = tv_server(off).await;
+    let error = s.tool("den_play_on_tv", json!({ "type": "movie", "id": 550 })).await.unwrap_err();
+    assert!(error.contains("Open Den on the TV first") && error.contains("Nothing was sent"), "{error}");
+    let calls: Vec<String> = log.lock().unwrap().iter().map(|c| c.1.clone()).collect();
+    assert_eq!(calls, ["/assistant/tv"], "no key was fetched and nothing queued");
+
+    let mut slow = tv_answers();
+    slow.requests = vec![(200, json!({ "state": "queued" }))];
+    let (s, _) = tv_server(slow).await;
+    let started = std::time::Instant::now();
+    let answer = s.tool("den_play_on_tv", json!({ "type": "movie", "id": 550 })).await.unwrap();
+    assert_eq!(answer["state"], "queued");
+    assert!(answer["note"].as_str().unwrap().contains("has not picked it up yet"));
+    assert!(started.elapsed() < std::time::Duration::from_secs(4), "the wait is short");
+}
+
+#[tokio::test]
+async fn the_tv_status_and_what_den_edge_refuses_are_said_in_plain_words() {
+    let (s, _) = tv_server(tv_answers()).await;
+    let status = s.tool("den_tv_status", json!({})).await.unwrap();
+    assert_eq!(
+        (status["online"].clone(), status["last_seen_at"].clone()),
+        (json!(true), json!("2026-09-21T14:13:20Z"))
+    );
+    let mut off = tv_answers();
+    off.tv = (200, json!({ "online": false, "lastSeenAt": null }));
+    let (s, _) = tv_server(off).await;
+    let status = s.tool("den_tv_status", json!({})).await.unwrap();
+    assert_eq!((status["online"].clone(), status["last_seen_at"].clone()), (json!(false), Value::Null));
+    assert!(status["note"].as_str().unwrap().contains("not open on the TV"));
+
+    for (change, said) in [
+        ((409, json!({ "error": "queue_full" })), "several requests waiting"),
+        ((429, json!({ "error": "rate_limited" })), "Too many play requests"),
+        ((403, json!({ "error": "insufficient_scope" })), "reconnect and allow changes"),
+        ((401, json!({ "error": "invalid_token" })), "reconnect Den"),
+    ] {
+        let mut answers = tv_answers();
+        answers.append = change;
+        let (s, _) = tv_server(answers).await;
+        let error = s.tool("den_play_on_tv", json!({ "type": "movie", "id": 550 })).await.unwrap_err();
+        assert!(error.contains(said), "{error} should say {said}");
+    }
+    let mut broken = tv_answers();
+    broken.tv = (403, json!({ "error": "insufficient_scope" }));
+    let (s, _) = tv_server(broken).await;
+    assert!(s.tool("den_tv_status", json!({})).await.unwrap_err().contains("can't play on the TV"));
+}
+
+#[tokio::test]
+async fn play_arguments_are_checked_before_anything_is_asked() {
+    let (s, log) = tv_server(tv_answers()).await;
+    for (tool, arguments, said) in [
+        ("den_play_on_tv", json!({ "type": "movie", "id": 550, "season": 1 }), "for series"),
+        ("den_play_on_tv", json!({ "type": "series", "id": 1399, "episode": 2 }), "needs its season"),
+        ("den_play_on_tv", json!({ "type": "show", "id": 1 }), "{type: movie|series, id}"),
+        ("den_play_trailer", json!({ "type": "movie" }), "{type: movie|series, id}"),
+    ] {
+        let error = s.tool(tool, arguments).await.unwrap_err();
+        assert!(error.contains(said), "{tool}: {error}");
+    }
+    assert!(log.lock().unwrap().is_empty());
 }
 
 #[test]

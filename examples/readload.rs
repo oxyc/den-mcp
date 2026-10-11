@@ -70,8 +70,17 @@ fn projection(watchlist: usize, continuing: usize, seen: usize, pool: usize) -> 
             e
         })
         .collect();
+    // A tenth as many ratings as plays, in the three reactions.
+    let rated: Vec<Value> = (0..seen.len() as u64 / 10)
+        .map(|i| {
+            let value = ["dislike", "like", "love"][(i % 3) as usize];
+            json!({ "title": title(next()), "value": value, "at": at(i) })
+        })
+        .collect();
+    let hide = json!({ "minYear": 1970, "genres": [27, 16], "languages": ["tr"], "anime": true });
     let view = json!({ "v": 1, "library": f["library"], "grant": f["grant"]["id"], "at": 1_790_000_000_000u64,
-                       "head": 1, "watchlist": watchlist, "continue": continuing, "seen": seen });
+                       "head": 1, "watchlist": watchlist, "continue": continuing, "seen": seen,
+                       "rated": rated, "hide": hide });
     let key = den_assistant::b64url_decode(f["read"]["readKey"].as_str().unwrap()).unwrap();
     let sealed = den_assistant::seal_projection(&key.try_into().unwrap(), &view, &[7; 32]).unwrap();
     let chars = sealed.parts.iter().map(String::len).sum();
@@ -201,16 +210,16 @@ async fn main() {
 
     // Without a fourth argument the calls cycle through the three lists; `recommend` makes every one `den_recommend`.
     let tools = if args.next().as_deref() == Some("recommend") {
-        ["den_recommend"; 3]
+        ["den_recommend"; 4]
     } else {
-        ["den_watchlist", "den_continue_watching", "den_history"]
+        ["den_watchlist", "den_continue_watching", "den_history", "den_ratings"]
     };
     let mut failed = 0;
     for _ in 0..rounds {
         let calls: Vec<_> = (0..concurrent)
             .map(|i| {
                 let (client, token, origin) = (client.clone(), token.clone(), origin.clone());
-                let tool = tools[i % 3];
+                let tool = tools[i % 4];
                 tokio::spawn(async move {
                     let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                                        "params": { "name": tool, "arguments": { "limit": 20 } } });

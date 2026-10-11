@@ -10,7 +10,7 @@
 //! one open (the three tools are often called together) and the packed rows are kept for a short while, wiped when
 //! they expire.
 
-use crate::projection::{Continue, Lists, Seen, Watch, NO_NUMBER, NO_TIME};
+use crate::projection::{Continue, Lists, Rated, Reaction, Seen, Watch, NO_NUMBER, NO_TIME};
 use crate::tools::{bad, paging, string, title, title_url, Ctx, ToolError};
 use crate::writes::{error_code, refuse, Refused, Writes};
 use den_assistant::{open_claim, open_projection_compact, open_read_claim, ReadKey};
@@ -23,7 +23,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The read tools, as `tools/list` names them.
-pub const TOOLS: [&str; 4] = ["den_watchlist", "den_continue_watching", "den_history", "den_recommend"];
+pub const TOOLS: [&str; 5] =
+    ["den_watchlist", "den_continue_watching", "den_history", "den_ratings", "den_recommend"];
 
 /// The largest projection answer read from den-edge: its parts come to at most 16 MiB of characters (§15).
 const MAX_PROJECTION_ANSWER: usize = 17 * 1024 * 1024;
@@ -223,6 +224,8 @@ struct Query {
     /// `den_recommend`: titles on the watchlist may be recommended.
     include_watchlist: bool,
     kind: Option<&'static str>,
+    /// `den_ratings`: only this rating.
+    reaction: Option<Reaction>,
     since: Option<u64>,
     until: Option<u64>,
     page: usize,
@@ -235,7 +238,16 @@ impl Query {
             "den_watchlist" => "watchlist",
             "den_continue_watching" => "continue",
             "den_recommend" => "recommend",
+            "den_ratings" => "rated",
             _ => "seen",
+        };
+        let reaction = match string(args, "value")? {
+            None | Some("all") => None,
+            // Den's UI calls dislike "Not for me".
+            Some("dislike" | "not_for_me") => Some(Reaction::Dislike),
+            Some("like") => Some(Reaction::Like),
+            Some("love") => Some(Reaction::Love),
+            Some(_) => return Err(bad("value is dislike (Not for me), like, love or all")),
         };
         let include_watchlist = match args.get("include_watchlist") {
             None | Some(Value::Null) => false,
@@ -259,7 +271,7 @@ impl Query {
             return Err(bad("since is after until"));
         }
         let (page, limit) = paging(args, if list == "recommend" { 10 } else { 20 })?;
-        Ok(Query { list, include_watchlist, kind, since, until, page, limit })
+        Ok(Query { list, include_watchlist, kind, reaction, since, until, page, limit })
     }
 }
 
@@ -271,6 +283,7 @@ fn window<'a, T>(
     query: &Query,
     title: impl Fn(&T) -> u32,
     at: impl Fn(&T) -> u64,
+    keep: impl Fn(&T) -> bool,
     untimed: &mut usize,
 ) -> (usize, Vec<&'a T>) {
     let timed = query.since.is_some() || query.until.is_some();
@@ -278,7 +291,7 @@ fn window<'a, T>(
     let to = from.saturating_add(query.limit);
     let (mut total, mut page) = (0, Vec::new());
     for row in rows {
-        if query.kind.is_some_and(|k| k != lists.title(title(row)).0) {
+        if !keep(row) || query.kind.is_some_and(|k| k != lists.title(title(row)).0) {
             continue;
         }
         if timed {
@@ -320,7 +333,7 @@ async fn answer(ctx: &Ctx<'_>, lists: &Lists, query: &Query) -> Value {
     let (total, rows): (usize, Vec<Row>) = match query.list {
         "watchlist" => {
             let (total, page) =
-                window(&lists.watchlist, lists, query, |e: &Watch| e.title, |e| e.at, &mut untimed);
+                window(&lists.watchlist, lists, query, |e: &Watch| e.title, |e| e.at, |_| true, &mut untimed);
             let rows = page
                 .iter()
                 .map(|e| {
@@ -334,8 +347,15 @@ async fn answer(ctx: &Ctx<'_>, lists: &Lists, query: &Query) -> Value {
             (total, rows)
         }
         "continue" => {
-            let (total, page) =
-                window(&lists.continuing, lists, query, |e: &Continue| e.title, |e| e.at, &mut untimed);
+            let (total, page) = window(
+                &lists.continuing,
+                lists,
+                query,
+                |e: &Continue| e.title,
+                |e| e.at,
+                |_| true,
+                &mut untimed,
+            );
             let rows = page
                 .iter()
                 .map(|e| {
@@ -352,8 +372,36 @@ async fn answer(ctx: &Ctx<'_>, lists: &Lists, query: &Query) -> Value {
                 .collect();
             (total, rows)
         }
+        "rated" => {
+            let (total, page) = window(
+                &lists.rated,
+                lists,
+                query,
+                |e: &Rated| e.title,
+                |e| e.at,
+                |e| query.reaction.is_none_or(|r| r == e.reaction),
+                &mut untimed,
+            );
+            let rows = page
+                .iter()
+                .map(|e| {
+                    let mut extra = Map::new();
+                    // Not `rating`: that key is TMDB's, and nothing of TMDB's reaches a model under it.
+                    extra.insert("reaction".into(), json!(e.reaction.name()));
+                    if e.reaction == Reaction::Dislike {
+                        extra.insert("not_for_me".into(), json!(true));
+                    }
+                    if let Some(at) = date(e.at) {
+                        extra.insert("rated_at".into(), json!(at));
+                    }
+                    (e.title, extra)
+                })
+                .collect();
+            (total, rows)
+        }
         _ => {
-            let (total, page) = window(&lists.seen, lists, query, |e: &Seen| e.title, |e| e.at, &mut untimed);
+            let (total, page) =
+                window(&lists.seen, lists, query, |e: &Seen| e.title, |e| e.at, |_| true, &mut untimed);
             let rows = page
                 .iter()
                 .map(|e| {
@@ -452,36 +500,53 @@ const MAX_BODY: usize = 500 * 1024;
 const MAX_SLIDES: usize = 300;
 
 /// What a title says about taste, as Den Web weighs it (`homeLibraryView.ts` `weightOf`): watched or part-watched
-/// counts full, watchlisted 0.6.
+/// counts full, watchlisted 0.6, a like adds 0.5, a love 1, and a dislike ("Not for me") counts −1.5 outright.
 struct Taste {
     weight: f64,
     at: u64,
     /// Watched or part-watched, not only watchlisted.
     engaged: bool,
+    /// Rated: the household has given its verdict, so atlas must not show it again.
+    rated: bool,
+    disliked: bool,
 }
 
 fn taste(lists: &Lists) -> HashMap<u32, Taste> {
     let when = |at: u64| if at == NO_TIME { 0 } else { at };
+    let held = |weight| Taste { weight, at: 0, engaged: false, rated: false, disliked: false };
     let mut by: HashMap<u32, Taste> = HashMap::new();
     for e in &lists.watchlist {
-        let t = by.entry(e.title).or_insert(Taste { weight: 0.6, at: 0, engaged: false });
+        let t = by.entry(e.title).or_insert_with(|| held(0.6));
         t.at = t.at.max(when(e.at));
     }
     for (title, at) in
         lists.continuing.iter().map(|e| (e.title, e.at)).chain(lists.seen.iter().map(|e| (e.title, e.at)))
     {
-        let t = by.entry(title).or_insert(Taste { weight: 1.0, at: 0, engaged: true });
+        let t = by.entry(title).or_insert_with(|| held(1.0));
         t.weight = 1.0;
         t.engaged = true;
         t.at = t.at.max(when(at));
+    }
+    for e in &lists.rated {
+        let t = by.entry(e.title).or_insert_with(|| held(0.0));
+        t.rated = true;
+        t.at = t.at.max(when(e.at));
+        match e.reaction {
+            Reaction::Dislike => {
+                t.weight = -1.5;
+                t.disliked = true;
+            }
+            Reaction::Like => t.weight += 0.5,
+            Reaction::Love => t.weight += 1.0,
+        }
     }
     by
 }
 
 /// `POST /recommend`'s body for these lists, as Den Web builds its own: the library's titles with their weights (the
-/// recent ones, 180 days), and `owned`, every title atlas must not show — all that is watched or in progress, and
-/// the watchlist unless it may be recommended. No `hide` rules: nothing here knows the household's. At most
-/// `MAX_BODY` bytes, the library giving way.
+/// recent ones, 180 days), `owned`, every title atlas must not show — all that is watched, in progress or rated, and
+/// the watchlist unless it may be recommended — and `hide`, the household's own rules. At most `MAX_BODY` bytes, the
+/// library giving way.
 fn recommend_body(
     lists: &Lists,
     taste: &HashMap<u32, Taste>,
@@ -500,8 +565,11 @@ fn recommend_body(
         }
         out.push('}');
     };
-    let mut owned: Vec<(u32, u64)> =
-        taste.iter().filter(|(_, t)| t.engaged || !include_watchlist).map(|(&i, t)| (i, t.at)).collect();
+    let mut owned: Vec<(u32, u64)> = taste
+        .iter()
+        .filter(|(_, t)| t.engaged || t.rated || !include_watchlist)
+        .map(|(&i, t)| (i, t.at))
+        .collect();
     owned.sort_unstable_by(newest_first);
     owned.truncate(MAX_OWNED);
     let mut owned_json = String::from("[");
@@ -519,8 +587,9 @@ fn recommend_body(
         library.retain(|(_, at)| *at >= since);
     }
     library.sort_unstable_by(newest_first);
+    let hide = serde_json::to_string(&lists.hide).unwrap_or_else(|_| "{}".into());
     let head = format!(
-        r#"{{"version":1,"surface":"{surface}","now":"{}","limit":{limit},"owned":{owned_json},"library":["#,
+        r#"{{"version":1,"surface":"{surface}","now":"{}","limit":{limit},"hide":{hide},"owned":{owned_json},"library":["#,
         rfc3339(now_ms)
     );
     let mut out = head;
@@ -592,13 +661,14 @@ async fn recommend(ctx: &Ctx<'_>, writes: &Writes, lists: &Lists, query: &Query)
         .map_or(0, |d| d.as_millis() as u64);
     // One at a time: a request is built from every title the household holds, so several at once would hold several.
     let turn = writes.lists.recommending.acquire().await.expect("the semaphore is never closed");
-    let (engaged, held, body) = {
+    let (engaged, watchlisted, disliked, body) = {
         let taste = taste(lists);
         let engaged = taste.values().filter(|t| t.engaged).count();
+        let disliked = taste.values().filter(|t| t.disliked).count();
         // One more than the page, so a next page is known to exist.
         let body =
             recommend_body(lists, &taste, surface, query.include_watchlist, now_ms, (to + 1).min(MAX_SLIDES));
-        (engaged, taste.len(), body)
+        (engaged, taste.values().filter(|t| !t.engaged && t.weight == 0.6).count(), disliked, body)
     };
     let answer = ctx.atlas.post("/recommend", bytes::Bytes::from(body), ctx.rid).await?;
     let ranked: Ranked = serde_json::from_slice(&answer)
@@ -654,11 +724,10 @@ async fn recommend(ctx: &Ctx<'_>, writes: &Writes, lists: &Lists, query: &Query)
         .collect();
 
     let mut note = format!(
-        "Ranked by Den against the {engaged} titles watched or in progress and {} on the watchlist, as of {as_of} \
-         (the last time a TV or Den Web published your lists). Titles already watched{} are left out. Ratings, \
-         including Not for me, are not shared with assistants, so a title marked Not for me but never watched can \
-         still appear; if one does, rate it with den_rate. At most {MAX_SLIDES} titles, best first.",
-        held - engaged,
+        "Ranked by Den against the {engaged} titles watched or in progress and {watchlisted} on the watchlist, shaped \
+         by the household's likes, loves and {disliked} Not for me marks, as of {as_of} (the last time a TV or Den \
+         Web published your lists). Titles already watched, rated{} are left out, and so is what the household \
+         hides. At most {MAX_SLIDES} titles, best first.",
         if query.include_watchlist { "" } else { " or on the watchlist" },
     );
     if more {
@@ -696,7 +765,7 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 }
 
 /// A Unix time in milliseconds as `2026-10-10T12:34:56Z`.
-fn rfc3339(ms: u64) -> String {
+pub(crate) fn rfc3339(ms: u64) -> String {
     let secs = (ms / 1000) as i64;
     let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
     let t = secs.rem_euclid(86_400);
@@ -781,13 +850,25 @@ pub fn list() -> Value {
             "annotations": annotations,
         },
         {
+            "name": "den_ratings",
+            "title": "Ratings",
+            "description": format!("What the person has rated, newest first, with when: love, like or dislike. Den's \
+                UI calls dislike \"Not for me\". Use it for \"what have I loved\" or \"what did I mark not for me\"; \
+                `value` picks one rating. {fresh}"),
+            "inputSchema": { "type": "object", "properties": {
+                "value": { "type": "string", "enum": ["love", "like", "dislike", "all"], "default": "all",
+                           "description": "dislike = Not for me" },
+                "type": kind, "page": page, "limit": limit } },
+            "annotations": annotations,
+        },
+        {
             "name": "den_recommend",
             "title": "What to watch next",
-            "description": "What the household should watch next, ranked by Den against what it has watched and \
-                added (as Den Web's billboard is), best first: use it for \"what should we watch\". Leaves out \
-                what is watched or in progress, and the watchlist unless include_watchlist is true. Paged, up to \
-                300 titles; `why` is Den's own short reason where it has one. As of the last time a TV or Den \
-                Web published the lists.",
+            "description": "What the household should watch next, ranked by Den against what it has watched, added \
+                and rated (as Den Web's billboard is), best first: use it for \"what should we watch\". Leaves out \
+                what is watched, in progress or rated (Not for me included), what the household hides, and the \
+                watchlist unless include_watchlist is true. Paged, up to 300 titles; `why` is Den's own short \
+                reason where it has one. As of the last time a TV or Den Web published the lists.",
             "inputSchema": { "type": "object", "properties": {
                 "type": kind,
                 "include_watchlist": { "type": "boolean", "default": false,

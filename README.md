@@ -48,6 +48,9 @@ server opens (den-spec `wire/assistant-v1.md`). Title arguments are `type` (`mov
 | `den_watchlist_remove` | `type`, `id` (`destructiveHint`) | `watchlist_remove` |
 | `den_mark_seen` | `type`, `id`, `value?` (true), `season?`, `episode?` (series; episode needs season) | `seen` |
 | `den_rate` | `type`, `id`, `value` (`dislike`, `like`, `love` or null to clear) | `rate` |
+| `den_play_on_tv` | `type`, `id`, `season?`, `episode?` (series; episode needs season) | `play` (TV queue) |
+| `den_play_trailer` | `type`, `id` | `play_trailer` (TV queue) |
+| `den_tv_status` | — | `GET /assistant/tv` (no request) |
 
 Den's UI calls `dislike` **Not for me**, and it is also a taste signal that steers recommendations away: the tool's
 description tells a model to use it for "not for me", "not interested" and "stop suggesting this".
@@ -57,6 +60,17 @@ A call opens the grant key from `dw` (`MCP_WRITE_KEY`, bound to the token's `sub
 `den-assistant` and `POST /assistant/append`s it, all with the caller's own token. The grant key lives for that call.
 den-edge's `queue_full`, rate limits and 401/403 are said to the model in plain words. The log line for a write is the
 tool and a status word, never an argument or key.
+
+**Playing on the TV** (den-spec §16). `den_play_on_tv` and `den_play_trailer` are requests like the others, sealed
+and signed the same way, but they belong in the TV queue (`den_assistant::Queue::of`): the append carries
+`"queue": "tv"`, which only a TV with Den open drains, and a play older than two minutes is stale. So before sealing
+anything they ask `GET /assistant/tv`; if the TV is not online the answer is "Open Den on the TV first" and nothing is
+queued. After the append they ask `GET /assistant/request/{seq}?queue=tv` every 0.4 s for up to 8 s and answer
+`state: "taken"` ("The TV picked it up") or `"queued"` (not yet). `taken` is all den-edge can know: whether anything
+played is not observable, so the note says that a connection made before TV playback has no play record, its plays are
+refused at the TV, and the owner reconnects the assistant with "Allow changes to my library and playing on my TV"
+ticked. `den_tv_status` answers `{online, last_seen_at}`. These tools are listed with the write tools (a token does not
+say whether its connection may play).
 
 `cargo run --example writekey` makes a key pair: `MCP_WRITE_KEY` for den-mcp, `MCP_WRITE_PUBLIC_KEY` for den-edge.
 
@@ -74,20 +88,24 @@ Den Web `url`; no TMDB field), with their ids and dates (UTC, RFC 3339) kept.
 | `den_watchlist` | `type?`, `page?`, `limit?` | `watchlist`, newest added first |
 | `den_continue_watching` | `page?`, `limit?` | `continue`: `action` `resume` (with `fraction`) or `next`, `season`, `episode` |
 | `den_history` | `since?`, `until?` (UTC date or time), `type?`, `page?`, `limit?` | `seen`, newest first; entries with no date only without a time range |
-| `den_recommend` | `type?` (movie, series, all), `include_watchlist?` (false), `page?`, `limit?` (10, ≤100) | all three, as the body of atlas's `POST /recommend` (below) |
+| `den_ratings` | `value?` (love, like, dislike or all; `dislike` is Not for me), `type?`, `page?`, `limit?` | `rated`, newest first; each has `reaction`, and `not_for_me` for a dislike |
+| `den_recommend` | `type?` (movie, series, all), `include_watchlist?` (false), `page?`, `limit?` (10, ≤100) | all of it, as the body of atlas's `POST /recommend` (below) |
 
 `den_recommend` ("what should we watch") asks atlas to rank, as Den Web's billboard does, so nothing here ranks. The body
-is Den Web's: `library` is every title watched or in progress (weight 1) and on the watchlist (0.6) with the time it
-was last touched, the recent 180 days if there are any (a library title with no date says nothing about now), at most
-5,000 and 500 KiB; `owned` is every title atlas must not show (all watched or in progress, and the watchlist unless
-`include_watchlist`), at most 10,000; `surface` is `home`, `movies` or `series`; `limit` the page and one more. There
-are no `hide` rules (den-mcp does not know the household's) and no `candidates`. A title is named like every other
+is Den Web's: `library` is every title watched or in progress (weight 1), on the watchlist (0.6) or rated, with the time
+it was last touched and Den Web's weights (`weightOf`: a like adds 0.5, a love 1, and a dislike, "Not for me", is −1.5
+outright), the recent 180 days if there are any (a library title with no date says nothing about now), at most 5,000
+and 500 KiB; `owned` is every title atlas must not show (all watched, in progress or rated, and the watchlist unless
+`include_watchlist`), at most 10,000, so a title marked Not for me is never shown; `hide` is the household's own rules
+(`minYear`, `genres`, `languages`, `anime`) from the projection, sent as Den Web sends them; `surface` is `home`,
+`movies` or `series`; `limit` the page and one more. There are no `candidates`. A title is named like every other
 result, with its Den Web `url`; `why` is the scorer's reason code in Den's own words (`similar`, `profile`, `people`,
 `franchise`, `arrived`, `recent`, `upcoming`, `timely`), never its numeric terms, and `quality` and `buzz` give none
-since they weigh ratings and popularity. Atlas ranks at most 300, so `more` ends there. **A rating is not in the
-projection**, so likes, loves and Not for me marks do not shape the weights and a disliked title that was never
-watched can still appear (the answer's note says so); `include_watchlist` marks watchlisted results `on_watchlist`.
-One request is built and asked at a time, so it costs the memory of the list tools.
+since they weigh ratings and popularity. Atlas ranks at most 300, so `more` ends there; `include_watchlist` marks
+watchlisted results `on_watchlist`. One request is built and asked at a time, so it costs the memory of the list tools.
+
+The projection reader ignores what it does not know (den-spec §15 requires it): unknown members of an object, and
+elements past the ones a row is read for. A projection published before `rated` and `hide` reads with none.
 
 A call opens the read key from `dr`, checks it names the same grant as `dw` when the token has both, `GET`s
 `/assistant/projection` with the caller's own token (`{library, grant, set, parts}`), opens the sealed, compressed parts
@@ -219,7 +237,7 @@ Measured with `cargo run --release --example load` (a stub atlas answering a 24-
 | a tool call answered from the cache | p50 0.14 ms, p99 0.29 ms |
 | 8 concurrent callers | ~8,000 calls/s, p50 0.97 ms, p99 1.4 ms |
 
-The release binary is ~3.3 MB (2.85 MB before library writes and reads; `den-assistant`'s X-Wing, HPKE, AES-GCM and DEFLATE add ~0.38 MB).
+The release binary is ~3.4 MB (2.85 MB before library writes and reads; `den-assistant`'s X-Wing, HPKE, AES-GCM and DEFLATE add ~0.38 MB).
 
 ## Development
 
