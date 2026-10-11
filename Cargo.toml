@@ -37,6 +37,8 @@ rand_core = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "signal", "test-util", "io-util"] }
+# The peak resident set of the child, for the readload example.
+libc = "0.2"
 
 # The fleet's release profile: fat LTO, one codegen unit, stripped. panic=unwind so a panic in one request
 # unwinds that connection rather than the whole server.
