@@ -22,7 +22,7 @@
     "projection": {
       "set": "7309c02501b33e43f9d9d13136ffac57",
       "parts": [
-        "MYBwDjAHq3nmFJgjMzve5CsNbFyArlKM5fRh8qes4dS1B1_S3G6b8pu10KxFYWaGeMZ1SE_YZ_wJ5iegqKRxJ2AZKX8nO40zbXdHRlp7d6gY13ombNy7JrwsbPWWCCCoR_pcLBJLYxyg5Oxa_IchZ8x72_qi9EyphHwub5wmzXXHRQomnQsEg-e26M8tE2Hk2mxTuLWrLi_4qn3v_VoV-Ctq9dAmLRDezCs6zrfh23wmcA2a9LUvyr5FqAIdkzWmgSMwvYoF2doMPmi6qaBp-RKObv-BMjrYLA1ZTuMgvX7ICDtu6wkW1TVSoIiTDxJnPGWMudAX8XTUpFQNAjgFhlJyZt5vBN8-aRddrMfu8D-ClTUnz8PzC6c12PlR"
+        "MYBwDjAHq3nmFJgjGzreBGwNdD3A7NmU1TvpE5Pv_fSE08_6rhZ6zXStNzxLN7CFTGObD7hp5ZKLNG2hJTDZji70HBPTZxpLlpJQXhLW6aHW0pErsp4EXLppnez2IZUrK7h2mHyGHpI1mXQDQHPKcltxTCzKV8dBx85gnhIcZKPXMGTKqxMGKvYBhQ_lV1M427gsJBwfOcADPp8uXoF2n4GBYlACD8-XQM3T6ORZwjWyvHYG--hDCzZZAkGwVgBAAnNtdEflZ7jYsEPl1bCiG7m_G88piVh0qOsnJQkNX6Nf6-jmmTg_QFgJqxm3EUWHgdSIW9YEZy2DtYtlllv5K3Zu3GX8Lfl_dL9uel3Jipi502LuXsuUFopcGMpOq5IPyfhPxSIi13b7jh2kA0cpXq2MDVUezEZ2AsQAybPxELUWZYzaiQymmNqtdKL0fGuELwwIPQUY0RPGAkvO2xoiNP4eTA"
       ],
       "view": {
         "at": 1790000000000,
@@ -61,7 +61,44 @@
         ],
         "grant": "d7047d7faa4c6f77e1919c132bb6bd9f",
         "head": 4711,
+        "hide": {
+          "anime": true,
+          "genres": [
+            27,
+            16
+          ],
+          "languages": [
+            "tr"
+          ],
+          "minYear": 1970
+        },
         "library": "4c1b7a0e9d3f2c8b5a6e1d0f7c3b9a2e",
+        "rated": [
+          {
+            "at": 1789985600000,
+            "title": {
+              "id": 1399,
+              "type": "tv"
+            },
+            "value": "dislike"
+          },
+          {
+            "at": 1789967600000,
+            "title": {
+              "id": 603,
+              "type": "movie"
+            },
+            "value": "love"
+          },
+          {
+            "at": null,
+            "title": {
+              "id": 27205,
+              "type": "movie"
+            },
+            "value": "like"
+          }
+        ],
         "seen": [
           {
             "at": 1789982000000,

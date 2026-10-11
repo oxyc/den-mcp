@@ -473,7 +473,7 @@ pub(crate) fn output_schema(tool: &str) -> Value {
             },
             "required": ["id", "title", "text", "url"],
         }),
-        t if crate::writes::TOOLS.iter().any(|(name, _)| *name == t) => crate::writes::output_schema(),
+        t if crate::writes::TOOLS.iter().any(|(name, _)| *name == t) => crate::writes::output_schema(t),
         t if crate::reads::TOOLS.contains(&t) => crate::reads::output_schema(),
         _ => json!({ "type": "object" }),
     }

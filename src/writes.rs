@@ -11,8 +11,8 @@ use crate::config::Write;
 use crate::tools::{bad, title_key, ToolError};
 use bytes::Bytes;
 use den_assistant::{
-    b64url_decode, key_id, open_claim, request_id_with_rng, seal_request_with_rng, Request, KEM_PUBLIC_LEN,
-    MAX_EPISODE, MAX_SAFE_INTEGER,
+    b64url_decode, key_id, open_claim, request_id_with_rng, seal_request_with_rng, Queue, Request,
+    KEM_PUBLIC_LEN, MAX_EPISODE, MAX_SAFE_INTEGER,
 };
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{header, Request as HttpRequest, StatusCode};
@@ -36,13 +36,32 @@ const MAX_ANSWER: usize = 16 * 1024;
 const QUEUED_NOTE: &str =
     "Den applies it next time a TV or Den Web is open; usually within seconds when the TV is on.";
 
-/// The four tools, as `tools/list` names them, and the op each sends.
-pub const TOOLS: [(&str, &str); 4] = [
+/// The write tools, as `tools/list` names them, and the op each sends. `tv_status` sends none: it asks whether the TV
+/// is open (den-spec §16).
+pub const TOOLS: [(&str, &str); 7] = [
     ("den_watchlist_add", "watchlist_add"),
     ("den_watchlist_remove", "watchlist_remove"),
     ("den_mark_seen", "seen"),
     ("den_rate", "rate"),
+    ("den_play_on_tv", "play"),
+    ("den_play_trailer", "play_trailer"),
+    ("den_tv_status", "tv_status"),
 ];
+
+/// How often a play request asks whether the TV has taken it.
+const TV_POLL: Duration = Duration::from_millis(400);
+
+/// What a play says once the TV has taken it: that is all den-edge can tell, not whether it played.
+const TAKEN_NOTE: &str =
+    "The TV picked it up. If nothing starts playing, this connection may not be allowed to play \
+    on the TV: connections made before TV playback need reconnecting with \"Allow changes to my library and \
+    playing on my TV\" ticked.";
+/// And when it has not yet.
+const WAITING_NOTE: &str =
+    "Sent to the TV, which has not picked it up yet. A play older than two minutes is \
+    dropped, so ask again if the TV stays idle.";
+const TV_OFF: &str =
+    "Open Den on the TV first — it isn't running, so it can't play anything yet. Nothing was sent.";
 
 #[derive(Clone)]
 struct Dropbox {
@@ -57,6 +76,8 @@ pub struct Writes {
     dropboxes: Mutex<HashMap<String, (Dropbox, Instant)>>,
     /// The lists the read tools share between calls (`reads.rs`).
     pub(crate) lists: crate::reads::Shared,
+    /// How long a play request waits to see whether the TV took it.
+    tv_wait: Duration,
 }
 
 /// Why a change was not queued: a short code for the log and the words the model is told.
@@ -76,6 +97,7 @@ impl Writes {
             client: Client::builder(TokioExecutor::new()).build(connector),
             dropboxes: Mutex::default(),
             lists: Default::default(),
+            tv_wait: config.tv_wait,
         }
     }
 
@@ -95,10 +117,18 @@ impl Writes {
         log: bool,
     ) -> Result<Value, ToolError> {
         let op = TOOLS.iter().find(|(name, _)| *name == tool).map_or("", |(_, op)| op);
-        let args = build_args(op, args)?;
-        let outcome = self.queue(caller, op, args).await;
+        let outcome = if op == "tv_status" {
+            self.tv_status(caller).await
+        } else {
+            let args = build_args(op, args)?;
+            self.queue(caller, op, args).await
+        };
         let status = match &outcome {
-            Ok(_) => "queued",
+            Ok(answer) => match answer.get("state").and_then(Value::as_str) {
+                Some(state) => state,
+                None if op == "tv_status" => "ok",
+                None => "queued",
+            },
             Err(Refused(code, _)) => code,
         };
         if log {
@@ -116,6 +146,11 @@ impl Writes {
         };
         let grant = caller.write.as_ref().ok_or_else(denied)?;
         let key = open_claim(&self.secret, &caller.session, &grant.claim).map_err(|_| denied())?;
+        // A play that would go stale is not queued: the TV must be open to take it.
+        let tv = Queue::of(op) == Queue::Tv;
+        if tv && !self.tv(&grant.token).await?.0 {
+            return Err(refuse("tv_offline", TV_OFF));
+        }
         let dropbox = self.dropbox(&caller.session, &grant.token).await?;
         let mut rng = rng();
         let id = request_id_with_rng(&mut rng);
@@ -124,19 +159,29 @@ impl Writes {
         let sealed = seal_request_with_rng(&dropbox.public, &key, &request, &mut rng)
             .map_err(|_| refuse("not_sealed", "Den could not prepare that change."))?;
         drop(key);
-        let (status, answer) = self
-            .edge_call(
-                "POST",
-                "/assistant/append",
-                &grant.token,
-                Some(json!({ "sealed": sealed })),
-                MAX_ANSWER,
-            )
-            .await?;
+        let body = if tv { json!({ "sealed": sealed, "queue": "tv" }) } else { json!({ "sealed": sealed }) };
+        let (status, answer) =
+            self.edge_call("POST", "/assistant/append", &grant.token, Some(body), MAX_ANSWER).await?;
         match (status.as_u16(), error_code(&answer)) {
+            (200, _) if tv => {
+                let taken = match answer.get("seq").and_then(Value::as_u64) {
+                    Some(seq) => self.taken(&grant.token, seq).await,
+                    None => false,
+                };
+                let (state, note) = if taken { ("taken", TAKEN_NOTE) } else { ("queued", WAITING_NOTE) };
+                Ok(json!({ "queued": true, "id": id, "state": state, "note": note }))
+            }
             (200, _) => Ok(json!({ "queued": true, "id": id, "note": QUEUED_NOTE })),
             (401, _) => Err(refuse("unauthorized", "This connection has expired — reconnect Den and try again.")),
             (403, _) => Err(denied()),
+            (409, _) if tv => Err(refuse(
+                "queue_full",
+                "The TV already has several requests waiting; try again in a moment.",
+            )),
+            (429, _) if tv => Err(refuse(
+                "rate_limited",
+                "Too many play requests in a short while; wait a minute and try again.",
+            )),
             (409, _) => Err(refuse(
                 "queue_full",
                 "Den already has 200 changes waiting to be applied. They are applied when a TV or Den Web is \
@@ -151,6 +196,65 @@ impl Writes {
                 Err(refuse("edge_error", "Den could not queue that change right now; try again later."))
             }
         }
+    }
+
+    /// Whether Den is open on the TV, and when it was last seen (ms): `GET /assistant/tv`.
+    async fn tv(&self, token: &str) -> Result<(bool, Option<u64>), Refused> {
+        let (status, answer) = self.edge_call("GET", "/assistant/tv", token, None, MAX_ANSWER).await?;
+        match status.as_u16() {
+            200 => match answer.get("online").and_then(Value::as_bool) {
+                Some(online) => Ok((online, answer.get("lastSeenAt").and_then(Value::as_u64))),
+                None => Err(refuse(
+                    "edge_error",
+                    "Den could not reach the TV's status right now; try again later.",
+                )),
+            },
+            401 => Err(refuse("unauthorized", "This connection has expired — reconnect Den and try again.")),
+            403 => Err(refuse(
+                "no_write_grant",
+                "This connection can't play on the TV — reconnect and allow changes and playing on the TV.",
+            )),
+            other => {
+                eprintln!("den-edge: tv answered {other} {}", error_code(&answer).unwrap_or("-"));
+                Err(refuse("edge_error", "Den could not reach the TV's status right now; try again later."))
+            }
+        }
+    }
+
+    /// `den_tv_status`: whether Den is open on the TV now.
+    async fn tv_status(&self, caller: &Caller) -> Result<Value, Refused> {
+        let grant = caller.write.as_ref().ok_or_else(|| {
+            refuse("no_write_grant", "This connection can't play on the TV — reconnect and allow changes.")
+        })?;
+        let (online, last_seen) = self.tv(&grant.token).await?;
+        Ok(json!({
+            "online": online,
+            "last_seen_at": last_seen.map(crate::reads::rfc3339),
+            "note": if online {
+                "Den is open on the TV."
+            } else {
+                "Den is not open on the TV; ask the person to open it before playing anything."
+            },
+        }))
+    }
+
+    /// Whether the TV took request `seq` within the wait, asking `GET /assistant/request/{seq}?queue=tv` every moment.
+    /// `false` is "not yet" as much as "never": it says nothing of whether anything played.
+    async fn taken(&self, token: &str, seq: u64) -> bool {
+        let deadline = Instant::now() + self.tv_wait;
+        while Instant::now() < deadline {
+            tokio::time::sleep(TV_POLL.min(self.tv_wait)).await;
+            let path = format!("/assistant/request/{seq}?queue=tv");
+            match self.edge_call("GET", &path, token, None, MAX_ANSWER).await {
+                Ok((status, answer)) if status.as_u16() == 200 => {
+                    if answer.get("state").and_then(Value::as_str) == Some("taken") {
+                        return true;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        false
     }
 
     /// The session's library and its drop-box public key, from den-edge, kept for a minute.
@@ -283,7 +387,7 @@ fn build_args(op: &str, args: &Value) -> Result<Value, ToolError> {
     }
     let title = json!({ "type": if kind == "series" { "tv" } else { "movie" }, "id": id });
     match op {
-        "watchlist_add" | "watchlist_remove" => Ok(json!({ "title": title })),
+        "watchlist_add" | "watchlist_remove" | "play_trailer" => Ok(json!({ "title": title })),
         "rate" => {
             let value = match args.get("value") {
                 Some(Value::Null) => Value::Null,
@@ -292,13 +396,16 @@ fn build_args(op: &str, args: &Value) -> Result<Value, ToolError> {
             };
             Ok(json!({ "title": title, "value": value }))
         }
+        // `seen` and `play` both take a series, a season or an episode; only `seen` says seen or unseen.
         _ => {
-            let value = match args.get("value") {
-                None | Some(Value::Null) => true,
-                Some(Value::Bool(v)) => *v,
-                Some(_) => return Err(bad("value is true (seen) or false (unseen)")),
-            };
-            let mut out = json!({ "title": title, "value": value });
+            let mut out = json!({ "title": title });
+            if op == "seen" {
+                out["value"] = match args.get("value") {
+                    None | Some(Value::Null) => json!(true),
+                    Some(Value::Bool(v)) => json!(v),
+                    Some(_) => return Err(bad("value is true (seen) or false (unseen)")),
+                };
+            }
             let number = |key: &str, max: u64| match args.get(key) {
                 None | Some(Value::Null) => Ok(None),
                 Some(v) => v
@@ -345,6 +452,9 @@ pub fn list() -> Value {
         json!({ "readOnlyHint": false, "destructiveHint": destructive, "idempotentHint": true,
                 "openWorldHint": false })
     };
+    // Playing twice plays twice, and it changes nothing in the library.
+    let playing = json!({ "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false,
+                          "openWorldHint": false });
     let queued =
         "Nothing happens at once: the change is queued and a TV or Den Web applies it when next open.";
     json!([
@@ -391,16 +501,59 @@ pub fn list() -> Value {
             }), &["value"]),
             "annotations": annotations(false),
         },
+        {
+            "name": "den_play_on_tv",
+            "title": "Play on the TV",
+            "description": "Play a film, episode or series on the TV where the household watches, as its own Play \
+                button would. For a series give no season to play it where it stands (the next episode or where \
+                they left off), or a season and episode for one episode. The TV must have Den open: if not, \
+                nothing is sent and the answer says to open it. Says whether the TV picked it up within a few \
+                seconds; it cannot say whether playback started.",
+            "inputSchema": schema(json!({
+                "season": { "type": "integer", "minimum": 0, "description": "Series only" },
+                "episode": { "type": "integer", "minimum": 0, "maximum": 99999,
+                             "description": "Series only; needs season" },
+            }), &[]),
+            "annotations": playing,
+        },
+        {
+            "name": "den_play_trailer",
+            "title": "Play a trailer on the TV",
+            "description": "Play a title's trailer on the TV, as the title page's trailer button would. The TV must \
+                have Den open: if not, nothing is sent and the answer says to open it.",
+            "inputSchema": schema(json!({}), &[]),
+            "annotations": playing,
+        },
+        {
+            "name": "den_tv_status",
+            "title": "Is Den open on the TV",
+            "description": "Whether Den is open on the household's TV right now (it can play only then), and when it \
+                was last seen. Check it before offering to play something.",
+            "inputSchema": { "type": "object", "properties": {} },
+            "annotations": { "readOnlyHint": true, "idempotentHint": true, "openWorldHint": false },
+        },
     ])
 }
 
 /// What a write tool's `structuredContent` holds.
-pub fn output_schema() -> Value {
+pub fn output_schema(tool: &str) -> Value {
+    if tool == "den_tv_status" {
+        return json!({
+            "type": "object",
+            "properties": {
+                "online": { "type": "boolean" },
+                "last_seen_at": { "type": ["string", "null"] },
+                "note": { "type": "string" },
+            },
+            "required": ["online", "note"],
+        });
+    }
     json!({
         "type": "object",
         "properties": {
             "queued": { "type": "boolean" },
             "id": { "type": "string" },
+            "state": { "type": "string", "enum": ["queued", "taken"] },
             "note": { "type": "string" },
         },
         "required": ["queued", "id", "note"],
