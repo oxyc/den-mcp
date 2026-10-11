@@ -92,6 +92,8 @@ async fn stub(answer: impl Fn(&str) -> (u16, String) + Clone + Send + Sync + 'st
             let service = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
                 let (status, body) = answer(req.uri().path());
                 async move {
+                    // A request's body is read before it is answered, as a server must.
+                    let _ = req.into_body().collect().await;
                     Ok::<_, std::convert::Infallible>(
                         hyper::Response::builder()
                             .status(status)
@@ -141,6 +143,12 @@ async fn main() {
     let atlas = stub(|path| {
         if path == "/index/schema.json" {
             (200, r#"{"tmdb":{"filterKinds":["rating","character"]}}"#.into())
+        } else if path == "/recommend" {
+            // The ranking `den_recommend` asks for: 11 slides with the scorer's terms.
+            let slides: Vec<Value> = (0..11)
+                .map(|i| json!({ "type": "movie", "id": 9000 + i, "why": { "score": 0.5, "reason": "similar" } }))
+                .collect();
+            (200, json!({ "slides": slides }).to_string())
         } else {
             (200, r#"{"type":"movie","id":1,"indexed":false}"#.into())
         }
@@ -191,7 +199,12 @@ async fn main() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     println!("idle RSS {} KB", rss_kb(child.id()));
 
-    let tools = ["den_watchlist", "den_continue_watching", "den_history"];
+    // Without a fourth argument the calls cycle through the three lists; `recommend` makes every one `den_recommend`.
+    let tools = if args.next().as_deref() == Some("recommend") {
+        ["den_recommend"; 3]
+    } else {
+        ["den_watchlist", "den_continue_watching", "den_history"]
+    };
     let mut failed = 0;
     for _ in 0..rounds {
         let calls: Vec<_> = (0..concurrent)

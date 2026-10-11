@@ -381,9 +381,13 @@ pub fn list() -> Value {
             "name": "den_rate",
             "title": "Rate a title",
             "description": format!(
-                "Set the person's rating of a film or series: dislike, like or love, or null to clear it. {queued}"),
+                "Set the person's rating of a film or series. Den's UI calls dislike \"Not for me\"; it is also a \
+                 taste signal that steers recommendations away. Use dislike for \"not for me\", \"not interested\" \
+                 or \"stop suggesting this\", like for \"I liked it\", love for \"I loved it\" or \"favourite\", and \
+                 null to clear a rating. {queued}"),
             "inputSchema": schema(json!({
-                "value": { "type": ["string", "null"], "enum": ["dislike", "like", "love", null] },
+                "value": { "type": ["string", "null"], "enum": ["dislike", "like", "love", null],
+                    "description": "dislike = Not for me (not interested, stop suggesting); like; love; null clears" },
             }), &["value"]),
             "annotations": annotations(false),
         },

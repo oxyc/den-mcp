@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The read tools, as `tools/list` names them.
-pub const TOOLS: [&str; 3] = ["den_watchlist", "den_continue_watching", "den_history"];
+pub const TOOLS: [&str; 4] = ["den_watchlist", "den_continue_watching", "den_history", "den_recommend"];
 
 /// The largest projection answer read from den-edge: its parts come to at most 16 MiB of characters (§15).
 const MAX_PROJECTION_ANSWER: usize = 17 * 1024 * 1024;
@@ -52,10 +52,17 @@ type Slot = Arc<tokio::sync::Mutex<Option<Held>>>;
 
 /// The lists the read tools share between calls: one slot a session, held across an open so concurrent calls wait
 /// for it instead of each doing their own.
-#[derive(Default)]
 pub struct Shared {
     slots: Mutex<HashMap<String, Slot>>,
     kept: Arc<AtomicUsize>,
+    /// Recommendation requests being built and asked at once: one.
+    recommending: tokio::sync::Semaphore,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Shared { slots: Mutex::default(), kept: Arc::default(), recommending: tokio::sync::Semaphore::new(1) }
+    }
 }
 
 impl Shared {
@@ -204,12 +211,17 @@ pub async fn call(ctx: &Ctx<'_>, writes: &Writes, tool: &str, args: &Value) -> R
         );
     }
     let lists = outcome.map_err(|Refused(_, message)| ToolError(message))?;
+    if query.list == "recommend" {
+        return recommend(ctx, writes, &lists, &query).await;
+    }
     Ok(answer(ctx, &lists, &query).await)
 }
 
 /// What a read tool was asked.
 struct Query {
     list: &'static str,
+    /// `den_recommend`: titles on the watchlist may be recommended.
+    include_watchlist: bool,
     kind: Option<&'static str>,
     since: Option<u64>,
     until: Option<u64>,
@@ -222,7 +234,13 @@ impl Query {
         let list = match tool {
             "den_watchlist" => "watchlist",
             "den_continue_watching" => "continue",
+            "den_recommend" => "recommend",
             _ => "seen",
+        };
+        let include_watchlist = match args.get("include_watchlist") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err(bad("include_watchlist is true or false")),
         };
         let kind = match string(args, "type")? {
             None | Some("all") => None,
@@ -240,8 +258,8 @@ impl Query {
         if since.zip(until).is_some_and(|(s, u)| s > u) {
             return Err(bad("since is after until"));
         }
-        let (page, limit) = paging(args, 20)?;
-        Ok(Query { list, kind, since, until, page, limit })
+        let (page, limit) = paging(args, if list == "recommend" { 10 } else { 20 })?;
+        Ok(Query { list, include_watchlist, kind, since, until, page, limit })
     }
 }
 
@@ -420,6 +438,238 @@ async fn cards(ctx: &Ctx<'_>, keys: &[(&'static str, u64)]) -> (HashMap<(&'stati
     (out, unnamed)
 }
 
+// ---- den_recommend
+
+/// How far back the library speaks for taste (Den Web's own window): a household's years-old titles outweigh what it
+/// watches now.
+const TASTE_WINDOW_MS: u64 = 180 * 86_400_000;
+/// The most library and owned titles atlas takes in one request (`recommend.rs` `MAX_LIBRARY`, `MAX_OWNED`), and the
+/// request body it refuses past 512 KiB.
+const MAX_LIBRARY: usize = 5000;
+const MAX_OWNED: usize = 10_000;
+const MAX_BODY: usize = 500 * 1024;
+/// The most slides atlas answers with.
+const MAX_SLIDES: usize = 300;
+
+/// What a title says about taste, as Den Web weighs it (`homeLibraryView.ts` `weightOf`): watched or part-watched
+/// counts full, watchlisted 0.6.
+struct Taste {
+    weight: f64,
+    at: u64,
+    /// Watched or part-watched, not only watchlisted.
+    engaged: bool,
+}
+
+fn taste(lists: &Lists) -> HashMap<u32, Taste> {
+    let when = |at: u64| if at == NO_TIME { 0 } else { at };
+    let mut by: HashMap<u32, Taste> = HashMap::new();
+    for e in &lists.watchlist {
+        let t = by.entry(e.title).or_insert(Taste { weight: 0.6, at: 0, engaged: false });
+        t.at = t.at.max(when(e.at));
+    }
+    for (title, at) in
+        lists.continuing.iter().map(|e| (e.title, e.at)).chain(lists.seen.iter().map(|e| (e.title, e.at)))
+    {
+        let t = by.entry(title).or_insert(Taste { weight: 1.0, at: 0, engaged: true });
+        t.weight = 1.0;
+        t.engaged = true;
+        t.at = t.at.max(when(at));
+    }
+    by
+}
+
+/// `POST /recommend`'s body for these lists, as Den Web builds its own: the library's titles with their weights (the
+/// recent ones, 180 days), and `owned`, every title atlas must not show — all that is watched or in progress, and
+/// the watchlist unless it may be recommended. No `hide` rules: nothing here knows the household's. At most
+/// `MAX_BODY` bytes, the library giving way.
+fn recommend_body(
+    lists: &Lists,
+    taste: &HashMap<u32, Taste>,
+    surface: &str,
+    include_watchlist: bool,
+    now_ms: u64,
+    limit: usize,
+) -> String {
+    use std::fmt::Write as _;
+    let newest_first = |a: &(u32, u64), b: &(u32, u64)| b.1.cmp(&a.1).then(a.0.cmp(&b.0));
+    let entry = |out: &mut String, title: u32, weight: Option<(f64, u64)>| {
+        let (kind, id) = lists.title(title);
+        let _ = write!(out, r#"{{"type":"{kind}","id":{id}"#);
+        if let Some((weight, at)) = weight {
+            let _ = write!(out, r#","weight":{weight},"at":{at}"#);
+        }
+        out.push('}');
+    };
+    let mut owned: Vec<(u32, u64)> =
+        taste.iter().filter(|(_, t)| t.engaged || !include_watchlist).map(|(&i, t)| (i, t.at)).collect();
+    owned.sort_unstable_by(newest_first);
+    owned.truncate(MAX_OWNED);
+    let mut owned_json = String::from("[");
+    for (n, (title, _)) in owned.iter().enumerate() {
+        if n > 0 {
+            owned_json.push(',');
+        }
+        entry(&mut owned_json, *title, None);
+    }
+    owned_json.push(']');
+
+    let mut library: Vec<(u32, u64)> = taste.iter().map(|(&i, t)| (i, t.at)).collect();
+    let since = now_ms.saturating_sub(TASTE_WINDOW_MS);
+    if library.iter().any(|(_, at)| *at >= since) {
+        library.retain(|(_, at)| *at >= since);
+    }
+    library.sort_unstable_by(newest_first);
+    let head = format!(
+        r#"{{"version":1,"surface":"{surface}","now":"{}","limit":{limit},"owned":{owned_json},"library":["#,
+        rfc3339(now_ms)
+    );
+    let mut out = head;
+    for (n, (title, at)) in library.iter().take(MAX_LIBRARY).enumerate() {
+        let mut one = String::new();
+        let t = &taste[title];
+        entry(&mut one, *title, Some((t.weight, *at)));
+        if out.len() + one.len() + 3 > MAX_BODY {
+            break;
+        }
+        if n > 0 {
+            out.push(',');
+        }
+        out.push_str(&one);
+    }
+    out.push_str("]}");
+    out
+}
+
+/// Den's own words for why atlas ranked a title, from the scorer's reason code. `quality` and `buzz` are leaves out:
+/// they weigh ratings and popularity, which are not for a model.
+fn why_of(reason: &str) -> Option<&'static str> {
+    Some(match reason {
+        "similar" => "Similar to what you've watched",
+        "profile" => "Fits your taste",
+        "people" => "Cast or creators you like",
+        "franchise" => "From a franchise you watch",
+        "arrived" => "New on streaming",
+        "recent" => "Recently released",
+        "upcoming" => "Coming soon",
+        "timely" => "New or coming soon",
+        _ => return None,
+    })
+}
+
+/// What to watch next, ranked by atlas against this household's lists, as Den Web's billboard is.
+async fn recommend(ctx: &Ctx<'_>, writes: &Writes, lists: &Lists, query: &Query) -> Result<Value, ToolError> {
+    #[derive(Deserialize)]
+    struct Ranked {
+        slides: Vec<Slide>,
+    }
+    #[derive(Deserialize)]
+    struct Slide {
+        #[serde(rename = "type")]
+        kind: String,
+        id: u64,
+        why: Option<Why>,
+    }
+    #[derive(Deserialize)]
+    struct Why {
+        reason: Option<String>,
+    }
+    let as_of = rfc3339(lists.at);
+    let (from, to) =
+        (query.page.saturating_mul(query.limit), query.page.saturating_add(1).saturating_mul(query.limit));
+    if from >= MAX_SLIDES {
+        return Ok(json!({
+            "results": [], "page": query.page, "more": false, "as_of": as_of,
+            "note": format!("Den ranks at most {MAX_SLIDES} titles; this page is past them."),
+        }));
+    }
+    let surface = match query.kind {
+        Some("movie") => "movies",
+        Some("series") => "series",
+        _ => "home",
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    // One at a time: a request is built from every title the household holds, so several at once would hold several.
+    let turn = writes.lists.recommending.acquire().await.expect("the semaphore is never closed");
+    let (engaged, held, body) = {
+        let taste = taste(lists);
+        let engaged = taste.values().filter(|t| t.engaged).count();
+        // One more than the page, so a next page is known to exist.
+        let body =
+            recommend_body(lists, &taste, surface, query.include_watchlist, now_ms, (to + 1).min(MAX_SLIDES));
+        (engaged, taste.len(), body)
+    };
+    let answer = ctx.atlas.post("/recommend", bytes::Bytes::from(body), ctx.rid).await?;
+    let ranked: Ranked = serde_json::from_slice(&answer)
+        .map_err(|_| ToolError("Den's index answered without a ranking.".into()))?;
+    drop(answer);
+    drop(turn);
+    let slides: Vec<(&'static str, u64, Option<&'static str>)> = ranked
+        .slides
+        .iter()
+        .filter_map(|s| {
+            let kind = match s.kind.as_str() {
+                "movie" => "movie",
+                "series" => "series",
+                _ => return None,
+            };
+            let why = s.why.as_ref().and_then(|w| w.reason.as_deref()).and_then(why_of);
+            (s.id > 0).then_some((kind, s.id, why))
+        })
+        .collect();
+    let more = slides.len() > to;
+    let shown: Vec<_> = slides.iter().skip(from).take(query.limit).collect();
+
+    let mut keys: Vec<(&'static str, u64)> = shown.iter().map(|(kind, id, _)| (*kind, *id)).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let (cards, unnamed) = cards(ctx, &keys).await;
+    // A title on the watchlist, when the watchlist may be recommended.
+    let on_watchlist: std::collections::HashSet<(&'static str, u64)> = if query.include_watchlist {
+        lists
+            .watchlist
+            .iter()
+            .map(|e| lists.title(e.title))
+            .filter(|k| keys.binary_search(k).is_ok())
+            .collect()
+    } else {
+        Default::default()
+    };
+    let results: Vec<Value> = shown
+        .iter()
+        .map(|(kind, id, why)| {
+            let mut item = match cards.get(&(*kind, *id)) {
+                Some(Value::Object(card)) => card.clone(),
+                _ => Map::new(),
+            };
+            if let Some(why) = why {
+                item.insert("why".into(), json!(why));
+            }
+            if on_watchlist.contains(&(*kind, *id)) {
+                item.insert("on_watchlist".into(), json!(true));
+            }
+            Value::Object(item)
+        })
+        .collect();
+
+    let mut note = format!(
+        "Ranked by Den against the {engaged} titles watched or in progress and {} on the watchlist, as of {as_of} \
+         (the last time a TV or Den Web published your lists). Titles already watched{} are left out. Ratings, \
+         including Not for me, are not shared with assistants, so a title marked Not for me but never watched can \
+         still appear; if one does, rate it with den_rate. At most {MAX_SLIDES} titles, best first.",
+        held - engaged,
+        if query.include_watchlist { "" } else { " or on the watchlist" },
+    );
+    if more {
+        note.push_str(" More on the next page.");
+    }
+    if unnamed > 0 {
+        note.push_str(&format!(" {unnamed} titles could not be named just now."));
+    }
+    Ok(json!({ "results": results, "page": query.page, "more": more, "as_of": as_of, "note": note }))
+}
+
 // ---- dates
 
 /// Days since 1970-01-01 of a civil date (Howard Hinnant's days-from-civil).
@@ -530,6 +780,22 @@ pub fn list() -> Value {
                 "type": kind, "page": page, "limit": limit } },
             "annotations": annotations,
         },
+        {
+            "name": "den_recommend",
+            "title": "What to watch next",
+            "description": "What the household should watch next, ranked by Den against what it has watched and \
+                added (as Den Web's billboard is), best first: use it for \"what should we watch\". Leaves out \
+                what is watched or in progress, and the watchlist unless include_watchlist is true. Paged, up to \
+                300 titles; `why` is Den's own short reason where it has one. As of the last time a TV or Den \
+                Web published the lists.",
+            "inputSchema": { "type": "object", "properties": {
+                "type": kind,
+                "include_watchlist": { "type": "boolean", "default": false,
+                    "description": "Also recommend titles already on the watchlist (marked on_watchlist)" },
+                "page": page,
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 10 } } },
+            "annotations": annotations,
+        },
     ])
 }
 
@@ -545,7 +811,8 @@ pub fn output_schema() -> Value {
             "as_of": { "type": "string" },
             "note": { "type": "string" },
         },
-        "required": ["results", "total", "page", "more", "note"],
+        // `total` is every list's but den_recommend's, whose ranking atlas cuts at 300.
+        "required": ["results", "page", "more", "note"],
     })
 }
 
@@ -565,5 +832,26 @@ mod tests {
         {
             assert_eq!(parse_time(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_huge_library_is_asked_within_atlas_s_limits() {
+        // 20,000 titles, all recent: atlas takes 10,000 owned, 5,000 library and 512 KiB of body.
+        let rows = |n: usize, per: &str| {
+            (0..n).map(|i| per.replace("{}", &i.to_string())).collect::<Vec<_>>().join(",")
+        };
+        let compact = format!(
+            r#"{{"at":1,"titles":[{}],"watchlist":[],"continue":[],"seen":[{}]}}"#,
+            rows(20_000, r#"["movie",100{}]"#),
+            rows(20_000, "[{},null,null,1789000000000]"),
+        );
+        let lists = Lists::parse(compact.as_bytes()).unwrap();
+        let held = taste(&lists);
+        let body = recommend_body(&lists, &held, "home", false, 1_790_000_000_000, 11);
+        assert!(body.len() <= 512 * 1024, "{} bytes", body.len());
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["owned"].as_array().unwrap().len(), MAX_OWNED);
+        let library = body["library"].as_array().unwrap().len();
+        assert!(library > 0 && library <= MAX_LIBRARY, "{library}");
     }
 }

@@ -49,6 +49,9 @@ server opens (den-spec `wire/assistant-v1.md`). Title arguments are `type` (`mov
 | `den_mark_seen` | `type`, `id`, `value?` (true), `season?`, `episode?` (series; episode needs season) | `seen` |
 | `den_rate` | `type`, `id`, `value` (`dislike`, `like`, `love` or null to clear) | `rate` |
 
+Den's UI calls `dislike` **Not for me**, and it is also a taste signal that steers recommendations away: the tool's
+description tells a model to use it for "not for me", "not interested" and "stop suggesting this".
+
 A call opens the grant key from `dw` (`MCP_WRITE_KEY`, bound to the token's `sub`), asks den-edge
 `GET /assistant/dropbox` for the library's drop-box key (kept a minute per session), signs and seals the request with
 `den-assistant` and `POST /assistant/append`s it, all with the caller's own token. The grant key lives for that call.
@@ -71,6 +74,20 @@ Den Web `url`; no TMDB field), with their ids and dates (UTC, RFC 3339) kept.
 | `den_watchlist` | `type?`, `page?`, `limit?` | `watchlist`, newest added first |
 | `den_continue_watching` | `page?`, `limit?` | `continue`: `action` `resume` (with `fraction`) or `next`, `season`, `episode` |
 | `den_history` | `since?`, `until?` (UTC date or time), `type?`, `page?`, `limit?` | `seen`, newest first; entries with no date only without a time range |
+| `den_recommend` | `type?` (movie, series, all), `include_watchlist?` (false), `page?`, `limit?` (10, ≤100) | all three, as the body of atlas's `POST /recommend` (below) |
+
+`den_recommend` ("what should we watch") asks atlas to rank, as Den Web's billboard does, so nothing here ranks. The body
+is Den Web's: `library` is every title watched or in progress (weight 1) and on the watchlist (0.6) with the time it
+was last touched, the recent 180 days if there are any (a library title with no date says nothing about now), at most
+5,000 and 500 KiB; `owned` is every title atlas must not show (all watched or in progress, and the watchlist unless
+`include_watchlist`), at most 10,000; `surface` is `home`, `movies` or `series`; `limit` the page and one more. There
+are no `hide` rules (den-mcp does not know the household's) and no `candidates`. A title is named like every other
+result, with its Den Web `url`; `why` is the scorer's reason code in Den's own words (`similar`, `profile`, `people`,
+`franchise`, `arrived`, `recent`, `upcoming`, `timely`), never its numeric terms, and `quality` and `buzz` give none
+since they weigh ratings and popularity. Atlas ranks at most 300, so `more` ends there. **A rating is not in the
+projection**, so likes, loves and Not for me marks do not shape the weights and a disliked title that was never
+watched can still appear (the answer's note says so); `include_watchlist` marks watchlisted results `on_watchlist`.
+One request is built and asked at a time, so it costs the memory of the list tools.
 
 A call opens the read key from `dr`, checks it names the same grant as `dw` when the token has both, `GET`s
 `/assistant/projection` with the caller's own token (`{library, grant, set, parts}`), opens the sealed, compressed parts
@@ -89,6 +106,8 @@ set, idle 3.3 MB):
 |---|---|---|---|
 | real size, 62 KB sealed | 6.0 MB | 6.5 MB | 7.1 MB |
 | large, 535 KB sealed (5,000 / 500 / 50,000) | 11.3 MB | 11.8 MB | 12.4 MB |
+| `den_recommend` only, real size | 5.8 MB | 6.1 MB | 6.4 MB |
+| `den_recommend` only, large | 11.1 MB | 11.6 MB | 11.5 MB |
 
 ### Open-vocabulary facets (scaffold only)
 
