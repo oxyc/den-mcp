@@ -677,7 +677,26 @@ async fn research_fetch(ctx: &Ctx<'_>, args: &Value) -> Answer {
     let (kind, n) = id.split_once(':').ok_or_else(|| bad("id is type:number, e.g. movie:949"))?;
     let facts = title_facts(ctx, &json!({ "type": kind, "id": n })).await?;
     if facts["indexed"] == false {
-        return Err(bad(format!("Den's index has nothing on {id}")));
+        // Not in the index, but Wikidata may name it: that much is all there is to say.
+        let Some(name) = facts["title"].as_str() else {
+            return Err(bad(format!("Den's index has nothing on {id}")));
+        };
+        let title = match facts["year"].as_i64() {
+            Some(year) => format!("{name} ({year})"),
+            None => name.to_owned(),
+        };
+        let mut text = format!(
+            "{title}, a {}. Den's index has no facts on it.",
+            if kind == "series" { "series" } else { "film" }
+        );
+        if let Some(original) = facts["original_title"].as_str() {
+            text.push_str(&format!(" Original title: {original}."));
+        }
+        text.push_str(&format!(" {WIKIDATA_NAME}"));
+        return Ok(json!({
+            "id": id, "title": name, "text": text, "url": facts["url"],
+            "metadata": { "type": kind, "source": "Wikidata", "attribution": "Title, year and original title from Wikidata (CC0)." },
+        }));
     }
     let list = |key: &str| -> Option<String> {
         let names: Vec<&str> =
@@ -1072,6 +1091,31 @@ pub(crate) fn title(cfg: &Config, card: &Value) -> Option<Value> {
     out.insert("url".into(), json!(title_url(cfg, kind, id, name)));
     Some(Value::Object(out))
 }
+
+/// A title the index does not hold, as a result: `indexed: false` and its Den Web link, and — where atlas names it
+/// from Wikidata (CC0; `source: "wikidata"`) — its name, year and original name, marked `name_source`. A title
+/// Wikidata does not name stays without a name.
+pub(crate) fn unindexed(cfg: &Config, kind: &str, id: u64, answer: &Value) -> Value {
+    let named = answer.get("source").and_then(Value::as_str) == Some("wikidata");
+    let mut out = Map::new();
+    out.insert("type".into(), json!(kind));
+    out.insert("id".into(), json!(id));
+    out.insert("indexed".into(), json!(false));
+    let name = named.then(|| text(answer.get("title"))).flatten();
+    if let Some(name) = &name {
+        out.insert("title".into(), name.clone());
+        out.insert("name_source".into(), json!("wikidata"));
+        let year = integer_value(answer.get("year"))
+            .filter(|y| y.as_i64().is_some_and(|y| (1850..=2200).contains(&y)));
+        put(&mut out, "year", year);
+        put(&mut out, "original_title", text(answer.get("originalTitle")));
+    }
+    out.insert("url".into(), json!(title_url(cfg, kind, id, name.as_ref().and_then(Value::as_str))));
+    Value::Object(out)
+}
+
+/// Said with a name that comes from Wikidata.
+pub(crate) const WIKIDATA_NAME: &str = "Name from Wikidata (CC0).";
 
 fn titles(cfg: &Config, cards: Option<&Value>) -> Vec<Value> {
     cards.and_then(Value::as_array).into_iter().flatten().filter_map(|c| title(cfg, c)).collect()
@@ -2097,10 +2141,17 @@ async fn title_facts(ctx: &Ctx<'_>, args: &Value) -> Answer {
     let (kind, id) = title_key(args)?;
     let (answer, _) = ctx.atlas.get(&format!("/index/title/{kind}/{id}.json"), ctx.rid).await?;
     if answer.get("indexed") != Some(&json!(true)) {
-        return Ok(json!({
-            "type": kind, "id": id, "indexed": false,
-            "note": "Den's index has nothing on this title; it may still exist.",
-        }));
+        let mut out = unindexed(ctx.cfg, kind, id, &answer);
+        let named = out.get("name_source").is_some();
+        out["note"] = json!(if named {
+            format!("Den's index has no facts on this title. {WIKIDATA_NAME}")
+        } else {
+            "Den's index has nothing on this title; it may still exist.".to_owned()
+        });
+        if named {
+            out["attribution"] = json!("Title, year and original title from Wikidata (CC0).");
+        }
+        return Ok(out);
     }
     let mut out = match title(ctx.cfg, &answer) {
         Some(Value::Object(map)) => map,
