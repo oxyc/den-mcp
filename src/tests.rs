@@ -123,6 +123,15 @@ fn canned(path: &str) -> Option<Value> {
         title
     } else if path == "/index/studios/movie/949.json" {
         json!({ "studios": [{ "id": "Q159846", "name": "Warner Bros." }, { "id": "not-a-qid", "name": "x" }] })
+    } else if path == "/index/title/movie/646371.json" {
+        // Not in the index; Wikidata names it (atlas 0.93.0). The overview is planted: it must not come through.
+        json!({ "type": "movie", "id": 646371, "indexed": false, "title": "Diana's Wedding", "year": 2020,
+                "originalTitle": "Dianas bryllup", "source": "wikidata", "overview": "TMDB text" })
+    } else if path == "/index/title/series/700000.json" {
+        json!({ "type": "series", "id": 700000, "indexed": false, "title": "Obscure Show", "source": "wikidata" })
+    } else if path == "/index/title/movie/700001.json" {
+        // A name from anywhere but Wikidata is not used.
+        json!({ "type": "movie", "id": 700001, "indexed": false, "title": "Someone Else's Name", "source": "tmdb" })
     } else if path.starts_with("/index/title/") {
         json!({ "type": "movie", "id": 1, "indexed": false })
     } else {
@@ -1802,6 +1811,80 @@ async fn what_den_edge_answers_instead_of_a_projection_is_said_in_plain_words() 
     }
     let error = reader("http://127.0.0.1:1").await.tool("den_watchlist", json!({})).await.unwrap_err();
     assert!(error.contains("could not reach"), "{error}");
+}
+
+#[tokio::test]
+async fn a_title_the_index_lacks_is_named_by_wikidata_where_atlas_has_the_name() {
+    let s = Server::new().await;
+    let named = s.tool("den_title", json!({ "type": "movie", "id": 646371 })).await.unwrap();
+    assert_eq!(
+        (
+            named["indexed"].clone(),
+            named["title"].clone(),
+            named["year"].clone(),
+            named["original_title"].clone(),
+            named["name_source"].clone()
+        ),
+        (json!(false), json!("Diana's Wedding"), json!(2020), json!("Dianas bryllup"), json!("wikidata"))
+    );
+    assert!(named["url"].as_str().unwrap().starts_with("https://den.example/movie/646371-diana"));
+    let note = named["note"].as_str().unwrap();
+    assert!(note.contains("Wikidata (CC0)") && !note.contains("nothing on this title"), "{note}");
+    assert!(named["attribution"].as_str().unwrap().contains("Wikidata (CC0)"));
+    assert!(!named.to_string().contains("TMDB text"), "only the allowlisted names come through");
+    // Year and original title only when known.
+    let bare = s.tool("den_title", json!({ "type": "series", "id": 700000 })).await.unwrap();
+    assert_eq!(
+        (bare["title"].clone(), bare["name_source"].clone()),
+        (json!("Obscure Show"), json!("wikidata"))
+    );
+    assert!(bare.get("year").is_none() && bare.get("original_title").is_none());
+    // A name from another source, and a title nothing names, stay unnamed with the old wording.
+    for (kind, id) in [("movie", 700001), ("movie", 1)] {
+        let none = s.tool("den_title", json!({ "type": kind, "id": id })).await.unwrap();
+        assert!(none.get("title").is_none() && none.get("name_source").is_none(), "{none}");
+        assert_eq!(none["indexed"], false);
+        assert!(none["note"].as_str().unwrap().contains("nothing on this title"));
+    }
+
+    // fetch quotes it, with its credit; one nothing names is still an error.
+    let fetched = s.tool("fetch", json!({ "id": "movie:646371" })).await.unwrap();
+    let text = fetched["text"].as_str().unwrap();
+    for said in ["Diana's Wedding (2020), a film", "Dianas bryllup", "Wikidata (CC0)"] {
+        assert!(text.contains(said), "{said}: {text}");
+    }
+    assert_eq!(fetched["metadata"]["source"], "Wikidata");
+    assert!(fetched["url"].as_str().unwrap().contains("/movie/646371-"));
+    assert!(s.tool("fetch", json!({ "id": "movie:1" })).await.is_err());
+}
+
+#[tokio::test]
+async fn the_read_tools_name_a_title_the_index_lacks_from_wikidata() {
+    let (s, _) = reader_of(json!({
+        "watchlist": [
+            { "title": { "type": "movie", "id": 646371 }, "addedAt": 1_789_900_000_000u64 },
+            { "title": { "type": "tv", "id": 700000 }, "addedAt": 1_789_800_000_000u64 },
+            { "title": { "type": "movie", "id": 700001 }, "addedAt": 1_789_700_000_000u64 },
+        ],
+        "continue": [], "seen": [], "rated": [],
+        "hide": { "minYear": null, "genres": [], "languages": [], "anime": false },
+    }))
+    .await;
+    let answer = s.tool("den_watchlist", json!({})).await.unwrap();
+    let results = answer["results"].as_array().unwrap();
+    assert_eq!(
+        (results[0]["title"].clone(), results[0]["year"].clone()),
+        (json!("Diana's Wedding"), json!(2020))
+    );
+    assert_eq!(
+        (results[0]["name_source"].clone(), results[0]["indexed"].clone()),
+        (json!("wikidata"), json!(false))
+    );
+    assert_eq!(results[0]["original_title"], "Dianas bryllup");
+    assert_eq!(results[1]["title"], "Obscure Show");
+    assert!(results[2].get("title").is_none() && results[2].get("name_source").is_none());
+    assert!(answer["note"].as_str().unwrap().contains("Wikidata (CC0)"));
+    assert!(!answer.to_string().contains("TMDB text") && !answer.to_string().contains("Someone Else"));
 }
 
 #[tokio::test]

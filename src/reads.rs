@@ -11,7 +11,7 @@
 //! they expire.
 
 use crate::projection::{Continue, Lists, Rated, Reaction, Seen, Watch, NO_NUMBER, NO_TIME};
-use crate::tools::{bad, paging, string, title, title_url, Ctx, ToolError};
+use crate::tools::{bad, paging, string, title, title_url, unindexed, Ctx, ToolError, WIKIDATA_NAME};
 use crate::writes::{error_code, refuse, Refused, Writes};
 use den_assistant::{open_claim, open_projection_compact, open_read_claim, ReadKey};
 use futures_util::future::join_all;
@@ -450,6 +450,7 @@ async fn answer(ctx: &Ctx<'_>, lists: &Lists, query: &Query) -> Value {
     if unnamed > 0 {
         note.push_str(&format!(" {unnamed} titles could not be named just now."));
     }
+    credit_wikidata(&results, &mut note);
     json!({
         "results": results,
         "total": total,
@@ -460,8 +461,18 @@ async fn answer(ctx: &Ctx<'_>, lists: &Lists, query: &Query) -> Value {
     })
 }
 
+/// Say so in the note when any title on the page is named by Wikidata (CC0), which the title's `name_source` also says.
+fn credit_wikidata(results: &[Value], note: &mut String) {
+    if results.iter().any(|r| r.get("name_source").is_some()) {
+        note.push_str(&format!(
+            " Titles marked name_source wikidata are not in Den's index. {WIKIDATA_NAME}"
+        ));
+    }
+}
+
 /// Each title as a discovery tool gives it (name, year, genre, Den Web link), from den-atlas, which caches. A title
-/// atlas does not index is `indexed: false` with its link; one atlas failed on is left unnamed (and counted).
+/// atlas does not index is `indexed: false` with its link, and the name Wikidata gives it where atlas has one; one
+/// atlas failed on is left unnamed (and counted).
 async fn cards(ctx: &Ctx<'_>, keys: &[(&'static str, u64)]) -> (HashMap<(&'static str, u64), Value>, usize) {
     let lookups = keys.iter().map(|&(kind, id)| async move {
         (kind, id, ctx.atlas.get(&format!("/index/title/{kind}/{id}.json"), ctx.rid).await)
@@ -472,9 +483,7 @@ async fn cards(ctx: &Ctx<'_>, keys: &[(&'static str, u64)]) -> (HashMap<(&'stati
         let plain = json!({ "type": kind, "id": id, "url": title_url(ctx.cfg, kind, id, None) });
         let card = match found {
             Ok((answer, _)) if answer.get("indexed") == Some(&json!(true)) => title(ctx.cfg, &answer),
-            Ok(_) => Some(
-                json!({ "type": kind, "id": id, "indexed": false, "url": title_url(ctx.cfg, kind, id, None) }),
-            ),
+            Ok((answer, _)) => Some(unindexed(ctx.cfg, kind, id, &answer)),
             Err(failed) => {
                 eprintln!("atlas: {}", failed.detail);
                 unnamed += 1;
@@ -736,6 +745,7 @@ async fn recommend(ctx: &Ctx<'_>, writes: &Writes, lists: &Lists, query: &Query)
     if unnamed > 0 {
         note.push_str(&format!(" {unnamed} titles could not be named just now."));
     }
+    credit_wikidata(&results, &mut note);
     Ok(json!({ "results": results, "page": query.page, "more": more, "as_of": as_of, "note": note }))
 }
 

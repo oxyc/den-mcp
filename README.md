@@ -177,8 +177,11 @@ its own. A last guard refuses any tool answer carrying prose under the keys atla
 (`overview`, `plot`, `summary`, …).
 
 Every list says it is drawn from Den's index (~47k titles), not the catalogue, and a title Den does not index is
-`indexed: false`. Den's labels and plot facets come with their attribution: derived from Wikipedia article text
-(CC BY-SA 4.0); people and credits are Wikidata's (CC0).
+`indexed: false`. Since den-atlas 0.93.0 atlas names such a title from Wikidata when it can (`source: "wikidata"`): the
+tools that name a title (the read tools, `den_recommend`, `den_title`, `fetch`) then carry `title`, `year` and
+`original_title` — only those, allowlisted — with `name_source: "wikidata"` and a note crediting Wikidata (CC0); a title
+Wikidata does not name, or whose name has another source, stays without one. Den's labels and plot facets come with
+their attribution: derived from Wikipedia article text (CC BY-SA 4.0); people and credits are Wikidata's (CC0).
 
 ## Authorization
 
