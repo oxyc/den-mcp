@@ -14,8 +14,8 @@ use std::collections::HashMap;
 /// The read tools, as `tools/list` names them.
 pub const TOOLS: [&str; 3] = ["den_watchlist", "den_continue_watching", "den_history"];
 
-/// The largest projection answer read from den-edge.
-const MAX_PROJECTION_ANSWER: usize = 8 * 1024 * 1024;
+/// The largest projection answer read from den-edge: its parts come to at most 16 MiB of characters (§15).
+const MAX_PROJECTION_ANSWER: usize = 17 * 1024 * 1024;
 
 const DENIED: &str =
     "This connection can't read your lists — reconnect and allow reading your watchlist and history.";
@@ -72,7 +72,12 @@ impl Writes {
             }
         }
         let field = |name: &str| answer.get(name).and_then(Value::as_str);
-        let (Some(library), Some(grant), Some(sealed)) = (field("library"), field("grant"), field("sealed"))
+        let parts: Option<Vec<String>> = answer
+            .get("parts")
+            .and_then(Value::as_array)
+            .and_then(|parts| parts.iter().map(|p| p.as_str().map(str::to_owned)).collect());
+        let (Some(library), Some(grant), Some(set), Some(parts)) =
+            (field("library"), field("grant"), field("set"), parts)
         else {
             return Err(refuse("edge_error", "Den could not read your lists right now; try again later."));
         };
@@ -80,7 +85,7 @@ impl Writes {
         if grant != key.grant() {
             return Err(refuse("grant_mismatch", DENIED));
         }
-        open_projection(key.key(), library, grant, sealed)
+        open_projection(key.key(), library, grant, set, &parts)
             .map_err(|_| refuse("unreadable", "Den could not read your lists right now; try again later."))
     }
 }
@@ -223,16 +228,15 @@ async fn answer(ctx: &Ctx<'_>, projection: &Value, query: &Query) -> Value {
         })
         .collect();
 
+    let shown_count = query.page * query.limit + results.len();
     let as_of = projection.get("at").and_then(Value::as_u64).map(rfc3339);
-    let omitted =
-        projection.pointer(&format!("/omitted/{}", query.list)).and_then(Value::as_u64).unwrap_or(0);
     let mut note = format!(
         "As of {}: the last time a TV or Den Web published your lists, so it lags anything done since, and \
          anything done while neither was open is not here.",
         as_of.as_deref().unwrap_or("an unknown time")
     );
-    if omitted > 0 {
-        note.push_str(&format!(" {omitted} more entries exist that the shared list leaves out."));
+    if total > shown_count {
+        note.push_str(&format!(" {} more on the next page.", total - shown_count));
     }
     if untimed > 0 {
         note.push_str(&format!(" {untimed} entries with no date were left out of the time range."));
@@ -240,14 +244,12 @@ async fn answer(ctx: &Ctx<'_>, projection: &Value, query: &Query) -> Value {
     if unnamed > 0 {
         note.push_str(&format!(" {unnamed} titles could not be named just now."));
     }
-    let shown_count = query.page * query.limit + results.len();
     json!({
         "results": results,
         "total": total,
         "page": query.page,
         "more": total > shown_count,
         "as_of": as_of,
-        "omitted": omitted,
         "note": note,
     })
 }
@@ -401,7 +403,6 @@ pub fn output_schema() -> Value {
             "page": { "type": "integer" },
             "more": { "type": "boolean" },
             "as_of": { "type": "string" },
-            "omitted": { "type": "integer" },
             "note": { "type": "string" },
         },
         "required": ["results", "total", "page", "more", "note"],

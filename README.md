@@ -62,8 +62,8 @@ tool and a status word, never an argument or key.
 Listed only when `MCP_WRITE_KEY` is set **and** the token carries the `den:library.read` scope with a `dr` claim this
 server opens for the token's session (den-spec `wire/assistant-v1.md` §15); a read-only connection needs no write
 scope. Every one is `readOnlyHint` and paged (`page?`, `limit?` 20, ≤100), with `total`, `more`, `as_of` (when a device
-published the lists), `omitted` (entries the shared list left out) and a `note` that says the lists are only as fresh as
-the last time a TV or Den Web was open. Titles are named through atlas like every discovery tool (name, year, genre,
+published the lists) and a `note` that says the lists are only as fresh as the last time a TV or Den Web was open. The
+projection is the whole library, never cut short, so `limit` is only the page size; `more` says there is another page. Titles are named through atlas like every discovery tool (name, year, genre,
 Den Web `url`; no TMDB field), with their ids and dates (UTC, RFC 3339) kept.
 
 | Tool | Parameters | From the projection |
@@ -73,8 +73,8 @@ Den Web `url`; no TMDB field), with their ids and dates (UTC, RFC 3339) kept.
 | `den_history` | `since?`, `until?` (UTC date or time), `type?`, `page?`, `limit?` | `seen`, newest first; entries with no date only without a time range |
 
 A call opens the read key from `dr`, checks it names the same grant as `dw` when the token has both, `GET`s
-`/assistant/projection` with the caller's own token, opens it with `open_projection` (which checks its library and
-grant) and answers from it. A `404 no_projection` says to open Den on the TV or web once. The log line is the tool and a
+`/assistant/projection` with the caller's own token (`{library, grant, set, parts}`), opens the sealed, compressed parts
+with `open_projection` (which checks the set whole and in order, its library and grant) and answers from it. A `404 no_projection` says to open Den on the TV or web once. The log line is the tool and a
 status word.
 
 ### Open-vocabulary facets (scaffold only)
@@ -187,7 +187,7 @@ Measured with `cargo run --release --example load` (a stub atlas answering a 24-
 | a tool call answered from the cache | p50 0.14 ms, p99 0.29 ms |
 | 8 concurrent callers | ~8,000 calls/s, p50 0.97 ms, p99 1.4 ms |
 
-The release binary is ~3.1 MB (2.85 MB before library writes; X-Wing, HPKE and AES-GCM from `den-assistant` add ~0.28 MB).
+The release binary is ~3.2 MB (2.85 MB before library writes and reads; `den-assistant`'s X-Wing, HPKE, AES-GCM and DEFLATE add ~0.38 MB).
 
 ## Development
 

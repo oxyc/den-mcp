@@ -1442,8 +1442,8 @@ fn projection_answer() -> (u16, Value) {
     let f = fixed();
     (
         200,
-        json!({ "library": f["library"], "grant": f["grant"]["id"], "sealed": f["read"]["projection"]["sealed"],
-                "storedAt": 1_790_000_001_000u64 }),
+        json!({ "library": f["library"], "grant": f["grant"]["id"], "set": f["read"]["projection"]["set"],
+                "parts": f["read"]["projection"]["parts"], "storedAt": 1_790_000_001_000u64 }),
     )
 }
 
@@ -1490,12 +1490,54 @@ fn the_vectors_read_claim_and_projection_open_only_for_their_own() {
     );
 
     let (library, grant) = (f["library"].as_str().unwrap(), f["grant"]["id"].as_str().unwrap());
-    let sealed = f["read"]["projection"]["sealed"].as_str().unwrap();
-    let opened = den_assistant::open_projection(read.key(), library, grant, sealed).unwrap();
-    assert_eq!(opened, f["read"]["projection"]["plaintext"]);
-    assert!(den_assistant::open_projection(read.key(), "0".repeat(32).as_str(), grant, sealed).is_err());
-    assert!(den_assistant::open_projection(read.key(), library, "0".repeat(32).as_str(), sealed).is_err());
-    assert!(den_assistant::open_projection(&[0; 32], library, grant, sealed).is_err());
+    let projection = &f["read"]["projection"];
+    let set = projection["set"].as_str().unwrap();
+    let parts: Vec<String> =
+        projection["parts"].as_array().unwrap().iter().map(|p| p.as_str().unwrap().to_owned()).collect();
+    let key = read.key();
+    let opened = den_assistant::open_projection(key, library, grant, set, &parts).unwrap();
+    assert_eq!(opened, projection["view"]);
+    let zeros = "0".repeat(32);
+    assert!(den_assistant::open_projection(key, &zeros, grant, set, &parts).is_err(), "another library");
+    assert!(den_assistant::open_projection(key, library, &zeros, set, &parts).is_err(), "another grant");
+    assert!(den_assistant::open_projection(key, library, grant, &zeros, &parts).is_err(), "another publish");
+    assert!(den_assistant::open_projection(&[0; 32], library, grant, set, &parts).is_err());
+    assert!(den_assistant::open_projection(key, library, grant, set, &[]).is_err(), "no parts");
+    let doubled = [parts.clone(), parts].concat();
+    assert!(den_assistant::open_projection(key, library, grant, set, &doubled).is_err(), "an extra part");
+}
+
+#[tokio::test]
+async fn a_large_library_is_read_whole_and_paged() {
+    let f = fixed();
+    let read = den_assistant::open_read_claim(
+        &seed(&f["mcp"]),
+        f["sub"].as_str().unwrap(),
+        f["read"]["claim"].as_str().unwrap(),
+    )
+    .unwrap();
+    // 60,000 plays of 3,000 films: a list far longer than any cap the earlier projection had, which must come
+    // through whole and page to its last entry.
+    let seen: Vec<Value> = (0..60_000u64)
+        .map(|n| json!({ "title": { "type": "movie", "id": 1 + n % 3000 }, "at": 1_789_000_000_000u64 - n * 1000 }))
+        .collect();
+    let view = json!({ "v": 1, "library": f["library"], "grant": f["grant"]["id"], "at": 1_790_000_000_000u64,
+                       "head": 1, "watchlist": [], "continue": [], "seen": seen });
+    let sealed = den_assistant::seal_projection(read.key(), &view, &[9; 32]).unwrap();
+    let answer = (
+        200,
+        json!({ "library": f["library"], "grant": f["grant"]["id"], "set": sealed.set, "parts": sealed.parts,
+                "storedAt": 1u64 }),
+    );
+    let (edge, _) = stub_edge_with(dropbox_answer(), queued(), answer).await;
+    let s = reader(&edge).await;
+    let page = s.tool("den_history", json!({ "page": 590, "limit": 100 })).await.unwrap();
+    assert_eq!((page["total"].clone(), page["more"].clone()), (json!(60_000), json!(true)));
+    assert_eq!(page["results"].as_array().unwrap().len(), 100);
+    let last = s.tool("den_history", json!({ "page": 599, "limit": 100 })).await.unwrap();
+    assert_eq!((last["results"].as_array().unwrap().len(), last["more"].clone()), (100, json!(false)));
+    let beyond = s.tool("den_history", json!({ "page": 600, "limit": 100 })).await.unwrap();
+    assert_eq!((beyond["results"].as_array().unwrap().len(), beyond["more"].clone()), (0, json!(false)));
 }
 
 #[tokio::test]
@@ -1641,19 +1683,30 @@ async fn a_connection_that_cannot_read_is_told_so_and_den_edge_is_not_called() {
 #[tokio::test]
 async fn what_den_edge_answers_instead_of_a_projection_is_said_in_plain_words() {
     let f = fixed();
-    let (library, grant, sealed) = (&f["library"], &f["grant"]["id"], &f["read"]["projection"]["sealed"]);
+    let (library, grant) = (&f["library"], &f["grant"]["id"]);
+    let (set, parts) = (&f["read"]["projection"]["set"], &f["read"]["projection"]["parts"]);
     let answers = [
         ((404, json!({ "error": "no_projection" })), "hasn't shared your lists yet"),
         ((401, json!({ "error": "invalid_token" })), "reconnect Den"),
         ((403, json!({ "error": "insufficient_scope" })), "allow reading"),
         ((500, json!({ "error": "oops" })), "try again later"),
         // Someone else's grant, another library's projection, and bytes that do not open.
-        ((200, json!({ "library": library, "grant": "0".repeat(32), "sealed": sealed })), "allow reading"),
         (
-            (200, json!({ "library": "f".repeat(32), "grant": grant, "sealed": sealed })),
+            (200, json!({ "library": library, "grant": "0".repeat(32), "set": set, "parts": parts })),
+            "allow reading",
+        ),
+        (
+            (200, json!({ "library": "f".repeat(32), "grant": grant, "set": set, "parts": parts })),
             "could not read your lists",
         ),
-        ((200, json!({ "library": library, "grant": grant, "sealed": "AAAA" })), "could not read your lists"),
+        (
+            (200, json!({ "library": library, "grant": grant, "set": "0".repeat(32), "parts": parts })),
+            "could not read your lists",
+        ),
+        (
+            (200, json!({ "library": library, "grant": grant, "set": set, "parts": ["AAAA"] })),
+            "could not read your lists",
+        ),
         ((200, json!({ "library": library })), "try again later"),
     ];
     for (projection, said) in answers {
