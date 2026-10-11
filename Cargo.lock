@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "aead"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -179,12 +185,13 @@ dependencies = [
 [[package]]
 name = "den-assistant"
 version = "0.1.0"
-source = "git+https://github.com/oxyc/den-core.git?tag=den-assistant-v1.1#fd397557fbe1e17c994bf70f871692fee1a209a5"
+source = "git+https://github.com/oxyc/den-core.git?tag=den-assistant-v1.3#c602f7e4f6480872e5cd4c896aee7dca67b21074"
 dependencies = [
  "aes-gcm",
  "ed25519-dalek",
  "hkdf",
  "hpke",
+ "miniz_oxide",
  "rand_core",
  "serde_json",
  "sha2",
@@ -534,6 +541,15 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "miniz_oxide"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
+dependencies = [
+ "adler2",
+]
 
 [[package]]
 name = "mio"
