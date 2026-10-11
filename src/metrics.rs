@@ -45,7 +45,7 @@ impl Metrics {
         let _ = writeln!(
             out,
             "# HELP mcp_build_info The running build.\n# TYPE mcp_build_info gauge\nmcp_build_info{{version=\"{}\"}} 1",
-            env!("CARGO_PKG_VERSION")
+            crate::release_version()
         );
         let counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
         for (name, help) in HELP {
