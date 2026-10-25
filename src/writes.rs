@@ -289,14 +289,16 @@ impl Writes {
                     [] if tvs.online => return Ok(None),
                     [] => return Err(refuse("tv_offline", TV_OFF)),
                     [tv] => *tv,
-                    several => return Err(refuse(
-                        "choose_tv",
-                        &format!(
-                            "Den is open on {}. Ask which one to play on, then call again with tv. Nothing \
+                    several => {
+                        return Err(refuse(
+                            "choose_tv",
+                            &format!(
+                                "Den is open on {}. Ask which one to play on, then call again with tv. Nothing \
                                  was sent.",
-                            names(several.iter().copied())
-                        ),
-                    )),
+                                names(several.iter().copied())
+                            ),
+                        ))
+                    }
                 }
             }
         };
