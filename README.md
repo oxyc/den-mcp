@@ -63,20 +63,23 @@ tool and a status word, never an argument or key.
 
 **Playing on the TV** (den-spec §16). `den_play_on_tv` and `den_play_trailer` are requests like the others, sealed
 and signed the same way, but they belong in the TV queue (`den_assistant::Queue::of`): the append carries
-`"queue": "tv"`, which only a TV with Den open drains, and a play older than two minutes is stale. So before sealing
-anything they ask `GET /assistant/tv`; if the TV is not online the answer is "Open Den on the TV first" and nothing is
-queued. After the append they ask `GET /assistant/request/{seq}?queue=tv` every 0.4 s for up to 8 s and answer
+`"queue": "tv"`, which only a TV with Den open drains, and a play older than two minutes is stale. Before sealing
+anything they ask `GET /assistant/tv`; a TV can receive the play when Den is online there or when its household
+controller reports it `wakeable` and can wake the receiver and open Den. If neither is true, nothing is queued. After
+the append they ask `GET /assistant/request/{seq}?queue=tv` every 0.4 s for up to 8 s and answer
 `state: "taken"` ("The TV picked it up") or `"queued"` (not yet). `taken` is all den-edge can know: whether anything
 played is not observable, so the note says that a connection made before TV playback has no play record, its plays are
 refused at the TV, and the owner reconnects the assistant with "Allow changes to my library and playing on my TV"
-ticked. `den_tv_status` answers `{online, last_seen_at, tvs}`. These tools are listed with the write tools (a token does
-not say whether its connection may play).
+ticked. `den_tv_status` answers `{online, wakeable, last_seen_at, tvs}`; every named TV separately reports `online`
+and `wakeable`, because registered to wake does not mean Den is already open. These tools are listed with the write
+tools (a token does not say whether its connection may play).
 
 **Several TVs** (§16 *TV lanes*). Each TV drains a lane of its own and names it, and `GET /assistant/tv` lists them
-(`tvs`). A play goes to the lane of the TV named in `tv` (any case), else to the one TV with Den open; with several
-open and none named, the answer names them and asks which, and nothing is sent. The append carries `"tv": <lane>` and
-the request is watched with `&tv=<lane>`. A household whose TVs list no lane (a TV from before lanes) plays from the
-shared TV queue as before.
+(`tvs`). A play goes to the lane of the TV named in `tv` (any case), else to the sole TV that is online or wakeable;
+with several possible targets and none named, the answer names them and asks which, and nothing is sent. The append
+carries `"tv": <lane>` and the request is watched with `&tv=<lane>`. An older den-edge omits `wakeable`, which is read
+as false. A household whose TVs list no usable lane but whose pre-lane TV is online plays from the shared TV queue as
+before.
 
 `cargo run --example writekey` makes a key pair: `MCP_WRITE_KEY` for den-mcp, `MCP_WRITE_PUBLIC_KEY` for den-edge.
 

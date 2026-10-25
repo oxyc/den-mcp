@@ -58,8 +58,8 @@ const TAKEN_NOTE: &str =
     playing on my TV\" ticked.";
 /// And when it has not yet.
 const WAITING_NOTE: &str =
-    "Sent to the TV, which has not picked it up yet. A play older than two minutes is \
-    dropped, so ask again if the TV stays idle.";
+    "Sent to the TV, which has not picked it up yet. It may still be waking or opening Den. A play older than two \
+    minutes is dropped, so ask again if the TV stays idle.";
 const TV_OFF: &str =
     "Open Den on the TV first — it isn't running, so it can't play anything yet. Nothing was sent.";
 const CHOOSE_TV: &str = "Ask which one to play on, then call again with tv. Nothing was sent.";
@@ -75,6 +75,9 @@ struct Tvs {
 struct Tv {
     lane: String,
     name: Option<String>,
+    /// Registered with the household controller, which can wake the receiver and open Den. Older den-edge answers
+    /// omit this, and are deliberately treated as false.
+    wakeable: bool,
     online: bool,
     last_seen: Option<u64>,
 }
@@ -82,6 +85,10 @@ struct Tv {
 impl Tv {
     fn called(&self) -> &str {
         self.name.as_deref().unwrap_or("a TV with no name")
+    }
+
+    fn can_receive(&self) -> bool {
+        self.online || self.wakeable
     }
 }
 
@@ -189,8 +196,9 @@ impl Writes {
         };
         let grant = caller.write.as_ref().ok_or_else(denied)?;
         let key = open_claim(&self.secret, &caller.session, &grant.claim).map_err(|_| denied())?;
-        // A play that would go stale is not queued: the TV must be open to take it. With several TVs it goes to the
-        // lane of the one meant; with none listed, to the shared TV queue.
+        // A play that would go stale is not queued: its TV must be open, or registered with the household controller
+        // that wakes it and opens Den. With several TVs it goes to the lane of the one meant; with none listed, to the
+        // shared TV queue.
         let tv = Queue::of(op) == Queue::Tv;
         let target = if tv { Some(self.target(&grant.token, wanted).await?) } else { None };
         let lane = target.as_ref().and_then(|tv| tv.as_ref().map(|(lane, _)| lane.clone()));
@@ -227,7 +235,7 @@ impl Writes {
             (403, _) => Err(denied()),
             (404, Some("unknown_tv")) => Err(refuse(
                 "tv_offline",
-                "That TV hasn't had Den open lately, so it can't play anything yet. Nothing was sent.",
+                "That TV is no longer registered to wake and hasn't had Den open lately. Nothing was sent.",
             )),
             (409, _) if tv => Err(refuse(
                 "queue_full",
@@ -254,8 +262,8 @@ impl Writes {
     }
 
     /// Where a play goes: `None` the shared TV queue, when no TV has a lane (a TV from before lanes); otherwise the lane
-    /// and name of the TV `wanted` names (any case), or of the one TV awake. Refused, with the TVs named, when that TV
-    /// isn't awake, no TV is, or several are and none was named.
+    /// and name of the TV `wanted` names (any case), or of the sole TV that is online or wakeable. Refused, with the
+    /// TVs named, when that TV cannot receive a play, no TV can, or several can and none was named.
     async fn target(&self, token: &str, wanted: Option<&str>) -> Result<Option<(String, String)>, Refused> {
         let tvs = self.tv(token).await?;
         if tvs.lanes.is_empty() {
@@ -272,11 +280,11 @@ impl Writes {
                         ),
                     ));
                 };
-                if !tv.online {
+                if !tv.can_receive() {
                     return Err(refuse(
                         "tv_offline",
                         &format!(
-                            "Open Den on {} first — it isn't running there. Nothing was sent.",
+                            "Open Den on {} first — it isn't running there or registered to wake. Nothing was sent.",
                             tv.called()
                         ),
                     ));
@@ -284,15 +292,18 @@ impl Writes {
                 tv
             }
             None => {
-                let awake: Vec<&Tv> = tvs.lanes.iter().filter(|tv| tv.online).collect();
-                match awake.as_slice() {
+                let possible: Vec<&Tv> = tvs.lanes.iter().filter(|tv| tv.can_receive()).collect();
+                match possible.as_slice() {
                     // Awake, and on no lane: a TV from before lanes, draining the shared queue.
                     [] if tvs.online => return Ok(None),
                     [] => return Err(refuse("tv_offline", TV_OFF)),
                     [tv] => *tv,
                     several => {
-                        let open = names(several.iter().copied());
-                        return Err(refuse("choose_tv", &format!("Den is open on {open}. {CHOOSE_TV}")));
+                        let available = names(several.iter().copied());
+                        return Err(refuse(
+                            "choose_tv",
+                            &format!("Den can play on {available}. {CHOOSE_TV}"),
+                        ));
                     }
                 }
             }
@@ -317,6 +328,7 @@ impl Writes {
                             Some(Tv {
                                 lane: tv.get("tv")?.as_str()?.to_owned(),
                                 name: tv.get("name").and_then(Value::as_str).map(str::to_owned),
+                                wakeable: tv.get("wakeable").and_then(Value::as_bool).unwrap_or(false),
                                 online: tv.get("online")?.as_bool()?,
                                 last_seen: tv.get("lastSeenAt").and_then(Value::as_u64),
                             })
@@ -347,24 +359,29 @@ impl Writes {
         })?;
         let tvs = self.tv(&grant.token).await?;
         let awake: Vec<&Tv> = tvs.lanes.iter().filter(|tv| tv.online).collect();
-        let note = match (tvs.online, tvs.lanes.len(), awake.len()) {
-            (false, _, _) => {
-                "Den is not open on the TV; ask the person to open it before playing anything.".to_owned()
+        let possible: Vec<&Tv> = tvs.lanes.iter().filter(|tv| tv.can_receive()).collect();
+        let wakeable = tvs.lanes.iter().any(|tv| tv.wakeable);
+        let note = match (possible.as_slice(), awake.as_slice(), tvs.online) {
+            ([], _, false) => {
+                "No TV has Den open or is registered to wake; ask the person to open Den before \
+                               playing anything."
+                    .to_owned()
             }
-            (true, 0 | 1, _) => "Den is open on the TV.".to_owned(),
-            (true, _, 1) => {
-                format!("Den is open on {}; a play goes there unless another TV is named.", awake[0].called())
-            }
-            (true, _, _) => {
-                format!("Den is open on {}: name one with tv when playing.", names(awake.iter().copied()))
+            ([], _, true) => "Den is open on the TV.".to_owned(),
+            ([tv], [], _) => format!("{} is registered to wake; a play goes there.", tv.called()),
+            ([tv], [_], _) => format!("Den is open on {}; a play goes there.", tv.called()),
+            (several, _, _) => {
+                format!("Den can play on {}: name one with tv when playing.", names(several.iter().copied()))
             }
         };
         Ok(json!({
             "online": tvs.online,
+            "wakeable": wakeable,
             "last_seen_at": tvs.last_seen.map(crate::reads::rfc3339),
             "tvs": tvs.lanes.iter().map(|tv| json!({
                 "name": tv.called(),
                 "online": tv.online,
+                "wakeable": tv.wakeable,
                 "last_seen_at": tv.last_seen.map(crate::reads::rfc3339),
             })).collect::<Vec<_>>(),
             "note": note,
@@ -593,7 +610,7 @@ pub fn list() -> Value {
     let playing = json!({ "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false,
                           "openWorldHint": false });
     let which_tv = json!({ "type": "string",
-        "description": "Which TV, by the name den_tv_status lists; needed only when Den is open on more than one" });
+        "description": "Which TV, by the name den_tv_status lists; needed when more than one can receive a play" });
     let queued =
         "Nothing happens at once: the change is queued and a TV or Den Web applies it when next open.";
     json!([
@@ -645,10 +662,9 @@ pub fn list() -> Value {
             "title": "Play on the TV",
             "description": "Play a film, episode or series on the TV where the household watches, as its own Play \
                 button would. For a series give no season to play it where it stands (the next episode or where \
-                they left off), or a season and episode for one episode. The TV must have Den open: if not, \
-                nothing is sent and the answer says to open it. A household with several TVs plays on the one with \
-                Den open; when more than one is, the answer names them and asks for tv. Says whether the TV picked \
-                it up within a few seconds; it cannot say whether playback started.",
+                they left off), or a season and episode for one episode. The TV must have Den open or be registered \
+                to wake and open it. When more than one TV can receive the play, the answer names them and asks for \
+                tv. Says whether Den picked it up within a few seconds; it cannot say whether playback started.",
             "inputSchema": schema(json!({
                 "season": { "type": "integer", "minimum": 0, "description": "Series only" },
                 "episode": { "type": "integer", "minimum": 0, "maximum": 99999,
@@ -660,17 +676,17 @@ pub fn list() -> Value {
         {
             "name": "den_play_trailer",
             "title": "Play a trailer on the TV",
-            "description": "Play a title's trailer on the TV, as the title page's trailer button would. The TV must \
-                have Den open: if not, nothing is sent and the answer says to open it. With several TVs, as \
-                den_play_on_tv.",
+            "description": "Play a title's trailer on the TV, as the title page's trailer button would. The TV \
+                must have Den open or be registered to wake and open it. With several TVs, as den_play_on_tv.",
             "inputSchema": schema(json!({ "tv": which_tv }), &[]),
             "annotations": playing,
         },
         {
             "name": "den_tv_status",
-            "title": "Is Den open on the TV",
-            "description": "Whether Den is open on the household's TV right now (it can play only then), and when it \
-                was last seen; with several TVs, each by name. Check it before offering to play something.",
+            "title": "Can Den play on the TV",
+            "description": "Whether Den is open on the household's TV right now or the TV is registered to wake \
+                and open it, and when Den was last seen; with several TVs, each by name. Check it before offering \
+                to play something.",
             "inputSchema": { "type": "object", "properties": {} },
             "annotations": { "readOnlyHint": true, "idempotentHint": true, "openWorldHint": false },
         },
@@ -684,19 +700,21 @@ pub fn output_schema(tool: &str) -> Value {
             "type": "object",
             "properties": {
                 "online": { "type": "boolean" },
+                "wakeable": { "type": "boolean" },
                 "last_seen_at": { "type": ["string", "null"] },
                 "tvs": { "type": "array", "items": {
                     "type": "object",
                     "properties": {
                         "name": { "type": "string" },
                         "online": { "type": "boolean" },
+                        "wakeable": { "type": "boolean" },
                         "last_seen_at": { "type": ["string", "null"] },
                     },
-                    "required": ["name", "online"],
+                    "required": ["name", "online", "wakeable"],
                 } },
                 "note": { "type": "string" },
             },
-            "required": ["online", "note"],
+            "required": ["online", "wakeable", "note"],
         });
     }
     json!({

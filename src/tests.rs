@@ -2289,15 +2289,18 @@ async fn the_tv_status_and_what_den_edge_refuses_are_said_in_plain_words() {
     let (s, _) = tv_server(tv_answers()).await;
     let status = s.tool("den_tv_status", json!({})).await.unwrap();
     assert_eq!(
-        (status["online"].clone(), status["last_seen_at"].clone()),
-        (json!(true), json!("2026-09-21T14:13:20Z"))
+        (status["online"].clone(), status["wakeable"].clone(), status["last_seen_at"].clone()),
+        (json!(true), json!(false), json!("2026-09-21T14:13:20Z"))
     );
     let mut off = tv_answers();
     off.tv = (200, json!({ "online": false, "lastSeenAt": null }));
     let (s, _) = tv_server(off).await;
     let status = s.tool("den_tv_status", json!({})).await.unwrap();
-    assert_eq!((status["online"].clone(), status["last_seen_at"].clone()), (json!(false), Value::Null));
-    assert!(status["note"].as_str().unwrap().contains("not open on the TV"));
+    assert_eq!(
+        (status["online"].clone(), status["wakeable"].clone(), status["last_seen_at"].clone()),
+        (json!(false), json!(false), Value::Null)
+    );
+    assert!(status["note"].as_str().unwrap().contains("No TV has Den open"));
 
     for (change, said) in [
         ((409, json!({ "error": "queue_full" })), "several requests waiting"),
@@ -2361,7 +2364,7 @@ async fn a_play_goes_to_the_lane_of_the_tv_meant() {
     answers.tv = two_tvs(true);
     let (s, log) = tv_server(answers).await;
     let error = s.tool("den_play_on_tv", json!({ "type": "movie", "id": 550 })).await.unwrap_err();
-    assert!(error.contains("Den is open on Living room and Bedroom") && error.contains("tv"), "{error}");
+    assert!(error.contains("Den can play on Living room and Bedroom") && error.contains("tv"), "{error}");
     assert!(append_bodies(&log).is_empty());
     let answer =
         s.tool("den_play_on_tv", json!({ "type": "movie", "id": 550, "tv": " BEDROOM " })).await.unwrap();
@@ -2378,6 +2381,65 @@ async fn a_play_goes_to_the_lane_of_the_tv_meant() {
         .collect();
     assert_eq!(tvs, [(json!("Living room"), json!(true)), (json!("Bedroom"), json!(true))]);
     assert!(status["note"].as_str().unwrap().contains("Living room and Bedroom"));
+    assert_eq!(status["wakeable"], false, "old den-edge answers omit wakeable and stay compatible");
+    assert!(status["tvs"].as_array().unwrap().iter().all(|tv| tv["wakeable"] == false));
+}
+
+#[tokio::test]
+async fn a_wakeable_tv_is_a_target_without_being_online() {
+    // One sleeping, registered TV: it is selected without a name, but remains honestly offline in status.
+    let mut answers = tv_answers();
+    answers.tv = (
+        200,
+        json!({ "online": false, "lastSeenAt": 1_780_000_000_000u64, "tvs": [
+            { "tv": BEDROOM, "name": "Bedroom", "online": false, "wakeable": true,
+              "lastSeenAt": 1_780_000_000_000u64 },
+        ] }),
+    );
+    let (s, log) = tv_server(answers).await;
+    let answer = s.tool("den_play_on_tv", json!({ "type": "movie", "id": 550 })).await.unwrap();
+    assert_eq!((answer["state"].clone(), answer["tv"].clone()), (json!("taken"), json!("Bedroom")));
+    assert_eq!(append_bodies(&log)[0]["tv"], BEDROOM);
+    assert_eq!(log.lock().unwrap().last().unwrap().1, format!("/assistant/request/7?queue=tv&tv={BEDROOM}"));
+    let status = s.tool("den_tv_status", json!({})).await.unwrap();
+    assert_eq!((status["online"].clone(), status["wakeable"].clone()), (json!(false), json!(true)));
+    assert_eq!(
+        (status["tvs"][0]["online"].clone(), status["tvs"][0]["wakeable"].clone()),
+        (json!(false), json!(true))
+    );
+    assert!(status["note"].as_str().unwrap().contains("registered to wake"));
+}
+
+#[tokio::test]
+async fn several_online_or_wakeable_tvs_need_a_name() {
+    let target_list = (
+        200,
+        json!({ "online": true, "lastSeenAt": 1_790_000_000_000u64, "tvs": [
+            { "tv": LIVING, "name": "Living room", "online": true, "wakeable": true,
+              "lastSeenAt": 1_790_000_000_000u64 },
+            { "tv": BEDROOM, "name": "Bedroom", "online": false, "wakeable": true,
+              "lastSeenAt": 1_789_000_000_000u64 },
+        ] }),
+    );
+
+    // An open TV is not silently preferred over another valid, sleeping target.
+    let mut answers = tv_answers();
+    answers.tv = target_list.clone();
+    let (s, log) = tv_server(answers).await;
+    let error = s.tool("den_play_on_tv", json!({ "type": "movie", "id": 550 })).await.unwrap_err();
+    assert!(error.contains("Den can play on Living room and Bedroom") && error.contains("tv"), "{error}");
+    assert!(append_bodies(&log).is_empty());
+
+    // Naming the sleeping target sends to its registered lane; wake/launch is not reported as playback success.
+    let mut answers = tv_answers();
+    answers.tv = target_list;
+    answers.requests = vec![(200, json!({ "state": "queued" }))];
+    let (s, log) = tv_server(answers).await;
+    let answer =
+        s.tool("den_play_trailer", json!({ "type": "movie", "id": 550, "tv": " bedroom " })).await.unwrap();
+    assert_eq!((answer["state"].clone(), answer["tv"].clone()), (json!("queued"), json!("Bedroom")));
+    assert_eq!(append_bodies(&log)[0]["tv"], BEDROOM);
+    assert!(answer["note"].as_str().unwrap().contains("may still be waking or opening Den"));
 }
 
 #[tokio::test]
