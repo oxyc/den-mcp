@@ -48,8 +48,8 @@ server opens (den-spec `wire/assistant-v1.md`). Title arguments are `type` (`mov
 | `den_watchlist_remove` | `type`, `id` (`destructiveHint`) | `watchlist_remove` |
 | `den_mark_seen` | `type`, `id`, `value?` (true), `season?`, `episode?` (series; episode needs season) | `seen` |
 | `den_rate` | `type`, `id`, `value` (`dislike`, `like`, `love` or null to clear) | `rate` |
-| `den_play_on_tv` | `type`, `id`, `season?`, `episode?` (series; episode needs season) | `play` (TV queue) |
-| `den_play_trailer` | `type`, `id` | `play_trailer` (TV queue) |
+| `den_play_on_tv` | `type`, `id`, `season?`, `episode?` (series; episode needs season), `tv?` (a TV's name) | `play` (TV queue) |
+| `den_play_trailer` | `type`, `id`, `tv?` | `play_trailer` (TV queue) |
 | `den_tv_status` | — | `GET /assistant/tv` (no request) |
 
 Den's UI calls `dislike` **Not for me**, and it is also a taste signal that steers recommendations away: the tool's
@@ -69,8 +69,14 @@ queued. After the append they ask `GET /assistant/request/{seq}?queue=tv` every 
 `state: "taken"` ("The TV picked it up") or `"queued"` (not yet). `taken` is all den-edge can know: whether anything
 played is not observable, so the note says that a connection made before TV playback has no play record, its plays are
 refused at the TV, and the owner reconnects the assistant with "Allow changes to my library and playing on my TV"
-ticked. `den_tv_status` answers `{online, last_seen_at}`. These tools are listed with the write tools (a token does not
-say whether its connection may play).
+ticked. `den_tv_status` answers `{online, last_seen_at, tvs}`. These tools are listed with the write tools (a token does
+not say whether its connection may play).
+
+**Several TVs** (§16 *TV lanes*). Each TV drains a lane of its own and names it, and `GET /assistant/tv` lists them
+(`tvs`). A play goes to the lane of the TV named in `tv` (any case), else to the one TV with Den open; with several
+open and none named, the answer names them and asks which, and nothing is sent. The append carries `"tv": <lane>` and
+the request is watched with `&tv=<lane>`. A household whose TVs list no lane (a TV from before lanes) plays from the
+shared TV queue as before.
 
 `cargo run --example writekey` makes a key pair: `MCP_WRITE_KEY` for den-mcp, `MCP_WRITE_PUBLIC_KEY` for den-edge.
 

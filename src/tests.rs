@@ -2317,6 +2317,85 @@ async fn the_tv_status_and_what_den_edge_refuses_are_said_in_plain_words() {
     assert!(s.tool("den_tv_status", json!({})).await.unwrap_err().contains("can't play on the TV"));
 }
 
+/// Two TVs' lanes (den-spec §16 *TV lanes*): the living room awake, the bedroom as asked.
+const LIVING: &str = "0123456789abcdef0123456789abcdef";
+const BEDROOM: &str = "fedcba9876543210fedcba9876543210";
+
+fn two_tvs(bedroom_awake: bool) -> (u16, Value) {
+    (
+        200,
+        json!({ "online": true, "lastSeenAt": 1_790_000_000_000u64, "tvs": [
+            { "tv": LIVING, "name": "Living room", "online": true, "lastSeenAt": 1_790_000_000_000u64 },
+            { "tv": BEDROOM, "name": "Bedroom", "online": bedroom_awake, "lastSeenAt": 1_789_000_000_000u64 },
+        ] }),
+    )
+}
+
+#[tokio::test]
+async fn a_play_goes_to_the_lane_of_the_tv_meant() {
+    // One TV awake: the play goes to its lane without asking, and is watched there.
+    let mut answers = tv_answers();
+    answers.tv = two_tvs(false);
+    let (s, log) = tv_server(answers).await;
+    let answer = s.tool("den_play_on_tv", json!({ "type": "movie", "id": 550 })).await.unwrap();
+    assert_eq!((answer["state"].clone(), answer["tv"].clone()), (json!("taken"), json!("Living room")));
+    assert_eq!(
+        append_bodies(&log)[0],
+        json!({ "sealed": append_bodies(&log)[0]["sealed"], "queue": "tv", "tv": LIVING })
+    );
+    let last = log.lock().unwrap().last().unwrap().1.clone();
+    assert_eq!(last, format!("/assistant/request/7?queue=tv&tv={LIVING}"));
+    // A TV named that is off: said by name, nothing sent.
+    let error =
+        s.tool("den_play_on_tv", json!({ "type": "movie", "id": 550, "tv": "bedroom" })).await.unwrap_err();
+    assert!(error.contains("Open Den on Bedroom first") && error.contains("Nothing was sent"), "{error}");
+    // A name that is no TV: the TVs are named.
+    let error =
+        s.tool("den_play_trailer", json!({ "type": "movie", "id": 550, "tv": "Kitchen" })).await.unwrap_err();
+    assert!(error.contains("no TV called Kitchen") && error.contains("Living room and Bedroom"), "{error}");
+    assert!(s.tool("den_play_on_tv", json!({ "type": "movie", "id": 550, "tv": 2 })).await.is_err());
+    assert_eq!(append_bodies(&log).len(), 1, "only the first was sent");
+
+    // Two awake and none named: the answer asks which; named, it goes there.
+    let mut answers = tv_answers();
+    answers.tv = two_tvs(true);
+    let (s, log) = tv_server(answers).await;
+    let error = s.tool("den_play_on_tv", json!({ "type": "movie", "id": 550 })).await.unwrap_err();
+    assert!(error.contains("Den is open on Living room and Bedroom") && error.contains("tv"), "{error}");
+    assert!(append_bodies(&log).is_empty());
+    let answer =
+        s.tool("den_play_on_tv", json!({ "type": "movie", "id": 550, "tv": " BEDROOM " })).await.unwrap();
+    assert_eq!(answer["tv"], "Bedroom");
+    assert_eq!(append_bodies(&log)[0]["tv"], BEDROOM);
+
+    // The status names every TV.
+    let status = s.tool("den_tv_status", json!({})).await.unwrap();
+    let tvs: Vec<(Value, Value)> = status["tvs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tv| (tv["name"].clone(), tv["online"].clone()))
+        .collect();
+    assert_eq!(tvs, [(json!("Living room"), json!(true)), (json!("Bedroom"), json!(true))]);
+    assert!(status["note"].as_str().unwrap().contains("Living room and Bedroom"));
+}
+
+#[tokio::test]
+async fn a_tv_from_before_lanes_still_plays_from_the_shared_queue() {
+    // Awake, and on no lane: an old TV drains the shared TV queue, so the play goes there.
+    let mut answers = tv_answers();
+    answers.tv = (
+        200,
+        json!({ "online": true, "lastSeenAt": 1_790_000_000_000u64, "tvs": [
+            { "tv": LIVING, "name": "Living room", "online": false, "lastSeenAt": 1_780_000_000_000u64 },
+        ] }),
+    );
+    let (s, log) = tv_server(answers).await;
+    let answer = s.tool("den_play_on_tv", json!({ "type": "movie", "id": 550 })).await.unwrap();
+    assert!(answer.get("tv").is_none());
+    assert!(append_bodies(&log)[0].get("tv").is_none());
+}
+
 #[tokio::test]
 async fn play_arguments_are_checked_before_anything_is_asked() {
     let (s, log) = tv_server(tv_answers()).await;
