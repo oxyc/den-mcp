@@ -62,6 +62,7 @@ const WAITING_NOTE: &str =
     dropped, so ask again if the TV stays idle.";
 const TV_OFF: &str =
     "Open Den on the TV first — it isn't running, so it can't play anything yet. Nothing was sent.";
+const CHOOSE_TV: &str = "Ask which one to play on, then call again with tv. Nothing was sent.";
 
 /// `GET /assistant/tv`: whether a TV is awake, and each TV's own lane (den-spec §16 *TV lanes*), the one seen last
 /// first. A den-edge from before lanes lists none.
@@ -290,14 +291,8 @@ impl Writes {
                     [] => return Err(refuse("tv_offline", TV_OFF)),
                     [tv] => *tv,
                     several => {
-                        return Err(refuse(
-                            "choose_tv",
-                            &format!(
-                                "Den is open on {}. Ask which one to play on, then call again with tv. Nothing \
-                                 was sent.",
-                                names(several.iter().copied())
-                            ),
-                        ))
+                        let open = names(several.iter().copied());
+                        return Err(refuse("choose_tv", &format!("Den is open on {open}. {CHOOSE_TV}")));
                     }
                 }
             }
