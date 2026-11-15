@@ -1124,6 +1124,16 @@ async fn an_answer_is_kept_and_revalidated_by_etag() {
         "{metrics}"
     );
     assert_eq!(s.send("GET", "/metrics", "", &[]).await.0, StatusCode::NOT_FOUND);
+    let (status, headers, body) = s.send("HEAD", "/metrics", "", &[("authorization", "Bearer m")]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "text/plain; version=0.0.4; charset=utf-8");
+    assert!(body.is_empty(), "HEAD rendered or sent the exposition");
+    for method in ["POST", "PUT", "DELETE", "OPTIONS"] {
+        assert_eq!(s.send(method, "/metrics", "", &[]).await.0, StatusCode::NOT_FOUND, "{method}");
+        let (status, headers, _) = s.send(method, "/metrics", "", &[("authorization", "Bearer m")]).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
+        assert_eq!(headers["allow"], "GET, HEAD", "{method}");
+    }
 }
 
 #[tokio::test]

@@ -213,6 +213,8 @@ and that document (RFC 9728) names den-edge as the authorization server. Each se
 | `GET /.well-known/oauth-protected-resource[/mcp]` | RFC 9728 metadata |
 | `GET /health` | `{"status":"ok"}`, or `degraded` with `no_token_keys` |
 | `GET /metrics` | Prometheus text, with `Authorization: Bearer $METRICS_TOKEN`; a 404 otherwise |
+| `HEAD /metrics` | Same status and representation headers without rendering or sending the exposition |
+| other `/metrics` methods | 405 with `Allow: GET, HEAD` when authorized; missing/wrong authorization remains 404 |
 
 One log line per request (`LOG_REQUESTS`): method, route, status, time, the tool's name and `rid=` — never its
 arguments, which are what someone asked.
