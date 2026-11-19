@@ -162,6 +162,30 @@ fn metrics_authorized(state: &AppState, headers: &hyper::HeaderMap) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+fn metrics_response(state: &AppState, parts: &hyper::http::request::Parts) -> Response<Full<Bytes>> {
+    if !metrics_authorized(state, &parts.headers) {
+        return json_response(StatusCode::NOT_FOUND, &json!({ "error": "not_found" }));
+    }
+    match parts.method {
+        Method::GET => Response::builder()
+            .header(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(full(state.metrics.render(state.atlas.cached(), state.atlas.used())))
+            .unwrap(),
+        Method::HEAD => Response::builder()
+            .header(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(full(""))
+            .unwrap(),
+        _ => {
+            let mut response =
+                json_response(StatusCode::METHOD_NOT_ALLOWED, &json!({ "error": "method_not_allowed" }));
+            response.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
+            response
+        }
+    }
+}
+
 pub async fn handle<B>(state: Arc<AppState>, req: Request<B>) -> Response<Full<Bytes>>
 where
     B: hyper::body::Body<Data = Bytes> + Send + 'static,
@@ -212,11 +236,7 @@ where
     let get = matches!(parts.method, Method::GET | Method::HEAD);
     let resp = match parts.uri.path() {
         "/health" if get => json_response(StatusCode::OK, &health(state)),
-        "/metrics" if get && metrics_authorized(state, &parts.headers) => Response::builder()
-            .header(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
-            .header(header::CACHE_CONTROL, "no-store")
-            .body(full(state.metrics.render(state.atlas.cached(), state.atlas.used())))
-            .unwrap(),
+        "/metrics" => metrics_response(state, parts),
         "/open-facets/queue" if get && metrics_authorized(state, &parts.headers) => open_facet_queue(state),
         "/.well-known/oauth-protected-resource" | "/.well-known/oauth-protected-resource/mcp" if get => {
             json_response(StatusCode::OK, &resource_metadata(state))
