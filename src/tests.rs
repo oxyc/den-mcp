@@ -1182,12 +1182,14 @@ async fn stub_edge_with(
         projection,
         tv: (200, json!({ "online": true, "lastSeenAt": 1_790_000_000_000u64 })),
         requests: vec![(200, json!({ "state": "taken" }))],
+        results: vec![],
     })
     .await
 }
 
 /// Everything the stand-in den-edge answers. `requests` is `GET /assistant/request/{seq}`'s answers in turn, the
-/// last repeating.
+/// last repeating. `results` is what the TV has said by each `GET /play/result/…` in turn, the last repeating: result
+/// bodies the stand-in seals for the id of the last request appended, as the TV that opened it would.
 #[derive(Clone)]
 struct EdgeAnswers {
     dropbox: (u16, Value),
@@ -1195,6 +1197,7 @@ struct EdgeAnswers {
     projection: (u16, Value),
     tv: (u16, Value),
     requests: Vec<(u16, Value)>,
+    results: Vec<Vec<Value>>,
 }
 
 async fn stub_edge_all(answers: EdgeAnswers) -> (String, EdgeLog) {
@@ -1203,12 +1206,14 @@ async fn stub_edge_all(answers: EdgeAnswers) -> (String, EdgeLog) {
     let log: EdgeLog = Arc::default();
     let seen = log.clone();
     let polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
-            let (seen, answers, polled) = (seen.clone(), answers.clone(), polled.clone());
+            let (seen, answers, polled, read) = (seen.clone(), answers.clone(), polled.clone(), read.clone());
             let service = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
-                let (seen, answers, polled) = (seen.clone(), answers.clone(), polled.clone());
+                let (seen, answers, polled, read) =
+                    (seen.clone(), answers.clone(), polled.clone(), read.clone());
                 async move {
                     let (parts, body) = req.into_parts();
                     let body = String::from_utf8(body.collect().await.unwrap().to_bytes().to_vec()).unwrap();
@@ -1223,6 +1228,39 @@ async fn stub_edge_all(answers: EdgeAnswers) -> (String, EdgeLog) {
                         p if p.starts_with("/assistant/request/") => {
                             let n = polled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             answers.requests[n.min(answers.requests.len() - 1)].clone()
+                        }
+                        p if p.starts_with("/play/result/") => {
+                            let n = read.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let said = answers
+                                .results
+                                .get(n)
+                                .or(answers.results.last())
+                                .cloned()
+                                .unwrap_or_default();
+                            // The TV's word on the request it opened: sealed under that request's id.
+                            let appended = seen
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .rev()
+                                .find(|c| c.1 == "/assistant/append")
+                                .cloned();
+                            let sealed: Vec<String> = match appended {
+                                Some(call) => {
+                                    let body: Value = serde_json::from_str(&call.3).unwrap();
+                                    let id = device_accepts_from(
+                                        body["sealed"].as_str().unwrap(),
+                                        den_assistant::Queue::Tv,
+                                    )
+                                    .id;
+                                    said.iter()
+                                        .enumerate()
+                                        .map(|(i, result)| crate::results::seal(&id, result, [i as u8; 12]))
+                                        .collect()
+                                }
+                                None => Vec::new(),
+                            };
+                            (200, json!({ "results": sealed }))
                         }
                         _ => answers.append,
                     };
@@ -1262,6 +1300,7 @@ fn write_server(edge: &str, scope: &str, dw: Option<&str>) -> Server {
             key: seed(&f["mcp"]),
             edge: edge.to_owned(),
             tv_wait: std::time::Duration::from_millis(1500),
+            result_wait: std::time::Duration::from_millis(6000),
         }),
         ..config("http://127.0.0.1:1".into())
     };
@@ -1353,7 +1392,8 @@ async fn a_change_is_sealed_to_the_library_and_a_device_accepts_it() {
             "den_rate",
             "den_play_on_tv",
             "den_play_trailer",
-            "den_tv_status"
+            "den_tv_status",
+            "den_play_status"
         ],
         "the write tools follow the nine read ones"
     );
@@ -1554,6 +1594,7 @@ async fn read_server(edge: &str, scope: &str, dr: Option<&str>) -> Server {
             key: seed(&f["mcp"]),
             edge: edge.to_owned(),
             tv_wait: std::time::Duration::from_millis(1500),
+            result_wait: std::time::Duration::from_millis(6000),
         }),
         ..config(atlas)
     };
@@ -2195,6 +2236,7 @@ fn tv_answers() -> EdgeAnswers {
         projection: (404, json!({ "error": "no_projection" })),
         tv: (200, json!({ "online": true, "lastSeenAt": 1_790_000_000_000u64 })),
         requests: vec![(200, json!({ "state": "queued" })), (200, json!({ "state": "taken" }))],
+        results: vec![],
     }
 }
 
@@ -2440,16 +2482,109 @@ async fn several_online_or_wakeable_tvs_need_a_name() {
     assert!(error.contains("Den can play on Living room and Bedroom") && error.contains("tv"), "{error}");
     assert!(append_bodies(&log).is_empty());
 
-    // Naming the sleeping target sends to its registered lane; wake/launch is not reported as playback success.
+    // Naming the sleeping target sends to its registered lane; wake/launch is not reported as playback success, only
+    // as den-mcp's own `waking` (play-results-v1 §3).
     let mut answers = tv_answers();
     answers.tv = target_list;
     answers.requests = vec![(200, json!({ "state": "queued" }))];
     let (s, log) = tv_server(answers).await;
     let answer =
         s.tool("den_play_trailer", json!({ "type": "movie", "id": 550, "tv": " bedroom " })).await.unwrap();
-    assert_eq!((answer["state"].clone(), answer["tv"].clone()), (json!("queued"), json!("Bedroom")));
+    assert_eq!((answer["state"].clone(), answer["tv"].clone()), (json!("waking"), json!("Bedroom")));
+    assert_eq!(answer["confirmed"], false);
     assert_eq!(append_bodies(&log)[0]["tv"], BEDROOM);
-    assert!(answer["note"].as_str().unwrap().contains("may still be waking or opening Den"));
+    let note = answer["note"].as_str().unwrap();
+    assert!(note.contains("Waking Bedroom") && note.contains("den_play_status"), "{note}");
+}
+
+/// The living room's TV, awake and reporting play results (play-results-v1 §6).
+fn reporting_tv() -> (u16, Value) {
+    (
+        200,
+        json!({ "online": true, "lastSeenAt": 1_790_000_000_000u64, "tvs": [
+            { "tv": LIVING, "name": "Living room", "online": true, "results": true,
+              "lastSeenAt": 1_790_000_000_000u64 },
+        ] }),
+    )
+}
+
+#[tokio::test]
+async fn a_tv_that_reports_results_confirms_playing_or_says_why_not() {
+    // Preparing, then playing: confirmed, in the TV's own word.
+    let mut answers = tv_answers();
+    answers.tv = reporting_tv();
+    answers.results = vec![
+        vec![json!({ "at": 1, "state": "preparing", "v": 1 })],
+        vec![
+            json!({ "at": 1, "state": "preparing", "v": 1 }),
+            json!({ "at": 2, "state": "playing", "v": 1 }),
+        ],
+    ];
+    let (s, log) = tv_server(answers).await;
+    let answer = s
+        .tool("den_play_on_tv", json!({ "type": "series", "id": 1399, "season": 1, "episode": 2 }))
+        .await
+        .unwrap();
+    assert_eq!(
+        (answer["state"].clone(), answer["confirmed"].clone(), answer["tv"].clone()),
+        (json!("playing"), json!(true), json!("Living room"))
+    );
+    assert_eq!(answer["note"], "Playing on Living room.");
+    // Read held at the request's own address, which only its id derives.
+    let address = crate::results::address(answer["id"].as_str().unwrap()).unwrap();
+    let reads: Vec<String> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.1.starts_with("/play/result/"))
+        .map(|c| c.1.clone())
+        .collect();
+    assert_eq!(reads[0], format!("/play/result/{address}?after=0&wait=2"));
+    assert_eq!(reads[1], format!("/play/result/{address}?after=1&wait=2"));
+
+    // Its asking again later: the same, without sending it twice.
+    let status = s.tool("den_play_status", json!({ "id": answer["id"] })).await.unwrap();
+    assert_eq!((status["state"].clone(), status["confirmed"].clone()), (json!("playing"), json!(true)));
+    assert_eq!(append_bodies(&log).len(), 1, "a status sends nothing");
+    assert!(s.tool("den_play_status", json!({ "id": "nope" })).await.unwrap_err().contains("id"));
+
+    // No source: failed, with the reason and a way on; never confirmed.
+    let mut answers = tv_answers();
+    answers.tv = reporting_tv();
+    answers.results = vec![vec![
+        json!({ "at": 1, "state": "preparing", "v": 1 }),
+        json!({ "at": 2, "reason": "no_source", "state": "failed", "v": 1 }),
+    ]];
+    let (s, _) = tv_server(answers).await;
+    let answer = s.tool("den_play_on_tv", json!({ "type": "movie", "id": 550 })).await.unwrap();
+    assert_eq!(
+        (answer["state"].clone(), answer["reason"].clone(), answer["confirmed"].clone()),
+        (json!("failed"), json!("no_source"), json!(false))
+    );
+    assert!(answer["note"].as_str().unwrap().contains("no playable source"), "{answer}");
+
+    // Only preparing by the end of the wait: not confirmed, and how to check again.
+    let mut answers = tv_answers();
+    answers.tv = reporting_tv();
+    answers.results = vec![vec![json!({ "at": 1, "state": "preparing", "v": 1 })]];
+    let (s, _) = tv_server(answers).await;
+    let answer = s.tool("den_play_on_tv", json!({ "type": "movie", "id": 550 })).await.unwrap();
+    assert_eq!((answer["state"].clone(), answer["confirmed"].clone()), (json!("preparing"), json!(false)));
+    assert!(answer["note"].as_str().unwrap().contains("den_play_status"));
+}
+
+#[tokio::test]
+async fn a_reporting_tv_that_takes_a_play_and_says_nothing_refused_it() {
+    // Taken from the queue, and no word: the TV refused it as it opened it (no play record, or too late).
+    let mut answers = tv_answers();
+    answers.tv = reporting_tv();
+    answers.requests = vec![(200, json!({ "state": "taken" }))];
+    let (s, _) = tv_server(answers).await;
+    let started = std::time::Instant::now();
+    let answer = s.tool("den_play_on_tv", json!({ "type": "movie", "id": 550 })).await.unwrap();
+    assert_eq!((answer["state"].clone(), answer["confirmed"].clone()), (json!("taken"), json!(false)));
+    assert!(answer["note"].as_str().unwrap().contains("took it but didn't start it"), "{answer}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(6), "it does not wait the whole while");
 }
 
 #[tokio::test]

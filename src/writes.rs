@@ -37,8 +37,8 @@ const QUEUED_NOTE: &str =
     "Den applies it next time a TV or Den Web is open; usually within seconds when the TV is on.";
 
 /// The write tools, as `tools/list` names them, and the op each sends. `tv_status` sends none: it asks whether the TV
-/// is open (den-spec §16).
-pub const TOOLS: [(&str, &str); 7] = [
+/// is open (den-spec §16); nor does `play_status`, which asks how an earlier play went (play-results-v1 §8).
+pub const TOOLS: [(&str, &str); 8] = [
     ("den_watchlist_add", "watchlist_add"),
     ("den_watchlist_remove", "watchlist_remove"),
     ("den_mark_seen", "seen"),
@@ -46,20 +46,30 @@ pub const TOOLS: [(&str, &str); 7] = [
     ("den_play_on_tv", "play"),
     ("den_play_trailer", "play_trailer"),
     ("den_tv_status", "tv_status"),
+    ("den_play_status", "play_status"),
 ];
 
 /// How often a play request asks whether the TV has taken it.
 const TV_POLL: Duration = Duration::from_millis(400);
+/// How long one held read of a play's results waits for the TV's next word: inside `EDGE_TIMEOUT`, and short enough
+/// to look at the queue between reads.
+const RESULT_HOLD_S: u64 = 2;
+/// A TV that reports results and took a request without a word for this long refused it as it opened it.
+const SILENT_TAKE: Duration = Duration::from_secs(4);
 
-/// What a play says once the TV has taken it: that is all den-edge can tell, not whether it played.
+/// What a play says once a TV that does not report results has taken it: all den-edge can tell, not whether it played.
 const TAKEN_NOTE: &str =
-    "The TV picked it up. If nothing starts playing, this connection may not be allowed to play \
-    on the TV: connections made before TV playback need reconnecting with \"Allow changes to my library and \
-    playing on my TV\" ticked.";
+    "The TV picked it up, but it can't say whether playback started. If nothing starts playing, this connection may \
+    not be allowed to play on the TV: connections made before TV playback need reconnecting with \"Allow changes to \
+    my library and playing on my TV\" ticked.";
 /// And when it has not yet.
 const WAITING_NOTE: &str =
     "Sent to the TV, which has not picked it up yet. It may still be waking or opening Den. A play older than two \
     minutes is dropped, so ask again if the TV stays idle.";
+/// How to ask again about a play that is not confirmed yet, without sending it twice.
+const CHECK_LATER: &str =
+    "Not confirmed yet: call den_play_status with this id to check again, rather than playing \
+    it a second time.";
 const TV_OFF: &str =
     "Open Den on the TV first — it isn't running, so it can't play anything yet. Nothing was sent.";
 const CHOOSE_TV: &str = "Ask which one to play on, then call again with tv. Nothing was sent.";
@@ -80,6 +90,8 @@ struct Tv {
     wakeable: bool,
     online: bool,
     last_seen: Option<u64>,
+    /// It says how each play went (play-results-v1 §6). Older den-edge answers omit this: false.
+    results: bool,
 }
 
 impl Tv {
@@ -102,6 +114,24 @@ fn names<'a>(tvs: impl IntoIterator<Item = &'a Tv>) -> String {
     }
 }
 
+/// The TV a play goes to: its lane and name, whether it reports play results, and whether it was asleep (registered to
+/// wake, not draining) when the play was sent.
+struct Chosen {
+    lane: String,
+    name: String,
+    results: bool,
+    waking: bool,
+}
+
+/// How a play stands when its wait ends: the TV's own word (play-results-v1 §3), else what the queue says.
+enum Outcome {
+    Said(crate::results::PlayResult),
+    /// A TV that reports results took it and said nothing: it refused it as it opened it (§7).
+    TakenSilently,
+    Taken,
+    Queued,
+}
+
 #[derive(Clone)]
 struct Dropbox {
     library: String,
@@ -117,6 +147,8 @@ pub struct Writes {
     pub(crate) lists: crate::reads::Shared,
     /// How long a play request waits to see whether the TV took it.
     tv_wait: Duration,
+    /// How long it waits for the TV's word on how it went, from a TV that reports play results.
+    result_wait: Duration,
 }
 
 /// Why a change was not queued: a short code for the log and the words the model is told.
@@ -137,6 +169,7 @@ impl Writes {
             dropboxes: Mutex::default(),
             lists: Default::default(),
             tv_wait: config.tv_wait,
+            result_wait: config.result_wait,
         }
     }
 
@@ -158,6 +191,8 @@ impl Writes {
         let op = TOOLS.iter().find(|(name, _)| *name == tool).map_or("", |(_, op)| op);
         let outcome = if op == "tv_status" {
             self.tv_status(caller).await
+        } else if op == "play_status" {
+            self.play_status(caller, args).await
         } else {
             let wanted = match args.get("tv") {
                 None | Some(Value::Null) => None,
@@ -200,8 +235,8 @@ impl Writes {
         // that wakes it and opens Den. With several TVs it goes to the lane of the one meant; with none listed, to the
         // shared TV queue.
         let tv = Queue::of(op) == Queue::Tv;
-        let target = if tv { Some(self.target(&grant.token, wanted).await?) } else { None };
-        let lane = target.as_ref().and_then(|tv| tv.as_ref().map(|(lane, _)| lane.clone()));
+        let target = if tv { self.target(&grant.token, wanted).await? } else { None };
+        let lane = target.as_ref().map(|tv| tv.lane.clone());
         let dropbox = self.dropbox(&caller.session, &grant.token).await?;
         let mut rng = rng();
         let id = request_id_with_rng(&mut rng);
@@ -219,13 +254,19 @@ impl Writes {
             self.edge_call("POST", "/assistant/append", &grant.token, Some(body), MAX_ANSWER).await?;
         match (status.as_u16(), error_code(&answer)) {
             (200, _) if tv => {
-                let taken = match answer.get("seq").and_then(Value::as_u64) {
-                    Some(seq) => self.taken(&grant.token, seq, lane.as_deref()).await,
-                    None => false,
+                let seq = answer.get("seq").and_then(Value::as_u64);
+                let outcome = match (&target, seq) {
+                    (Some(chosen), Some(seq)) if chosen.results => {
+                        self.outcome(&grant.token, &id, seq, &chosen.lane).await
+                    }
+                    (_, Some(seq)) if self.taken(&grant.token, seq, lane.as_deref()).await => Outcome::Taken,
+                    _ => Outcome::Queued,
                 };
-                let (state, note) = if taken { ("taken", TAKEN_NOTE) } else { ("queued", WAITING_NOTE) };
-                let mut answer = json!({ "queued": true, "id": id, "state": state, "note": note });
-                if let Some(Some((_, name))) = target {
+                let name = target.as_ref().map(|tv| tv.name.as_str());
+                let waking = target.as_ref().is_some_and(|tv| tv.waking);
+                let mut answer = describe(&id, &outcome, name, waking);
+                answer["queued"] = json!(true);
+                if let Some(name) = name {
                     answer["tv"] = json!(name);
                 }
                 Ok(answer)
@@ -264,7 +305,7 @@ impl Writes {
     /// Where a play goes: `None` the shared TV queue, when no TV has a lane (a TV from before lanes); otherwise the lane
     /// and name of the TV `wanted` names (any case), or of the sole TV that is online or wakeable. Refused, with the
     /// TVs named, when that TV cannot receive a play, no TV can, or several can and none was named.
-    async fn target(&self, token: &str, wanted: Option<&str>) -> Result<Option<(String, String)>, Refused> {
+    async fn target(&self, token: &str, wanted: Option<&str>) -> Result<Option<Chosen>, Refused> {
         let tvs = self.tv(token).await?;
         if tvs.lanes.is_empty() {
             return if tvs.online { Ok(None) } else { Err(refuse("tv_offline", TV_OFF)) };
@@ -308,7 +349,12 @@ impl Writes {
                 }
             }
         };
-        Ok(Some((chosen.lane.clone(), chosen.called().to_owned())))
+        Ok(Some(Chosen {
+            lane: chosen.lane.clone(),
+            name: chosen.called().to_owned(),
+            results: chosen.results,
+            waking: !chosen.online,
+        }))
     }
 
     /// Whether Den is open on a TV, when one was last seen (ms), and each TV's lane: `GET /assistant/tv`.
@@ -331,6 +377,7 @@ impl Writes {
                                 wakeable: tv.get("wakeable").and_then(Value::as_bool).unwrap_or(false),
                                 online: tv.get("online")?.as_bool()?,
                                 last_seen: tv.get("lastSeenAt").and_then(Value::as_u64),
+                                results: tv.get("results").and_then(Value::as_bool).unwrap_or(false),
                             })
                         })
                         .collect(),
@@ -386,6 +433,113 @@ impl Writes {
             })).collect::<Vec<_>>(),
             "note": note,
         }))
+    }
+
+    /// How request `id` (queue entry `seq` on `lane`) went, for a TV that reports play results: its results read held
+    /// (`GET /play/result/{address}?wait=`) until one is terminal or the wait ends, and between reads whether the TV
+    /// took it — so a TV that took it and said nothing is told apart from one still waking.
+    async fn outcome(&self, token: &str, id: &str, seq: u64, lane: &str) -> Outcome {
+        let Some(address) = crate::results::address(id) else { return Outcome::Queued };
+        let deadline = Instant::now() + self.result_wait;
+        let mut count = 0;
+        let mut best: Option<crate::results::PlayResult> = None;
+        let mut taken_at: Option<Instant> = None;
+        while Instant::now() < deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let wait = left.as_secs().clamp(1, RESULT_HOLD_S);
+            let path = format!("/play/result/{address}?after={count}&wait={wait}");
+            let started = Instant::now();
+            let sealed: Option<Vec<String>> =
+                match self.edge_call("GET", &path, token, None, MAX_ANSWER).await {
+                    Ok((status, answer)) if status.as_u16() == 200 => answer
+                        .get("results")
+                        .and_then(Value::as_array)
+                        .map(|r| r.iter().filter_map(|s| s.as_str().map(str::to_owned)).collect()),
+                    // A den-edge from before results, or one that cannot answer: the queue is all there is.
+                    _ => None,
+                };
+            let Some(sealed) = sealed else { break };
+            if sealed.len() > count {
+                count = sealed.len();
+                best = crate::results::strongest(&crate::results::open(id, &sealed)).cloned();
+                if best.as_ref().is_some_and(|r| r.state != crate::results::State::Preparing) {
+                    break;
+                }
+            } else if started.elapsed() < Duration::from_millis(500) {
+                // An early answer (den-edge's held reads per address are capped): never ask again at once.
+                tokio::time::sleep(TV_POLL.min(left)).await;
+            }
+            if best.is_none() {
+                if taken_at.is_none() && self.state(token, seq, Some(lane)).await == Some("taken") {
+                    taken_at = Some(Instant::now());
+                }
+                if taken_at.is_some_and(|at| at.elapsed() >= SILENT_TAKE) {
+                    return Outcome::TakenSilently;
+                }
+            }
+        }
+        match best {
+            Some(result) => Outcome::Said(result),
+            None if taken_at.is_some() || self.state(token, seq, Some(lane)).await == Some("taken") => {
+                Outcome::Taken
+            }
+            None => Outcome::Queued,
+        }
+    }
+
+    /// `GET /assistant/request/{seq}?queue=tv`: `queued` or `taken`, or `None` when den-edge could not say.
+    async fn state(&self, token: &str, seq: u64, lane: Option<&str>) -> Option<&'static str> {
+        let path = match lane {
+            Some(lane) => format!("/assistant/request/{seq}?queue=tv&tv={lane}"),
+            None => format!("/assistant/request/{seq}?queue=tv"),
+        };
+        match self.edge_call("GET", &path, token, None, MAX_ANSWER).await {
+            Ok((status, answer)) if status.as_u16() == 200 => {
+                match answer.get("state").and_then(Value::as_str) {
+                    Some("taken") => Some("taken"),
+                    Some("queued") => Some("queued"),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `den_play_status`: how a play an earlier answer gave the id of stands now, from the TV's results alone.
+    async fn play_status(&self, caller: &Caller, args: &Value) -> Result<Value, Refused> {
+        let grant = caller.write.as_ref().ok_or_else(|| {
+            refuse("no_write_grant", "This connection can't play on the TV — reconnect and allow changes.")
+        })?;
+        let id = args.get("id").and_then(Value::as_str).unwrap_or("");
+        let Some(address) = crate::results::address(id) else {
+            return Err(refuse("bad_id", "id is the id a den_play_on_tv or den_play_trailer answer gave."));
+        };
+        let (status, answer) =
+            self.edge_call("GET", &format!("/play/result/{address}"), &grant.token, None, MAX_ANSWER).await?;
+        if status.as_u16() != 200 {
+            eprintln!("den-edge: play result answered {status} {}", error_code(&answer).unwrap_or("-"));
+            return Err(refuse("edge_error", "Den could not reach the TV's word on that play right now."));
+        }
+        let sealed: Vec<String> = answer
+            .get("results")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s.as_str().map(str::to_owned))
+            .collect();
+        let outcome = match crate::results::strongest(&crate::results::open(id, &sealed)) {
+            Some(result) => Outcome::Said(result.clone()),
+            None => Outcome::Queued,
+        };
+        let mut answer = describe(id, &outcome, None, false);
+        if matches!(outcome, Outcome::Queued) {
+            answer["state"] = json!("unknown");
+            answer["note"] = json!(
+                "The TV has said nothing about that play: it may not have taken it, may not report how plays go, or \
+                 the play is more than ten minutes old."
+            );
+        }
+        Ok(answer)
     }
 
     /// Whether the TV took request `seq` within the wait, asking `GET /assistant/request/{seq}?queue=tv` (on its lane,
@@ -511,6 +665,57 @@ impl Writes {
             .map_err(unreachable)?;
         Ok((status, body))
     }
+}
+
+/// A play's answer from how it stands: `state`, `confirmed` (only for the TV's own `playing`), `reason` for a failure,
+/// and words that say which, naming the TV when it is known.
+fn describe(id: &str, outcome: &Outcome, tv: Option<&str>, waking: bool) -> Value {
+    use crate::results::State;
+    let on = tv.unwrap_or("the TV");
+    let (state, reason, note) = match outcome {
+        Outcome::Said(result) => match (result.state, result.reason) {
+            (State::Playing, _) => ("playing", None, format!("Playing on {on}.")),
+            (State::Preparing, _) => {
+                ("preparing", None, format!("{on} took it and is preparing a source. {CHECK_LATER}"))
+            }
+            (State::Failed, reason) => {
+                let reason = reason.unwrap_or("failed");
+                let note = match reason {
+                    "not_allowed" => format!("{on} didn't play it: a content limit or the profile on the TV blocks it."),
+                    "no_source" => format!(
+                        "{on} found no playable source for it. Try another title, or open Den on the TV to pick a source."
+                    ),
+                    "no_trailer" => format!("{on} has no trailer for it."),
+                    "expired" => format!(
+                        "{on} got the request too late: a play is dropped after two minutes. Ask again to send a new one."
+                    ),
+                    "superseded" => format!("{on} is playing a newer request instead."),
+                    _ => format!("{on} couldn't start it. Ask again to send a new one."),
+                };
+                ("failed", Some(reason), note)
+            }
+        },
+        Outcome::TakenSilently => (
+            "taken",
+            None,
+            format!(
+                "{on} took it but didn't start it. This connection may not be allowed to play on the TV — reconnect \
+                 with \"Allow changes to my library and playing on my TV\" ticked — or it arrived too late."
+            ),
+        ),
+        Outcome::Taken => ("taken", None, TAKEN_NOTE.to_owned()),
+        Outcome::Queued if waking => (
+            "waking",
+            None,
+            format!("Waking {on} and opening Den; it hasn't taken the play yet. {CHECK_LATER}"),
+        ),
+        Outcome::Queued => ("queued", None, WAITING_NOTE.to_owned()),
+    };
+    let mut answer = json!({ "id": id, "state": state, "confirmed": state == "playing", "note": note });
+    if let Some(reason) = reason {
+        answer["reason"] = json!(reason);
+    }
+    answer
 }
 
 /// den-edge's `{"error": "<code>"}`.
@@ -664,7 +869,9 @@ pub fn list() -> Value {
                 button would. For a series give no season to play it where it stands (the next episode or where \
                 they left off), or a season and episode for one episode. The TV must have Den open or be registered \
                 to wake and open it. When more than one TV can receive the play, the answer names them and asks for \
-                tv. Says whether Den picked it up within a few seconds; it cannot say whether playback started.",
+                tv. Waits briefly for the TV's word: state is playing (confirmed), failed with a reason, preparing or \
+                waking (not confirmed yet; check with den_play_status), or only taken/queued for a TV that cannot \
+                say. Never report playing unless confirmed is true.",
             "inputSchema": schema(json!({
                 "season": { "type": "integer", "minimum": 0, "description": "Series only" },
                 "episode": { "type": "integer", "minimum": 0, "maximum": 99999,
@@ -688,6 +895,19 @@ pub fn list() -> Value {
                 and open it, and when Den was last seen; with several TVs, each by name. Check it before offering \
                 to play something.",
             "inputSchema": { "type": "object", "properties": {} },
+            "annotations": { "readOnlyHint": true, "idempotentHint": true, "openWorldHint": false },
+        },
+        {
+            "name": "den_play_status",
+            "title": "How a play on the TV went",
+            "description": "How an earlier den_play_on_tv or den_play_trailer stands now, by the id its answer gave: \
+                playing (confirmed), failed with a reason, or preparing. Use it instead of playing the same thing \
+                again when an answer was not confirmed yet.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string", "description": "The id the play's answer gave" } },
+                "required": ["id"],
+            },
             "annotations": { "readOnlyHint": true, "idempotentHint": true, "openWorldHint": false },
         },
     ])
@@ -717,12 +937,33 @@ pub fn output_schema(tool: &str) -> Value {
             "required": ["online", "wakeable", "note"],
         });
     }
+    let states = json!(["playing", "failed", "preparing", "waking", "taken", "queued"]);
+    let reason = json!({ "type": "string",
+        "enum": ["not_allowed", "no_source", "no_trailer", "expired", "superseded", "failed"],
+        "description": "Why the TV did not play it, with state failed" });
+    if tool == "den_play_status" {
+        let mut states = states;
+        states.as_array_mut().expect("a list").push(json!("unknown"));
+        return json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "state": { "type": "string", "enum": states },
+                "confirmed": { "type": "boolean" },
+                "reason": reason,
+                "note": { "type": "string" },
+            },
+            "required": ["id", "state", "confirmed", "note"],
+        });
+    }
     json!({
         "type": "object",
         "properties": {
             "queued": { "type": "boolean" },
             "id": { "type": "string" },
-            "state": { "type": "string", "enum": ["queued", "taken"] },
+            "state": { "type": "string", "enum": states },
+            "confirmed": { "type": "boolean", "description": "True only when the TV said it is playing" },
+            "reason": reason,
             "tv": { "type": "string", "description": "The TV it was sent to, when the household has several" },
             "note": { "type": "string" },
         },

@@ -203,11 +203,13 @@ dependencies = [
 name = "den-mcp"
 version = "0.9.1"
 dependencies = [
+ "aes-gcm",
  "bytes",
  "den-assistant",
  "ed25519-dalek",
  "futures-util",
  "getrandom 0.4.3",
+ "hkdf",
  "http-body-util",
  "hyper",
  "hyper-rustls",
