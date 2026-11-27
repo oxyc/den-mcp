@@ -1,0 +1,24 @@
+{
+  "comment": "wire/play-results-v1.md, computed by tools/play-results-vectors.mjs. id is inbox-v1.json's play envelope id; address and key are its HKDF derivations, aad the UTF-8 of \"den/play-result/v1\", 0x00 and the address. Byte strings are lowercase hex; plaintext is padded with spaces to 128 bytes; sealed is base64url as it travels.",
+  "id": "ffeeddccbbaa99887766554433221100",
+  "address": "fd800be3b016e9a091d596058c2ac909",
+  "key": "99041fa176cb0f1cada3775aa659d6f0ed41c961eb76edea17751c47f5b3a3c0",
+  "aad": "64656e2f706c61792d726573756c742f7631006664383030626533623031366539613039316435393630353863326163393039",
+  "results": [
+    {
+      "nonce": "000102030405060708090a0b",
+      "plaintext": "{\"at\":1789000061000,\"state\":\"preparing\",\"v\":1}                                                                                  ",
+      "sealed": "AAECAwQFBgcICQoLfJg1DWopJX5XF-9uCKsmTJTxaYpISFcP3wuCy6DPAjqmilYID9mgSL8Cto6MSu1Lmr1wWc1DPZcdIpBUu3_uv6RBGqc6RxaYCKEppZV7DcD7hMnbouGT9euLBJJA20h6RjSwPToTpzoZXh9Wdwmnm5pzmzWnQsL-NNlXtDdQo4ZyF8KUURkoWnABsyXEOuJF"
+    },
+    {
+      "nonce": "0c0d0e0f1011121314151617",
+      "plaintext": "{\"at\":1789000069000,\"state\":\"playing\",\"v\":1}                                                                                    ",
+      "sealed": "DA0ODxAREhMUFRYXCqrbH03FDkAnSJDekRi9VRjBIHgEVg-poXxBWu50MzeP3L7kIyry-eLcK3ZvqZqI-8TWIQNdNiQggmdCuqaEMAU0Qh6-2WeeypsayzxHN1Bw5NWjwAVBMwLNESA87qaSuIdqDmZM-p-qVRMBLBzH9rAh1HXctnsJV15GuoQGZEW6Yyrx2dGe6_zLemIKOtVK"
+    },
+    {
+      "nonce": "18191a1b1c1d1e1f20212223",
+      "plaintext": "{\"at\":1789000066000,\"reason\":\"no_source\",\"state\":\"failed\",\"v\":1}                                                                ",
+      "sealed": "GBkaGxwdHh8gISIjQzxB4fDCE9e0TUnDDRlF-93EveLPFeR-kbzZEpehSup8KIWmtFCZbcNpYKfvxzPDr_jTgeXp3WN8yst69fEb7QkK8VNpvV2Dp6o2HJ-pEcv7L9IF6gevj3I3GxgH0PNnNe1AISj6G5JrmhCwNW8up_dcLQbVsI0fe5Jk-Uc6tjtCXtuOI0GMAKCKXoC9HjJy"
+    }
+  ]
+}
